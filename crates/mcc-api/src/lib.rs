@@ -39,7 +39,7 @@ impl ClusterStatus {
             nodes_total: 0,
             stacks: 0,
             instances: 0,
-            message: Some("Phase 0: control plane not fully implemented".into()),
+            message: Some("bootstrap stub".into()),
         }
     }
 }

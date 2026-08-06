@@ -1,12 +1,18 @@
 //! Storage abstraction for MicroCommandControl.
 //!
-//! Phase 0: trait sketch + in-memory stub.
-//! Phase 1: SQLite implementation + migrations.
+//! Server logic depends on [`Store`], not on SQLite types.
+//! Default backend: SQLite ([`SqliteStore`]). [`MemoryStore`] remains for unit tests.
+
+mod memory;
+mod sqlite;
+mod token;
+
+pub use memory::MemoryStore;
+pub use sqlite::SqliteStore;
+pub use token::{hash_token, verify_token, TokenKind};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Errors from the store layer.
 #[derive(Debug, thiserror::Error)]
@@ -15,61 +21,46 @@ pub enum StoreError {
     NotFound(String),
     #[error("already exists: {0}")]
     AlreadyExists(String),
+    #[error("not initialized")]
+    NotInitialized,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
-/// Minimal cluster metadata for Phase 0 wiring tests.
-#[derive(Debug, Clone, Default)]
+/// Persisted cluster bootstrap / meta.
+#[derive(Debug, Clone)]
 pub struct ClusterMeta {
     pub initialized: bool,
+    pub api_token_hash: String,
+    pub join_token_hash: String,
+    pub created_at: String,
 }
 
-/// Persistence surface. All server logic depends on this, not on SQLite types.
+/// Lightweight counts for `/v1/status`.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterCounts {
+    pub nodes_ready: u32,
+    pub nodes_total: u32,
+    pub stacks: u32,
+    pub instances: u32,
+}
+
+/// Persistence surface used by the control plane.
 #[async_trait]
 pub trait Store: Send + Sync {
-    async fn get_cluster_meta(&self) -> Result<ClusterMeta, StoreError>;
-    async fn set_cluster_meta(&self, meta: ClusterMeta) -> Result<(), StoreError>;
-}
+    async fn get_cluster_meta(&self) -> Result<Option<ClusterMeta>, StoreError>;
 
-/// In-memory store used until SQLite lands in Phase 1.
-#[derive(Debug, Default)]
-pub struct MemoryStore {
-    inner: RwLock<ClusterMeta>,
-}
+    async fn init_cluster(
+        &self,
+        api_token_hash: &str,
+        join_token_hash: &str,
+    ) -> Result<ClusterMeta, StoreError>;
 
-impl MemoryStore {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-}
+    /// Constant-time check of operator API bearer token.
+    async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError>;
 
-#[async_trait]
-impl Store for MemoryStore {
-    async fn get_cluster_meta(&self) -> Result<ClusterMeta, StoreError> {
-        Ok(self.inner.read().await.clone())
-    }
+    /// Constant-time check of agent join token (Phase 2).
+    async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError>;
 
-    async fn set_cluster_meta(&self, meta: ClusterMeta) -> Result<(), StoreError> {
-        *self.inner.write().await = meta;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn memory_store_roundtrip() {
-        let store = MemoryStore::new();
-        let meta = store.get_cluster_meta().await.unwrap();
-        assert!(!meta.initialized);
-
-        store
-            .set_cluster_meta(ClusterMeta { initialized: true })
-            .await
-            .unwrap();
-        assert!(store.get_cluster_meta().await.unwrap().initialized);
-    }
+    async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError>;
 }

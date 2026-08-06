@@ -36,11 +36,15 @@ check:
     just lint
     just test
 
-# Run server stub (Phase 0: use --dry-run; Phase 1+: real listen)
+# Run server (default: listen on 127.0.0.1:7443, data dir ~/.mcc)
 run-server *args:
     cargo run -p mcc -- server {{args}}
 
-# Run agent stub
+# Init data dir + tokens only (no listen)
+init-server *args:
+    cargo run -p mcc -- server --init-only {{args}}
+
+# Run agent stub (Phase 2: join/heartbeat)
 run-agent *args:
     cargo run -p mcc -- agent {{args}}
 

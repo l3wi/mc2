@@ -4,7 +4,7 @@ Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.mi
 
 MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
-> **Status:** early scaffold (Phase 0). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
+> **Status:** Phases 0–1 done (server + SQLite + REST). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
 ## Quick start (dev)
 
@@ -15,20 +15,24 @@ just build          # produces target/debug/mcc
 ./target/debug/mcc --help
 ./target/debug/mcc version
 
-# Phase 0 stubs (exit cleanly; no listen/join yet)
-just run-server -- --dry-run
-just run-agent -- --dry-run
+# First run prints API + join tokens once (save them)
+just run-server -- --data-dir /tmp/mcc-dev --bind 127.0.0.1:7443
+
+# In another shell:
+curl -s http://127.0.0.1:7443/health
+curl -s -H "Authorization: Bearer <api-token>" http://127.0.0.1:7443/v1/status
 ```
 
 ```bash
 just check          # fmt + clippy + test
+just init-server -- --data-dir /tmp/mcc-dev   # tokens only, no listen
 ```
 
 ## Binary modes
 
 | Command | Role |
 | ------- | ---- |
-| `mcc server` | Control plane (SQLite, REST, scheduler) — **Phase 1+** |
+| `mcc server` | Control plane (SQLite, REST) — **Phase 1** |
 | `mcc agent` | Node worker (join, heartbeat, microsandbox) — **Phase 2+** |
 | `mcc apply -f stack.yaml` | Apply desired stack — **Phase 3+** |
 

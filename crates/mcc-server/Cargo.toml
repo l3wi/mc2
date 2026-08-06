@@ -12,8 +12,21 @@ mcc-api = { workspace = true }
 mcc-store = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = { workspace = true }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = "0.8"
+hex = "0.4"
+http = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lib]
 name = "mcc_server"

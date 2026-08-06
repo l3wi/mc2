@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phase 0 complete)  
+**Status:** **Approved — implementing** (Phases 0–1 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -379,12 +379,24 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 1 — Store + server process
 
-- [ ] Storage trait + SQLite implementation + migrations  
-- [ ] Server bootstrap: data dir, generate API token + join token  
-- [ ] REST: health, status stub, auth middleware  
-- [ ] Config: bind addr, data dir, secrets key path  
+- [x] Storage trait + SQLite implementation + migrations  
+- [x] Server bootstrap: data dir, generate API token + join token  
+- [x] REST: health, status stub, auth middleware  
+- [x] Config: bind addr, data dir, secrets key path  
 
-**Exit:** `mcc server` listens; `curl` with bearer hits `/v1/status`.
+**Exit:** `mcc server` listens; `curl` with bearer hits `/v1/status`. ✅
+
+#### Implementation notes (Phase 1)
+
+- **Branch:** `feat/phase-1-server-store`
+- **Store:** `Store` trait; `SqliteStore` (sqlx + `migrations/001_init.sql`); `MemoryStore` for unit tests
+- **Tokens:** SHA-256 hashes in `cluster_meta`; plaintext printed once on first init (`mccat_*` / `mccjt_*`)
+- **Secrets key:** 32-byte file at `<data_dir>/secrets.key` (mode 0600), for Phase 5
+- **REST (axum, plain HTTP for now):**
+  - `GET /health` — no auth
+  - `GET /v1/status` — `Authorization: Bearer <api_token>`
+- **Flags:** `--bind`, `--data-dir`, `--secrets-key-path`, `--init-only`, `--dry-run`
+- **Verify:** `just check`; e2e curl against ephemeral data dir
 
 ### Phase 2 — Agent join + heartbeat
 
@@ -591,6 +603,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 
 | Phase | Status | Notes |
 | ----- | ------ | ----- |
-| 0 | **done** | Workspace + dual-mode CLI + justfile + CI; see notes above |
-| 1 | next | SQLite store, server bootstrap, REST health/status + auth |
-| 2–7 | pending | — |
+| 0 | **done** | Workspace + dual-mode CLI + justfile + CI |
+| 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
+| 2 | next | gRPC join + heartbeat + `mcc node ls` |
+| 3–7 | pending | — |
