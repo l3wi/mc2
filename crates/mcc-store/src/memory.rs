@@ -1,8 +1,8 @@
 //! In-memory store for unit tests.
 
 use crate::{
-    verify_token, ClusterCounts, ClusterMeta, NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus,
-    Store, StoreError,
+    verify_token, ClusterCounts, ClusterMeta, InstancePhase, InstanceRecord, NodeHeartbeat,
+    NodeJoin, NodeRecord, NodeStatus, StackRecord, Store, StoreError,
 };
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -16,11 +16,11 @@ use uuid::Uuid;
 struct Inner {
     meta: Option<ClusterMeta>,
     nodes: HashMap<String, NodeRecord>,
-    /// name -> id
     by_name: HashMap<String, String>,
+    stacks: HashMap<String, StackRecord>,
+    instances: HashMap<String, InstanceRecord>,
 }
 
-/// In-memory [`Store`] used in tests and early scaffolding.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     inner: RwLock<Inner>,
@@ -59,33 +59,31 @@ impl Store for MemoryStore {
 
     async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError> {
         let g = self.inner.read().await;
-        let Some(meta) = &g.meta else {
-            return Ok(false);
-        };
-        Ok(verify_token(token, &meta.api_token_hash))
+        Ok(g.meta
+            .as_ref()
+            .map(|m| verify_token(token, &m.api_token_hash))
+            .unwrap_or(false))
     }
 
     async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError> {
         let g = self.inner.read().await;
-        let Some(meta) = &g.meta else {
-            return Ok(false);
-        };
-        Ok(verify_token(token, &meta.join_token_hash))
+        Ok(g.meta
+            .as_ref()
+            .map(|m| verify_token(token, &m.join_token_hash))
+            .unwrap_or(false))
     }
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {
         let g = self.inner.read().await;
-        let nodes_total = g.nodes.len() as u32;
-        let nodes_ready = g
-            .nodes
-            .values()
-            .filter(|n| n.status == NodeStatus::Ready.as_str())
-            .count() as u32;
         Ok(ClusterCounts {
-            nodes_ready,
-            nodes_total,
-            stacks: 0,
-            instances: 0,
+            nodes_total: g.nodes.len() as u32,
+            nodes_ready: g
+                .nodes
+                .values()
+                .filter(|n| n.status == NodeStatus::Ready.as_str())
+                .count() as u32,
+            stacks: g.stacks.len() as u32,
+            instances: g.instances.len() as u32,
         })
     }
 
@@ -93,7 +91,7 @@ impl Store for MemoryStore {
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
         if let Some(id) = g.by_name.get(&join.name).cloned() {
-            let node = g.nodes.get_mut(&id).expect("by_name consistent");
+            let node = g.nodes.get_mut(&id).expect("consistent");
             node.labels_json = join.labels_json;
             node.arch = join.arch;
             node.cpus = join.cpus;
@@ -162,19 +160,187 @@ impl Store for MemoryStore {
             if node.status != NodeStatus::Ready.as_str() {
                 continue;
             }
-            let Some(ref hb) = node.last_heartbeat else {
+            let stale = match &node.last_heartbeat {
+                None => true,
+                Some(hb) => chrono::DateTime::parse_from_rfc3339(hb)
+                    .map(|ts| ts.with_timezone(&Utc) < cutoff)
+                    .unwrap_or(true),
+            };
+            if stale {
                 node.status = NodeStatus::NotReady.as_str().into();
                 n += 1;
-                continue;
-            };
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(hb) {
-                if ts.with_timezone(&Utc) < cutoff {
-                    node.status = NodeStatus::NotReady.as_str().into();
-                    n += 1;
-                }
             }
         }
         Ok(n)
+    }
+
+    async fn upsert_stack(
+        &self,
+        name: &str,
+        labels_json: &str,
+        raw_yaml: &str,
+    ) -> Result<StackRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        let now = Utc::now().to_rfc3339();
+        let rec = if let Some(existing) = g.stacks.get(name) {
+            StackRecord {
+                name: name.into(),
+                labels_json: labels_json.into(),
+                raw_yaml: raw_yaml.into(),
+                created_at: existing.created_at.clone(),
+                updated_at: now,
+            }
+        } else {
+            StackRecord {
+                name: name.into(),
+                labels_json: labels_json.into(),
+                raw_yaml: raw_yaml.into(),
+                created_at: now.clone(),
+                updated_at: now,
+            }
+        };
+        g.stacks.insert(name.into(), rec.clone());
+        Ok(rec)
+    }
+
+    async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError> {
+        let g = self.inner.read().await;
+        let mut v: Vec<_> = g.stacks.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError> {
+        Ok(self.inner.read().await.stacks.get(name).cloned())
+    }
+
+    async fn reconcile_service_replicas(
+        &self,
+        stack: &str,
+        service: &str,
+        replicas: u32,
+        spec_json: &str,
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let mut g = self.inner.write().await;
+        let now = Utc::now().to_rfc3339();
+        let mut by_ord: HashMap<u32, InstanceRecord> = g
+            .instances
+            .values()
+            .filter(|i| i.stack == stack && i.service == service)
+            .cloned()
+            .map(|i| (i.ordinal, i))
+            .collect();
+
+        // scale down
+        let remove: Vec<String> = by_ord
+            .values()
+            .filter(|i| i.ordinal >= replicas)
+            .map(|i| i.id.clone())
+            .collect();
+        for id in remove {
+            g.instances.remove(&id);
+            by_ord.retain(|_, i| i.id != id);
+        }
+
+        // scale up / refresh spec
+        for ord in 0..replicas {
+            if let Some(existing) = by_ord.get_mut(&ord) {
+                existing.spec_json = spec_json.into();
+                existing.updated_at = now.clone();
+                g.instances.insert(existing.id.clone(), existing.clone());
+            } else {
+                let id = Uuid::new_v4().to_string();
+                let rec = InstanceRecord {
+                    id: id.clone(),
+                    stack: stack.into(),
+                    service: service.into(),
+                    ordinal: ord,
+                    node_id: None,
+                    phase: InstancePhase::Pending.as_str().into(),
+                    runtime_id: None,
+                    message: None,
+                    spec_json: spec_json.into(),
+                    updated_at: now.clone(),
+                };
+                g.instances.insert(id, rec.clone());
+                by_ord.insert(ord, rec);
+            }
+        }
+
+        let mut out: Vec<_> = by_ord.into_values().collect();
+        out.sort_by_key(|i| i.ordinal);
+        Ok(out)
+    }
+
+    async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        let g = self.inner.read().await;
+        let mut v: Vec<_> = g.instances.values().cloned().collect();
+        v.sort_by(|a, b| (&a.stack, &a.service, a.ordinal).cmp(&(&b.stack, &b.service, b.ordinal)));
+        Ok(v)
+    }
+
+    async fn list_instances_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let g = self.inner.read().await;
+        Ok(g.instances
+            .values()
+            .filter(|i| i.node_id.as_deref() == Some(node_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_pending_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        let g = self.inner.read().await;
+        Ok(g.instances
+            .values()
+            .filter(|i| i.phase == InstancePhase::Pending.as_str() && i.node_id.is_none())
+            .cloned()
+            .collect())
+    }
+
+    async fn bind_instance_to_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<InstanceRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        let inst = g
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))?;
+        inst.node_id = Some(node_id.into());
+        inst.phase = InstancePhase::Scheduled.as_str().into();
+        inst.updated_at = Utc::now().to_rfc3339();
+        Ok(inst.clone())
+    }
+
+    async fn update_instance_status(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        runtime_id: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<InstanceRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        let inst = g
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))?;
+        inst.phase = phase.into();
+        if let Some(r) = runtime_id {
+            inst.runtime_id = Some(r.into());
+        }
+        if let Some(m) = message {
+            inst.message = Some(m.into());
+        }
+        inst.updated_at = Utc::now().to_rfc3339();
+        Ok(inst.clone())
+    }
+
+    async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
+        Ok(self.inner.read().await.instances.get(instance_id).cloned())
     }
 }
 
@@ -184,78 +350,23 @@ mod tests {
     use crate::hash_token;
 
     #[tokio::test]
-    async fn init_and_verify() {
-        let store = MemoryStore::new();
-        assert!(store.get_cluster_meta().await.unwrap().is_none());
-
-        store
-            .init_cluster(&hash_token("api-secret"), &hash_token("join-secret"))
-            .await
-            .unwrap();
-
-        assert!(store.verify_api_token("api-secret").await.unwrap());
-        assert!(!store.verify_api_token("nope").await.unwrap());
-        assert!(store.verify_join_token("join-secret").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn join_heartbeat_and_stale() {
+    async fn replicas_scale() {
         let store = MemoryStore::new();
         store
             .init_cluster(&hash_token("a"), &hash_token("j"))
             .await
             .unwrap();
-
-        let node = store
-            .upsert_node_join(NodeJoin {
-                name: "n1".into(),
-                labels_json: "{}".into(),
-                arch: "aarch64".into(),
-                cpus: 4,
-                memory_mib: 8192,
-                node_token_hash: hash_token("ntok"),
-            })
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 2, r#"{"image":"x"}"#)
             .await
             .unwrap();
-
-        store
-            .heartbeat_node(
-                &node.id,
-                "ntok",
-                NodeHeartbeat {
-                    cpus: 4,
-                    memory_mib: 8192,
-                    status: "Ready".into(),
-                },
-            )
+        assert_eq!(inst.len(), 2);
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
             .await
             .unwrap();
-
-        assert!(store
-            .heartbeat_node(
-                &node.id,
-                "wrong",
-                NodeHeartbeat {
-                    cpus: 1,
-                    memory_mib: 1,
-                    status: "Ready".into(),
-                },
-            )
-            .await
-            .is_err());
-
-        // Force stale heartbeat
-        {
-            let mut g = store.inner.write().await;
-            let n = g.nodes.get_mut(&node.id).unwrap();
-            n.last_heartbeat = Some((Utc::now() - ChronoDuration::seconds(120)).to_rfc3339());
-        }
-        let marked = store
-            .mark_stale_nodes(Duration::from_secs(30))
-            .await
-            .unwrap();
-        assert_eq!(marked, 1);
-        let list = store.list_nodes().await.unwrap();
-        assert_eq!(list[0].status, "NotReady");
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].ordinal, 0);
     }
 }

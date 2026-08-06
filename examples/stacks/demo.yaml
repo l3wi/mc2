@@ -1,5 +1,5 @@
-# Example stack for MicroCommandControl (Phase 3+ apply).
-# Phase 0: schema reference only — `mcc apply` is not implemented yet.
+# Example stack for MicroCommandControl.
+# Apply with: mcc apply -f examples/stacks/demo.yaml --token <api-token>
 apiVersion: mcc/v1
 kind: Stack
 metadata:

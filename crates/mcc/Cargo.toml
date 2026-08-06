@@ -15,6 +15,7 @@ path = "src/main.rs"
 mcc-server = { workspace = true }
 mcc-agent = { workspace = true }
 mcc-api = { workspace = true }
+mcc-store = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

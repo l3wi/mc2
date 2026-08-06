@@ -103,7 +103,6 @@ impl AgentService for AgentSvc {
 
     async fn sync(&self, request: Request<SyncRequest>) -> Result<Response<SyncResponse>, Status> {
         let req = request.into_inner();
-        // Auth check for future use; return empty desired set until Phase 3.
         let node = self
             .store
             .get_node(&req.node_id)
@@ -113,7 +112,31 @@ impl AgentService for AgentSvc {
         if !mcc_store::verify_token(&req.node_token, &node.node_token_hash) {
             return Err(Status::unauthenticated("invalid node token"));
         }
-        Ok(Response::new(SyncResponse { instances: vec![] }))
+
+        let rows = self
+            .store
+            .list_instances_for_node(&req.node_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let instances = rows
+            .into_iter()
+            .filter(|i| {
+                matches!(
+                    i.phase.as_str(),
+                    "Scheduled" | "Creating" | "Running" | "Pending"
+                )
+            })
+            .map(|i| mcc_api::agent::DesiredInstance {
+                instance_id: i.id,
+                stack: i.stack,
+                service: i.service,
+                ordinal: i.ordinal,
+                spec_json: i.spec_json,
+            })
+            .collect();
+
+        Ok(Response::new(SyncResponse { instances }))
     }
 
     async fn report_status(
@@ -130,7 +153,40 @@ impl AgentService for AgentSvc {
         if !mcc_store::verify_token(&req.node_token, &node.node_token_hash) {
             return Err(Status::unauthenticated("invalid node token"));
         }
-        // Phase 3 will persist instance status.
+
+        for st in req.instances {
+            if let Some(inst) = self
+                .store
+                .get_instance(&st.instance_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                if let Some(ref nid) = inst.node_id {
+                    if nid != &req.node_id {
+                        continue;
+                    }
+                }
+            }
+            let _ = self
+                .store
+                .update_instance_status(
+                    &st.instance_id,
+                    &st.phase,
+                    if st.runtime_id.is_empty() {
+                        None
+                    } else {
+                        Some(st.runtime_id.as_str())
+                    },
+                    if st.message.is_empty() {
+                        None
+                    } else {
+                        Some(st.message.as_str())
+                    },
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
         Ok(Response::new(ReportStatusResponse { ok: true }))
     }
 }

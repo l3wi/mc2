@@ -1,8 +1,8 @@
 //! SQLite-backed store (default production backend).
 
 use crate::{
-    verify_token, ClusterCounts, ClusterMeta, NodeHeartbeat, NodeJoin, NodeRecord, Store,
-    StoreError,
+    verify_token, ClusterCounts, ClusterMeta, InstanceRecord, NodeHeartbeat, NodeJoin, NodeRecord,
+    StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;
@@ -69,6 +69,21 @@ impl SqliteStore {
             last_heartbeat: row.get("last_heartbeat"),
             created_at: row.get("created_at"),
             node_token_hash: row.get("node_token_hash"),
+        }
+    }
+
+    fn map_instance(row: &sqlx::sqlite::SqliteRow) -> InstanceRecord {
+        InstanceRecord {
+            id: row.get("id"),
+            stack: row.get("stack"),
+            service: row.get("service"),
+            ordinal: row.get::<i64, _>("ordinal") as u32,
+            node_id: row.get("node_id"),
+            phase: row.get("phase"),
+            runtime_id: row.get("runtime_id"),
+            message: row.get("message"),
+            spec_json: row.get("spec_json"),
+            updated_at: row.get("updated_at"),
         }
     }
 }
@@ -156,11 +171,16 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
 
+        let instances: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instances")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+
         Ok(ClusterCounts {
             nodes_ready: nodes_ready as u32,
             nodes_total: nodes_total as u32,
             stacks: stacks as u32,
-            instances: 0,
+            instances: instances as u32,
         })
     }
 
@@ -318,6 +338,247 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
         Ok(res.rows_affected() as u32)
+    }
+
+    async fn upsert_stack(
+        &self,
+        name: &str,
+        labels_json: &str,
+        raw_yaml: &str,
+    ) -> Result<StackRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let existing = self.get_stack(name).await?;
+        if existing.is_some() {
+            sqlx::query(
+                r#"UPDATE stacks SET labels_json = ?1, raw_yaml = ?2, updated_at = ?3 WHERE name = ?4"#,
+            )
+            .bind(labels_json)
+            .bind(raw_yaml)
+            .bind(&now)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO stacks (name, labels_json, raw_yaml, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            )
+            .bind(name)
+            .bind(labels_json)
+            .bind(raw_yaml)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+        self.get_stack(name)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(name.into()))
+    }
+
+    async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT name, labels_json, raw_yaml, created_at, updated_at FROM stacks ORDER BY name"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows
+            .iter()
+            .map(|r| StackRecord {
+                name: r.get("name"),
+                labels_json: r.get("labels_json"),
+                raw_yaml: r.get("raw_yaml"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT name, labels_json, raw_yaml, created_at, updated_at FROM stacks WHERE name = ?1"#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.map(|r| StackRecord {
+            name: r.get("name"),
+            labels_json: r.get("labels_json"),
+            raw_yaml: r.get("raw_yaml"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn reconcile_service_replicas(
+        &self,
+        stack: &str,
+        service: &str,
+        replicas: u32,
+        spec_json: &str,
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(r#"DELETE FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal >= ?3"#)
+            .bind(stack)
+            .bind(service)
+            .bind(replicas as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+
+        for ord in 0..replicas {
+            let existing = sqlx::query(
+                r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
+            )
+            .bind(stack)
+            .bind(service)
+            .bind(ord as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+
+            if let Some(row) = existing {
+                let id: String = row.get("id");
+                sqlx::query(
+                    r#"UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3"#,
+                )
+                .bind(spec_json)
+                .bind(&now)
+                .bind(&id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            } else {
+                let id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    r#"INSERT INTO instances
+                       (id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, NULL, 'Pending', NULL, NULL, ?5, ?6)"#,
+                )
+                .bind(&id)
+                .bind(stack)
+                .bind(service)
+                .bind(ord as i64)
+                .bind(spec_json)
+                .bind(&now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            }
+        }
+
+        let rows = sqlx::query(
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+               FROM instances WHERE stack = ?1 AND service = ?2 ORDER BY ordinal"#,
+        )
+        .bind(stack)
+        .bind(service)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+
+        Ok(rows.iter().map(Self::map_instance).collect())
+    }
+
+    async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+               FROM instances ORDER BY stack, service, ordinal"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows.iter().map(Self::map_instance).collect())
+    }
+
+    async fn list_instances_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+               FROM instances WHERE node_id = ?1"#,
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows.iter().map(Self::map_instance).collect())
+    }
+
+    async fn list_pending_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+               FROM instances WHERE phase = 'Pending' AND node_id IS NULL"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows.iter().map(Self::map_instance).collect())
+    }
+
+    async fn bind_instance_to_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<InstanceRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE instances SET node_id = ?1, phase = 'Scheduled', updated_at = ?2 WHERE id = ?3"#,
+        )
+        .bind(node_id)
+        .bind(&now)
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        self.get_instance(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+    }
+
+    async fn update_instance_status(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        runtime_id: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<InstanceRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"UPDATE instances SET phase = ?1, runtime_id = COALESCE(?2, runtime_id),
+                message = COALESCE(?3, message), updated_at = ?4 WHERE id = ?5"#,
+        )
+        .bind(phase)
+        .bind(runtime_id)
+        .bind(message)
+        .bind(&now)
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        self.get_instance(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+    }
+
+    async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+               FROM instances WHERE id = ?1"#,
+        )
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.as_ref().map(Self::map_instance))
     }
 }
 

@@ -4,7 +4,7 @@ Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.mi
 
 MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
-> **Status:** Phases 0–2 done (server, agents, nodes). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
+> **Status:** Phases 0–3 done (server, agents, apply + mock schedule). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
 ## Quick start (dev)
 
@@ -27,6 +27,8 @@ DATA=/tmp/mcc-dev
 # Terminal 3 — operator
 export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"
 ./target/debug/mcc node ls
+./target/debug/mcc apply -f examples/stacks/demo.yaml
+./target/debug/mcc ps
 curl -s -H "Authorization: Bearer $MCC_API_TOKEN" "$MCC_API/v1/status"
 ```
 
@@ -47,7 +49,8 @@ just test-integration
 | `mcc server` | Control plane (SQLite, REST, gRPC) |
 | `mcc agent` | Node worker (join + heartbeat; msb later) |
 | `mcc node ls` | List nodes via REST |
-| `mcc apply -f stack.yaml` | Apply desired stack — **Phase 3+** |
+| `mcc apply -f stack.yaml` | Apply desired stack (schedule + mock run) |
+| `mcc ps` | List instances / phases |
 
 One dual-mode binary for operators and nodes.
 

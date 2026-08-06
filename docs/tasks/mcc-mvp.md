@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–2 complete)  
+**Status:** **Approved — implementing** (Phases 0–3 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -420,12 +420,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 3 — Apply stack + schedule (no msb yet)
 
-- [ ] YAML parse → Stack/Service models  
-- [ ] Instance creation for replicas  
-- [ ] Scheduler filters + spread + pin  
-- [ ] Agent Sync receives **mock** runtime tasks; reports Running (fake)  
+- [x] YAML parse → Stack/Service models  
+- [x] Instance creation for replicas  
+- [x] Scheduler filters + spread + pin  
+- [x] Agent Sync receives **mock** runtime tasks; reports Running (fake)  
 
-**Exit:** `mcc apply -f examples/demo.yaml` places instances on nodes; status shows Running (simulated).
+**Exit:** `mcc apply -f examples/demo.yaml` places instances on nodes; status shows Running (simulated). ✅
+
+#### Implementation notes (Phase 3)
+
+- **Branch:** `feat/phase-3-apply-schedule`
+- **YAML:** `mcc_api::parse_stack_yaml` (`mcc/v1` Stack); rejects `ingress`
+- **Store:** `instances` + stack upsert; `reconcile_service_replicas`; bind/update status
+- **Scheduler:** Ready filter, `nodeName` pin, `nodeSelector`, residual CPU/mem, spread by service load
+- **REST:** `POST /v1/stacks:apply` `{yaml}`, `GET /v1/instances`
+- **CLI:** `mcc apply -f …`, `mcc ps`
+- **Agent:** Sync + mock `ReportStatus` → Running (`mock://…` runtime id)
+- **Tests:** unit parse/scheduler; integration `apply_schedule.rs`
 
 ### Phase 4 — Microsandbox runtime
 
@@ -621,6 +632,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 0 | **done** | Workspace + dual-mode CLI + justfile + CI |
 | 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
 | 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
-| 3 | next | apply YAML + schedule + mock runtime |
-| 4–7 | pending | — |
+| 3 | **done** | apply YAML, spread scheduler, mock agent Running |
+| 4 | next | real microsandbox runtime |
+| 5–7 | pending | — |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

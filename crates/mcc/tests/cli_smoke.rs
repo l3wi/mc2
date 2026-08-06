@@ -35,7 +35,7 @@ fn help_lists_core_commands() {
 }
 
 #[test]
-fn apply_not_implemented_yet() {
+fn apply_requires_token() {
     let out = mcc()
         .args(["apply", "-f", "examples/stacks/demo.yaml"])
         .output()
@@ -47,7 +47,7 @@ fn apply_not_implemented_yet() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        err.contains("not implemented") || err.contains("Phase 3"),
+        err.contains("MCC_API_TOKEN") || err.contains("token"),
         "unexpected error: {err}"
     );
 }

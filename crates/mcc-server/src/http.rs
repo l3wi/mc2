@@ -1,9 +1,17 @@
 //! Operator REST API.
 
+use crate::apply::{apply_stack_yaml, list_instance_views};
 use crate::auth::AuthUser;
 use crate::AppState;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use mcc_api::{ClusterStatus, NodeView};
+use serde::Deserialize;
 use serde_json::json;
 use tower_http::trace::TraceLayer;
 
@@ -12,8 +20,15 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/nodes", get(list_nodes))
+        .route("/v1/stacks:apply", post(apply_stack))
+        .route("/v1/instances", get(list_instances))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyBody {
+    yaml: String,
 }
 
 async fn health() -> impl IntoResponse {
@@ -77,6 +92,44 @@ async fn list_nodes(
         .collect();
 
     Ok(Json(views))
+}
+
+async fn apply_stack(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Json(body): Json<ApplyBody>,
+) -> Result<Json<crate::ApplyResult>, (StatusCode, Json<serde_json::Value>)> {
+    match apply_stack_yaml(state.store.clone(), &body.yaml).await {
+        Ok(r) => Ok(Json(r)),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("invalid")
+                || msg.contains("unsupported")
+                || msg.contains("required")
+                || msg.contains("ingress")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((code, Json(json!({ "error": msg }))))
+        }
+    }
+}
+
+async fn list_instances(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<Vec<mcc_store::InstanceRecord>>, (StatusCode, Json<serde_json::Value>)> {
+    list_instance_views(state.store.clone())
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })
 }
 
 #[cfg(test)]

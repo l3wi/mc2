@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 prost-types = "0.13"

@@ -34,6 +34,8 @@ enum Commands {
     Apply(ApplyArgs),
     /// Node operations
     Node(NodeCmd),
+    /// List instances (desired sandboxes)
+    Ps(OperatorArgs),
     /// Show cluster / binary version info
     Version,
 }
@@ -43,6 +45,9 @@ struct ApplyArgs {
     /// Path to stack YAML
     #[arg(short = 'f', long = "file")]
     file: String,
+
+    #[command(flatten)]
+    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -85,21 +90,81 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server(args) => mcc_server::run(args).await?,
         Commands::Agent(args) => mcc_agent::run(args).await?,
-        Commands::Apply(args) => {
-            bail!(
-                "apply is not implemented yet (Phase 3). File: {}",
-                args.file
-            );
-        }
+        Commands::Apply(args) => apply_cmd(args).await?,
         Commands::Node(NodeCmd {
             command: NodeCommands::Ls(args),
         }) => node_ls(args).await?,
+        Commands::Ps(args) => ps_cmd(args).await?,
         Commands::Version => {
             println!("mcc {} — MicroCommandControl", env!("CARGO_PKG_VERSION"));
             println!("api schema: {}", mcc_api::API_VERSION);
         }
     }
 
+    Ok(())
+}
+
+async fn apply_cmd(args: ApplyArgs) -> Result<()> {
+    let token = args
+        .op
+        .token
+        .context("missing --token / MCC_API_TOKEN (operator API token from server bootstrap)")?;
+    let yaml =
+        std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
+    let url = format!("{}/v1/stacks:apply", args.op.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "yaml": yaml }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("apply failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ps_cmd(args: OperatorArgs) -> Result<()> {
+    let token = args.token.context("missing --token / MCC_API_TOKEN")?;
+    let url = format!("{}/v1/instances", args.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ps failed: {status} {body}");
+    }
+    let instances: Vec<mcc_store::InstanceRecord> =
+        serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    if instances.is_empty() {
+        println!("No instances.");
+        return Ok(());
+    }
+    println!(
+        "{:<8} {:<12} {:<6} {:<10} {:<36} ID",
+        "STACK", "SERVICE", "ORD", "PHASE", "NODE"
+    );
+    for i in instances {
+        println!(
+            "{:<8} {:<12} {:<6} {:<10} {:<36} {}",
+            i.stack,
+            i.service,
+            i.ordinal,
+            i.phase,
+            i.node_id.unwrap_or_else(|| "-".into()),
+            i.id
+        );
+    }
     Ok(())
 }
 

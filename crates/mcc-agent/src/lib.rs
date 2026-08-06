@@ -6,7 +6,9 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use mcc_api::agent::agent_service_client::AgentServiceClient;
-use mcc_api::agent::{Capacity, HeartbeatRequest, JoinRequest};
+use mcc_api::agent::{
+    Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -121,6 +123,12 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Immediate sync after join so apply right after agent start still works.
+    if let Err(e) = sync_and_mock_run(&mut client, &join_resp.node_id, &join_resp.node_token).await
+    {
+        warn!(error = %e, "initial sync failed");
+    }
+
     loop {
         tokio::select! {
             _ = shutdown_signal() => {
@@ -146,10 +154,75 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     }
                     Err(e) => warn!(error = %e, "heartbeat failed"),
                 }
+
+                if let Err(e) = sync_and_mock_run(
+                    &mut client,
+                    &join_resp.node_id,
+                    &join_resp.node_token,
+                )
+                .await
+                {
+                    warn!(error = %e, "sync failed");
+                }
             }
         }
     }
 
+    Ok(())
+}
+
+/// Pull desired instances and report them Running with a mock runtime id (Phase 3; no msb yet).
+async fn sync_and_mock_run(
+    client: &mut AgentServiceClient<Channel>,
+    node_id: &str,
+    node_token: &str,
+) -> Result<()> {
+    let sync = client
+        .sync(SyncRequest {
+            node_id: node_id.into(),
+            node_token: node_token.into(),
+        })
+        .await
+        .context("Sync RPC")?
+        .into_inner();
+
+    if sync.instances.is_empty() {
+        return Ok(());
+    }
+
+    let reports: Vec<InstanceStatus> = sync
+        .instances
+        .into_iter()
+        .map(|d| {
+            let runtime_id = format!("mock://{}/{}/{}", d.stack, d.service, d.ordinal);
+            info!(
+                instance_id = %d.instance_id,
+                stack = %d.stack,
+                service = %d.service,
+                ordinal = d.ordinal,
+                "mock runtime: instance Running"
+            );
+            InstanceStatus {
+                instance_id: d.instance_id,
+                phase: "Running".into(),
+                message: "phase3 mock runtime".into(),
+                runtime_id,
+            }
+        })
+        .collect();
+
+    let ok = client
+        .report_status(ReportStatusRequest {
+            node_id: node_id.into(),
+            node_token: node_token.into(),
+            instances: reports,
+        })
+        .await
+        .context("ReportStatus RPC")?
+        .into_inner();
+    if !ok.ok {
+        warn!("ReportStatus returned ok=false");
+    }
     Ok(())
 }
 

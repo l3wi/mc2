@@ -1,12 +1,15 @@
 //! MicroCommandControl server process (control plane).
 
+mod apply;
 mod auth;
 mod bootstrap;
 mod grpc;
 mod http;
+mod scheduler;
 mod tls;
 mod watcher;
 
+pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
 pub use grpc::AgentSvc;
 pub use http::router;
