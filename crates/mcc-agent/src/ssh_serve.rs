@@ -1,9 +1,9 @@
-//! Host-side SSH serve for instances.
+//! Host-side SSH serve for instances via `msb ssh serve` when available.
 //!
-//! Full protocol is provided by `msb ssh serve` (official external-client path).
-//! The microsandbox crate `ssh` feature currently fails to resolve on crates.io
-//! (`russh` pins `ed25519-dalek = 3.0.0-pre.7`, not published). When that is
-//! fixed we can switch to in-process `Sandbox::ssh().server_with(...)`.
+//! Note: the microsandbox crate `ssh` feature currently cannot be enabled
+//! (russh pins unpublished `ed25519-dalek = 3.0.0-pre.7`). The installed
+//! `msb` CLI must expose `ssh serve` / `ssh authorize` (newer msb). Older
+//! project-style CLIs will report phase Failed with a clear message.
 
 use mcc_api::agent::SshObserved;
 use mcc_runtime::DesiredSandbox;
@@ -24,11 +24,28 @@ struct ActiveServe {
 #[derive(Default)]
 pub struct SshServeTable {
     active: HashMap<String, ActiveServe>,
+    /// Cached capability probe (`msb ssh --help` succeeds).
+    msb_ssh_ok: Option<bool>,
 }
 
 impl SshServeTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn msb_supports_ssh(&mut self) -> bool {
+        if let Some(ok) = self.msb_ssh_ok {
+            return ok;
+        }
+        let ok = Command::new("msb")
+            .args(["ssh", "--help"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        self.msb_ssh_ok = Some(ok);
+        ok
     }
 
     pub async fn reconcile(
@@ -56,15 +73,19 @@ impl SshServeTable {
             };
         }
 
+        if !self.msb_supports_ssh() {
+            self.close(&desired.instance_id);
+            return SshObserved {
+                phase: "Failed".into(),
+                bind: String::new(),
+                port: 0,
+                message: "msb CLI has no `ssh` subcommand (upgrade msb, or wait for SDK ssh feature)".into(),
+            };
+        }
+
         if let Some(active) = self.active.get(&desired.instance_id) {
             if active.config_hash == desired.ssh.config_hash {
-                // Still running?
-                let alive = active
-                    .child
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.as_mut().map(|ch| ch.try_wait().ok() == Some(None)))
-                    .unwrap_or(false);
+                let alive = process_alive(&active.child);
                 if alive {
                     return SshObserved {
                         phase: "Open".into(),
@@ -73,12 +94,28 @@ impl SshServeTable {
                         message: "msb ssh serve".into(),
                     };
                 }
+                warn!(
+                    instance = %desired.instance_id,
+                    "msb ssh serve process exited; will restart"
+                );
             }
             self.close(&desired.instance_id);
         }
 
         match start_serve(desired) {
             Ok(active) => {
+                // Confirm child still alive after short settle.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if !process_alive(&active.child) {
+                    warn!(instance = %desired.instance_id, "msb ssh serve exited immediately");
+                    return SshObserved {
+                        phase: "Failed".into(),
+                        bind: String::new(),
+                        port: 0,
+                        message: "msb ssh serve exited immediately (check sandbox name / msb version)"
+                            .into(),
+                    };
+                }
                 let obs = SshObserved {
                     phase: "Open".into(),
                     bind: active.bind.clone(),
@@ -131,23 +168,33 @@ impl SshServeTable {
     }
 }
 
-fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
-    // Ensure msb CLI is available.
-    let msb = which_msb().ok_or_else(|| {
-        anyhow::anyhow!("msb CLI not on PATH (required for SSH serve until SDK ssh feature builds)")
-    })?;
+fn process_alive(child: &Mutex<Option<Child>>) -> bool {
+    let Ok(mut g) = child.lock() else {
+        return false;
+    };
+    let Some(ch) = g.as_mut() else {
+        return false;
+    };
+    match ch.try_wait() {
+        Ok(None) => true,           // still running
+        Ok(Some(_)) => false,       // exited
+        Err(_) => false,
+    }
+}
 
-    // Authorize keys into msb home (cluster keys → host authorized_keys).
+fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
+    // Authorize keys (best-effort).
     for key in &desired.ssh.authorized_public_keys {
-        let status = Command::new(&msb)
+        let out = Command::new("msb")
             .args(["ssh", "authorize", "--key", key])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if let Ok(s) = status {
-            if !s.success() {
-                warn!("msb ssh authorize failed for a key (continuing)");
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                warn!(%err, "msb ssh authorize failed");
             }
+            Err(e) => warn!(error = %e, "msb ssh authorize spawn failed"),
         }
     }
 
@@ -157,7 +204,6 @@ fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
         .parse()
         .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
 
-    // Pick free port if auto.
     let port = if desired.ssh.port == 0 {
         let listener = std::net::TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
         let p = listener.local_addr()?.port();
@@ -169,7 +215,7 @@ fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
 
     let host = desired.ssh.bind.clone();
     let name = desired.runtime_id.clone();
-    let child = Command::new(&msb)
+    let child = Command::new("msb")
         .args([
             "ssh",
             "serve",
@@ -179,14 +225,10 @@ fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
             "--port",
             &port.to_string(),
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn msb ssh serve: {e}"))?;
-
-    // Brief settle: if process dies immediately, surface failure.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    // can't try_wait after move easily — store and check on next reconcile
 
     Ok(ActiveServe {
         config_hash: desired.ssh.config_hash.clone(),
@@ -194,15 +236,4 @@ fn start_serve(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
         port,
         child: Mutex::new(Some(child)),
     })
-}
-
-fn which_msb() -> Option<String> {
-    Command::new("msb")
-        .arg("version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| "msb".into())
 }
