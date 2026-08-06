@@ -52,12 +52,13 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
     let cpus = desired.spec.resources.cpus.clamp(1, 255) as u8;
     let mem = desired.spec.resources.memory_mib.min(u32::MAX as u64) as u32;
 
+    // Note: `.replace()` is not accepted by create_detached on local backend.
+    // Callers must remove an existing sandbox first if recreation is needed.
     let mut b = Sandbox::builder(desired.runtime_id.clone())
         .image(desired.spec.image.as_str())
         .cpus(cpus)
         .memory(mem)
-        .detached(true)
-        .replace();
+        .detached(true);
 
     // Guest command for detached run (replaces image CMD; keeps ENTRYPOINT).
     let cmd = start_command_parts(&desired.spec);

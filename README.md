@@ -27,7 +27,7 @@ DATA=/tmp/mcc-dev
 
 # Terminal 3 — operator (token only if server was not --no-auth)
 export MCC_API=http://127.0.0.1:7443
-# export MCC_API_TOKEN="<api-token>"   # when auth is enabled
+# export MCC_API_KEY="<api-token>"   # when auth is enabled
 ./target/debug/mcc node ls
 ./target/debug/mcc apply -f examples/stacks/smoke.yaml
 ./target/debug/mcc ps

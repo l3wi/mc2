@@ -79,7 +79,7 @@ struct OperatorArgs {
     api: String,
 
     /// Operator API bearer token
-    #[arg(long, env = "MCC_API_TOKEN")]
+    #[arg(long, env = "MCC_API_KEY")]
     token: Option<String>,
 }
 

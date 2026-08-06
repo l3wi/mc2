@@ -415,7 +415,7 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 - **Auth:** join token → long-lived `mccnt_*` node token (hashed); re-join by name rotates token
 - **Store:** `upsert_node_join`, `heartbeat_node`, `list_nodes`, `mark_stale_nodes` (grace default 45s, watcher 5s)
 - **REST:** `GET /v1/nodes` (bearer); status counts ready/total
-- **CLI:** `mcc node ls --api … --token …` (env `MCC_API`, `MCC_API_TOKEN`)
+- **CLI:** `mcc node ls --api … --token …` (env `MCC_API`, `MCC_API_KEY`)
 - **Tests:** unit (memory/sqlite stale); integration `tests/tests/agent_join.rs`; process e2e verified
 
 ### Phase 3 — Apply stack + schedule (no msb yet)

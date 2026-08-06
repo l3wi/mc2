@@ -242,12 +242,13 @@ async fn reconcile(
                 warn!(
                     instance_id = %d.instance_id,
                     error = %e,
+                    error_full = format!("{e:#}"),
                     "ensure_running failed"
                 );
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
-                    message: e.to_string(),
+                    message: format!("{e:#}"),
                     runtime_id: d.runtime_id.clone(),
                 });
             }
