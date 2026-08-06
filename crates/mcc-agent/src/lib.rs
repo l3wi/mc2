@@ -9,13 +9,24 @@ use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
-use mcc_runtime::{default_runtime, desired_from_sync, NodeRuntime, SandboxPhase};
+use mcc_runtime::{
+    backoff_secs, default_runtime, desired_from_sync, NodeRuntime, RestartPolicy, SandboxPhase,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{info, warn};
+
+/// Per-sandbox restart / health bookkeeping on the agent.
+#[derive(Debug, Default)]
+struct InstanceRuntimeState {
+    restart_count: u32,
+    next_restart_ok: Option<Instant>,
+    last_health: Option<Instant>,
+    running_since: Option<Instant>,
+}
 
 /// Arguments for `mcc agent`.
 #[derive(Debug, Clone, Parser)]
@@ -128,6 +139,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     // Track runtime ids we created so we can GC on scale-down.
     let mut owned: HashSet<String> = HashSet::new();
+    let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
 
     if let Err(e) = reconcile(
         &mut client,
@@ -135,6 +147,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         &join_resp.node_token,
         runtime.as_ref(),
         &mut owned,
+        &mut rt_state,
     )
     .await
     {
@@ -171,6 +184,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     &join_resp.node_token,
                     runtime.as_ref(),
                     &mut owned,
+                    &mut rt_state,
                 )
                 .await
                 {
@@ -190,6 +204,7 @@ async fn reconcile(
     node_token: &str,
     runtime: &dyn NodeRuntime,
     owned: &mut HashSet<String>,
+    rt_state: &mut HashMap<String, InstanceRuntimeState>,
 ) -> Result<()> {
     let sync = client
         .sync(SyncRequest {
@@ -210,14 +225,112 @@ async fn reconcile(
             warn!(runtime_id = %rid, error = %e, "ensure_removed failed");
         }
         owned.remove(&rid);
+        rt_state.remove(&rid);
     }
 
     let mut reports: Vec<InstanceStatus> = Vec::new();
+    let now = Instant::now();
 
     for d in &desired {
+        let policy = RestartPolicy::parse(&d.spec.restart_policy);
+        let state = rt_state.entry(d.runtime_id.clone()).or_default();
+
+        // Backoff gate before ensure_running when we recently recreated.
+        if let Some(next) = state.next_restart_ok {
+            if now < next {
+                reports.push(InstanceStatus {
+                    instance_id: d.instance_id.clone(),
+                    phase: "Creating".into(),
+                    message: format!(
+                        "restart backoff {}s",
+                        next.saturating_duration_since(now).as_secs()
+                    ),
+                    runtime_id: d.runtime_id.clone(),
+                });
+                continue;
+            }
+        }
+
         match runtime.ensure_running(d).await {
-            Ok(st) => {
+            Ok(mut st) => {
                 owned.insert(d.runtime_id.clone());
+
+                // Reset restart counter after sustained Running.
+                if st.phase == SandboxPhase::Running {
+                    match state.running_since {
+                        None => state.running_since = Some(now),
+                        Some(since) if now.duration_since(since) >= Duration::from_secs(60) => {
+                            state.restart_count = 0;
+                            state.next_restart_ok = None;
+                        }
+                        Some(_) => {}
+                    }
+                } else {
+                    state.running_since = None;
+                }
+
+                // Exec health when Running.
+                if st.phase == SandboxPhase::Running {
+                    if let Some(ref health) = d.spec.health {
+                        if health.kind.eq_ignore_ascii_case("exec") && !health.command.is_empty() {
+                            let interval =
+                                Duration::from_secs(u64::from(health.interval_seconds.max(1)));
+                            let due = state
+                                .last_health
+                                .map(|t| now.duration_since(t) >= interval)
+                                .unwrap_or(true);
+                            if due {
+                                state.last_health = Some(now);
+                                match runtime.exec_command(&d.runtime_id, &health.command).await {
+                                    Ok(0) => {
+                                        // healthy
+                                    }
+                                    Ok(code) => {
+                                        warn!(
+                                            runtime_id = %d.runtime_id,
+                                            code,
+                                            "health exec failed"
+                                        );
+                                        st = handle_health_failure(
+                                            runtime,
+                                            d,
+                                            policy,
+                                            state,
+                                            now,
+                                            format!("health: exit {code}"),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            runtime_id = %d.runtime_id,
+                                            error = %e,
+                                            "health exec error"
+                                        );
+                                        st = handle_health_failure(
+                                            runtime,
+                                            d,
+                                            policy,
+                                            state,
+                                            now,
+                                            format!("health: {e:#}"),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Track recreates from Failed path (ensure_running did work).
+                if matches!(st.phase, SandboxPhase::Creating)
+                    && state.restart_count > 0
+                    && state.next_restart_ok.is_none()
+                {
+                    // noop — counts set in handle_health_failure
+                }
+
                 let phase = match st.phase {
                     SandboxPhase::Running => "Running",
                     SandboxPhase::Creating => "Creating",
@@ -245,6 +358,13 @@ async fn reconcile(
                     error_full = format!("{e:#}"),
                     "ensure_running failed"
                 );
+                // Schedule backoff for next attempt if policy allows restart.
+                if policy != RestartPolicy::Never {
+                    state.restart_count = state.restart_count.saturating_add(1);
+                    state.next_restart_ok =
+                        Some(now + Duration::from_secs(backoff_secs(state.restart_count)));
+                    state.running_since = None;
+                }
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
@@ -272,6 +392,38 @@ async fn reconcile(
         warn!("ReportStatus returned ok=false");
     }
     Ok(())
+}
+
+async fn handle_health_failure(
+    runtime: &dyn NodeRuntime,
+    d: &mcc_runtime::DesiredSandbox,
+    policy: RestartPolicy,
+    state: &mut InstanceRuntimeState,
+    now: Instant,
+    message: String,
+) -> mcc_runtime::SandboxStatus {
+    use mcc_runtime::SandboxStatus;
+    if policy == RestartPolicy::Never {
+        return SandboxStatus {
+            runtime_id: d.runtime_id.clone(),
+            phase: SandboxPhase::Failed,
+            message: Some(message),
+        };
+    }
+    state.restart_count = state.restart_count.saturating_add(1);
+    state.next_restart_ok = Some(now + Duration::from_secs(backoff_secs(state.restart_count)));
+    state.running_since = None;
+    if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
+        warn!(runtime_id = %d.runtime_id, error = %e, "remove after health fail");
+    }
+    match runtime.ensure_running(d).await {
+        Ok(st) => st,
+        Err(e) => SandboxStatus {
+            runtime_id: d.runtime_id.clone(),
+            phase: SandboxPhase::Failed,
+            message: Some(format!("{message}; recreate: {e:#}")),
+        },
+    }
 }
 
 async fn connect(

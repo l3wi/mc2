@@ -5,6 +5,7 @@ mod auth;
 mod bootstrap;
 mod grpc;
 mod http;
+mod reschedule;
 mod scheduler;
 mod secrets;
 mod tls;
@@ -14,6 +15,7 @@ pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
 pub use grpc::AgentSvc;
 pub use http::router;
+pub use reschedule::reschedule_not_ready;
 pub use secrets::{decrypt_secret, set_secret};
 pub use tls::{ensure_dev_tls, TlsPaths};
 
@@ -54,6 +56,10 @@ pub struct ServerArgs {
     /// Seconds without heartbeat before a Ready node becomes NotReady
     #[arg(long, default_value_t = 45, env = "MCC_HEARTBEAT_GRACE_SECS")]
     pub heartbeat_grace_secs: u64,
+
+    /// Interval for reschedule + Pending schedule loops (seconds)
+    #[arg(long, default_value_t = 5, env = "MCC_RESCHEDULE_INTERVAL_SECS")]
+    pub reschedule_interval_secs: u64,
 
     /// Bootstrap only: init data dir + tokens + exit (no listen)
     #[arg(long)]
@@ -180,6 +186,16 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         watcher::not_ready_loop(store_watch, grace, Duration::from_secs(5)).await;
     });
 
+    let reschedule_every = Duration::from_secs(args.reschedule_interval_secs.max(1));
+    let store_resched = store.clone() as Arc<dyn Store>;
+    tokio::spawn(async move {
+        reschedule::reschedule_loop(store_resched, reschedule_every).await;
+    });
+    let store_sched = store.clone() as Arc<dyn Store>;
+    tokio::spawn(async move {
+        reschedule::schedule_loop(store_sched, reschedule_every).await;
+    });
+
     let agent = AgentSvc {
         store: store as Arc<dyn Store>,
         secrets_key,
@@ -274,6 +290,7 @@ mod tests {
             secrets_key_path: None,
             grpc_plain: true,
             heartbeat_grace_secs: 45,
+            reschedule_interval_secs: 5,
             init_only: false,
             no_auth: false,
             dry_run: true,

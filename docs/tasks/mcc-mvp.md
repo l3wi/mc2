@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–5 complete)  
+**Status:** **Approved — implementing** (Phases 0–6 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -480,12 +480,22 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 6 — Restart, health, reschedule
 
-- [ ] restartPolicy enforcement  
-- [ ] Optional exec health check  
-- [ ] Node loss → reschedule (non-sticky)  
-- [ ] Volume sticky placement  
+- [x] restartPolicy enforcement  
+- [x] Optional exec health check  
+- [x] Node loss → reschedule (non-sticky)  
+- [x] Volume sticky placement  
 
-**Exit:** kill agent process / mark node down; replacement instance on another node (multi-node test).
+**Exit:** kill agent process / mark node down; replacement instance on another node (multi-node test). ✅ (integration harness)
+
+#### Implementation notes (Phase 6)
+
+- **Branch:** `feat/phase-6-restart-reschedule`
+- **Plan:** [phase-6-restart-health-reschedule.md](./phase-6-restart-health-reschedule.md)
+- **Store:** `unbind_instance` → Pending / clear node+runtime
+- **Server:** `reschedule_loop` + `schedule_loop` (default 5s); NotReady → unbind if `may_reschedule_on_node_loss` (not sticky volumes, not `never`)
+- **Agent/runtime:** `RestartPolicy` + `action_for_phase`; gate crash recreate; exec health via `SandboxHandle::connect` + `exec`
+- **Sync:** all instances bound to node (any phase) so restart can act on Failed/Stopped
+- **Tests:** unit policy/sticky/reschedule; integration `tests/tests/reschedule.rs`
 
 ### Phase 7 — OTLP + polish
 
@@ -619,7 +629,7 @@ just run-agent
 - [ ] apply YAML → schedule → real msb sandboxes  
 - [x] Secrets encrypted + injection  
 - [ ] Ports published  
-- [ ] Restart/reschedule basics  
+- [x] Restart/reschedule basics  
 - [ ] OTLP from mcc; docs align with msb-metrics  
 - [ ] linux-amd64, linux-arm64, darwin-arm64 release path  
 - [ ] Ingress stub only  
@@ -656,6 +666,6 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 3 | **done** | apply YAML, spread scheduler, mock agent Running |
 | 4 | **done** | NodeRuntime + microsandbox SDK only |
 | 5 | **done** | encrypted secrets, CLI/REST, agent msb injection; secrets smoke (set→Sync) |
-| 6 | next | restartPolicy, health, reschedule |
-| 7 | pending | OTLP + polish |
+| 6 | **done** | restartPolicy, exec health, NotReady reschedule, volume sticky |
+| 7 | next | OTLP + polish |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

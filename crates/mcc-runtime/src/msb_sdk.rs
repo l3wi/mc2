@@ -3,6 +3,7 @@
 //! Always uses the **local** backend. Host `MSB_API_KEY` / cloud profiles must not
 //! hijack MCC agent sandboxes.
 
+use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
 use crate::{DesiredSandbox, NodeRuntime, SandboxPhase, SandboxStatus};
 use anyhow::{Context, Result};
@@ -165,6 +166,8 @@ impl NodeRuntime for MicrosandboxRuntime {
         ensure_local_backend().await?;
         let name = desired.runtime_id.as_str();
 
+        let policy = RestartPolicy::parse(&desired.spec.restart_policy);
+
         match observe(name).await? {
             Some(st) => {
                 let phase = map_status(st);
@@ -183,22 +186,42 @@ impl NodeRuntime for MicrosandboxRuntime {
                             message: Some("starting".into()),
                         });
                     }
-                    SandboxPhase::Failed => {
-                        warn!(%name, "sandbox crashed; recreating");
-                        let _ = Sandbox::remove(name).await;
-                        create_detached(desired).await?;
-                    }
-                    SandboxPhase::Stopped | SandboxPhase::Pending | SandboxPhase::Unknown => {
-                        info!(%name, ?phase, "starting existing sandbox (detached)");
-                        match Sandbox::start_detached(name).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(%name, error = %e, "start_detached failed; recreating");
-                                let _ = Sandbox::remove(name).await;
-                                create_detached(desired).await?;
+                    other => match action_for_phase(policy, other) {
+                        RestartAction::Leave => {
+                            return Ok(SandboxStatus {
+                                runtime_id: name.into(),
+                                phase: other,
+                                message: Some(format!(
+                                    "left {} (restartPolicy={})",
+                                    other.as_str(),
+                                    desired.spec.restart_policy
+                                )),
+                            });
+                        }
+                        RestartAction::Recreate => {
+                            warn!(%name, ?policy, "recreating sandbox per restartPolicy");
+                            let _ = Sandbox::remove(name).await;
+                            create_detached(desired).await?;
+                        }
+                        RestartAction::Start => {
+                            info!(%name, ?other, "starting existing sandbox (detached)");
+                            match Sandbox::start_detached(name).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    if policy == RestartPolicy::Never {
+                                        return Ok(SandboxStatus {
+                                            runtime_id: name.into(),
+                                            phase: other,
+                                            message: Some(format!("start failed: {e:#}")),
+                                        });
+                                    }
+                                    warn!(%name, error = %e, "start_detached failed; recreating");
+                                    let _ = Sandbox::remove(name).await;
+                                    create_detached(desired).await?;
+                                }
                             }
                         }
-                    }
+                    },
                 }
             }
             None => {
@@ -271,6 +294,27 @@ impl NodeRuntime for MicrosandboxRuntime {
             .into_iter()
             .map(|h| h.name().to_string())
             .collect())
+    }
+
+    async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32> {
+        ensure_local_backend().await?;
+        if argv.is_empty() {
+            anyhow::bail!("exec_command: empty argv");
+        }
+        let handle = Sandbox::get(runtime_id)
+            .await
+            .with_context(|| format!("Sandbox::get({runtime_id}) for exec"))?;
+        let sb = handle
+            .connect()
+            .await
+            .with_context(|| format!("SandboxHandle::connect({runtime_id}) for exec"))?;
+        let cmd = argv[0].clone();
+        let args: Vec<String> = argv[1..].to_vec();
+        let output = sb
+            .exec(cmd, args)
+            .await
+            .with_context(|| format!("Sandbox::exec({runtime_id})"))?;
+        Ok(output.status().code)
     }
 }
 

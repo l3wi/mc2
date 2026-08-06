@@ -351,6 +351,20 @@ impl Store for MemoryStore {
         Ok(inst.clone())
     }
 
+    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        let inst = g
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))?;
+        inst.node_id = None;
+        inst.phase = InstancePhase::Pending.as_str().into();
+        inst.runtime_id = None;
+        inst.message = None;
+        inst.updated_at = Utc::now().to_rfc3339();
+        Ok(inst.clone())
+    }
+
     async fn update_instance_status(
         &self,
         instance_id: &str,
@@ -456,5 +470,28 @@ mod tests {
             .unwrap();
         assert_eq!(inst.len(), 1);
         assert_eq!(inst[0].ordinal, 0);
+    }
+
+    #[tokio::test]
+    async fn unbind_returns_to_pending() {
+        let store = MemoryStore::new();
+        store
+            .init_cluster(&hash_token("a"), &hash_token("j"))
+            .await
+            .unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+            .await
+            .unwrap();
+        let id = inst[0].id.clone();
+        store.bind_instance_to_node(&id, "node-a").await.unwrap();
+        let unbound = store.unbind_instance(&id).await.unwrap();
+        assert_eq!(unbound.phase, "Pending");
+        assert!(unbound.node_id.is_none());
+        assert!(unbound.runtime_id.is_none());
+        let pending = store.list_pending_instances().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
     }
 }

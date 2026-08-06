@@ -147,6 +147,9 @@ pub trait Store: Send + Sync {
         node_id: &str,
     ) -> Result<InstanceRecord, StoreError>;
 
+    /// Clear placement so the instance can be rescheduled (Pending, no node/runtime).
+    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError>;
+
     async fn update_instance_status(
         &self,
         instance_id: &str,

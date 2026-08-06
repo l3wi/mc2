@@ -122,14 +122,10 @@ impl AgentService for AgentSvc {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Include all phases bound to this node so restartPolicy can act on
+        // Failed/Stopped (scale-down deletes rows; unbound instances leave Sync).
         let mut instances = Vec::new();
         for i in rows {
-            if !matches!(
-                i.phase.as_str(),
-                "Scheduled" | "Creating" | "Running" | "Pending"
-            ) {
-                continue;
-            }
             let spec: ServiceSpec = serde_json::from_str(&i.spec_json)
                 .map_err(|e| Status::internal(format!("parse service spec for {}: {e}", i.id)))?;
             let resolved =

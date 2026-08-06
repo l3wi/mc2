@@ -100,11 +100,28 @@ pub fn service_load_map(instances: &[InstanceRecord], service: &str) -> HashMap<
         if inst.service != service {
             continue;
         }
+        // Failed/Stopped do not consume placement load (align with residual_capacity).
+        if inst.phase == "Failed" || inst.phase == "Stopped" {
+            continue;
+        }
         if let Some(ref nid) = inst.node_id {
             *m.entry(nid.clone()).or_insert(0) += 1;
         }
     }
     m
+}
+
+/// True when the service has node-local volume mounts (sticky placement).
+pub fn is_volume_sticky(spec: &ServiceSpec) -> bool {
+    !spec.volumes.is_empty()
+}
+
+/// Whether control plane may unbind this instance from a NotReady node.
+pub fn may_reschedule_on_node_loss(spec: &ServiceSpec) -> bool {
+    if is_volume_sticky(spec) {
+        return false;
+    }
+    !spec.restart_policy.eq_ignore_ascii_case("never")
 }
 
 fn resources_from_spec_json(spec_json: &str) -> (u32, u64) {
@@ -197,6 +214,38 @@ mod tests {
             &residual_capacity(&nodes, &[])
         )
         .is_none());
+    }
+
+    #[test]
+    fn may_reschedule_respects_sticky_and_never() {
+        let mut sticky = ServiceSpec {
+            image: "x".into(),
+            replicas: 1,
+            resources: ResourceSpec {
+                cpus: 1,
+                memory_mib: 512,
+            },
+            ports: vec![],
+            network: Default::default(),
+            env: BTreeMap::new(),
+            secrets: vec![],
+            volumes: vec![mcc_api::VolumeMount {
+                name: "d".into(),
+                mount: "/data".into(),
+            }],
+            restart_policy: "on-failure".into(),
+            health: None,
+            labels: BTreeMap::new(),
+            command: None,
+            node_name: None,
+            node_selector: BTreeMap::new(),
+        };
+        assert!(!may_reschedule_on_node_loss(&sticky));
+        sticky.volumes.clear();
+        sticky.restart_policy = "never".into();
+        assert!(!may_reschedule_on_node_loss(&sticky));
+        sticky.restart_policy = "on-failure".into();
+        assert!(may_reschedule_on_node_loss(&sticky));
     }
 
     #[test]

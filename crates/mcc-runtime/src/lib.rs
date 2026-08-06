@@ -4,11 +4,13 @@
 
 mod msb_sdk;
 mod naming;
+mod restart;
 mod spec;
 
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
-pub use spec::{desired_from_sync, DesiredSandbox, SandboxPhase};
+pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
+pub use spec::{desired_from_sync, DesiredSandbox, InjectedSecret, SandboxPhase};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,6 +29,9 @@ pub trait NodeRuntime: Send + Sync {
 
     /// List runtime ids known to this backend (best-effort).
     async fn list(&self) -> Result<Vec<String>>;
+
+    /// Run a guest command (health probes). Returns process exit code.
+    async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32>;
 }
 
 /// Observed sandbox state.

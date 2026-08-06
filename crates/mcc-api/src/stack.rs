@@ -185,6 +185,27 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
         if svc.replicas == 0 {
             return Err(format!("service {name}: replicas must be >= 1 for MVP"));
         }
+        let rp = svc.restart_policy.trim().to_ascii_lowercase();
+        if !matches!(rp.as_str(), "always" | "on-failure" | "never") {
+            return Err(format!(
+                "service {name}: restartPolicy must be always|on-failure|never (got {:?})",
+                svc.restart_policy
+            ));
+        }
+        if let Some(ref h) = svc.health {
+            let kind = h.kind.trim().to_ascii_lowercase();
+            if !matches!(kind.as_str(), "exec" | "none") {
+                return Err(format!(
+                    "service {name}: health.kind must be exec|none (got {:?})",
+                    h.kind
+                ));
+            }
+            if kind == "exec" && h.command.is_empty() {
+                return Err(format!(
+                    "service {name}: health.kind=exec requires a non-empty command"
+                ));
+            }
+        }
     }
     Ok(())
 }

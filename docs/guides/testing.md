@@ -98,7 +98,7 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not 
 | 3 Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
 | 4 msb runtime | naming, profile mapping | unit only in CI; full SDK lab-only |
 | 5 Secrets | encrypt/decrypt roundtrip | set → apply → agent Sync injection; missing/empty allowHosts fail closed |
-| 6 Reschedule | policy pure functions | multi-node harness with mock agents |
+| 6 Reschedule | restartPolicy matrix; sticky/never | two-node NotReady → rebind (`tests/tests/reschedule.rs`); sticky volumes stay |
 
 ---
 

@@ -32,6 +32,11 @@ services:
     #     allowHosts:
     #       - api.github.com
     restartPolicy: on-failure
+    # Optional app probe (agent runs via msb exec while Running):
+    # health:
+    #   kind: exec
+    #   command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
+    #   intervalSeconds: 30
     command: ["httpd", "-f", "-p", "8000", "-h", "/"]
     labels:
       app: web

@@ -572,6 +572,25 @@ impl Store for SqliteStore {
             .ok_or_else(|| StoreError::NotFound(instance_id.into()))
     }
 
+    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE instances SET node_id = NULL, phase = 'Pending', runtime_id = NULL,
+                message = NULL, updated_at = ?1 WHERE id = ?2"#,
+        )
+        .bind(&now)
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        self.get_instance(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+    }
+
     async fn update_instance_status(
         &self,
         instance_id: &str,
@@ -746,6 +765,30 @@ mod tests {
         let counts = store.cluster_counts().await.unwrap();
         assert_eq!(counts.nodes_total, 1);
         assert_eq!(counts.nodes_ready, 1);
+    }
+
+    #[tokio::test]
+    async fn unbind_instance_clears_placement() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mcc.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.init_cluster("", "").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+            .await
+            .unwrap();
+        let id = inst[0].id.clone();
+        store.bind_instance_to_node(&id, "n1").await.unwrap();
+        store
+            .update_instance_status(&id, "Running", Some("demo-web-0"), Some("ok"))
+            .await
+            .unwrap();
+        let unbound = store.unbind_instance(&id).await.unwrap();
+        assert_eq!(unbound.phase, "Pending");
+        assert!(unbound.node_id.is_none());
+        assert!(unbound.runtime_id.is_none());
+        assert!(store.list_pending_instances().await.unwrap().len() == 1);
     }
 
     #[tokio::test]
