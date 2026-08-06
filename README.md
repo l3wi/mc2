@@ -27,9 +27,12 @@ DATA=/tmp/mcc-dev
 # Terminal 3 — operator
 export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"
 ./target/debug/mcc node ls
-./target/debug/mcc apply -f examples/stacks/demo.yaml
+# Fast smoke (alpine ~3–4 MB) or demo (alpine + busybox httpd on :8080)
+./target/debug/mcc apply -f examples/stacks/smoke.yaml
+# ./target/debug/mcc apply -f examples/stacks/demo.yaml
 ./target/debug/mcc ps
 curl -s -H "Authorization: Bearer $MCC_API_TOKEN" "$MCC_API/v1/status"
+# after demo is Running: curl -s http://127.0.0.1:8080/
 ```
 
 Plain gRPC (no TLS) for local tests: add `--grpc-plain` on the server and use `--server http://127.0.0.1:7444` on the agent.
