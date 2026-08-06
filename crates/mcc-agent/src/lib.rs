@@ -56,17 +56,9 @@ pub struct AgentArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// Runtime backend: auto | mock | msb (default auto)
+    /// Runtime backend: auto | msb (SDK embed) | mock (CI)
     #[arg(long, default_value = "auto", env = "MCC_RUNTIME")]
     pub runtime: String,
-
-    /// Project dir for msb CLI Sandboxfile (default: ~/.mcc/agent/<node>/msb)
-    #[arg(long, env = "MCC_MSB_PROJECT")]
-    pub msb_project: Option<PathBuf>,
-
-    /// Path to msb binary (default: msb on PATH)
-    #[arg(long, env = "MCC_MSB_BIN")]
-    pub msb_bin: Option<PathBuf>,
 
     /// Log and exit without connecting
     #[arg(long, hide = true)]
@@ -84,15 +76,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let runtime_kind = RuntimeKind::parse(&args.runtime)
         .with_context(|| format!("invalid --runtime {}", args.runtime))?;
 
-    let project = args.msb_project.clone().unwrap_or_else(|| {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".mcc").join("agent").join(&name).join("msb")
-    });
-
-    let runtime: Arc<dyn NodeRuntime> =
-        Arc::from(select_runtime(runtime_kind, project, args.msb_bin.clone())?);
+    let runtime: Arc<dyn NodeRuntime> = Arc::from(select_runtime(runtime_kind)?);
 
     info!(
         node = %name,
@@ -415,8 +399,6 @@ mod tests {
             memory_mib: None,
             labels: vec![],
             runtime: "mock".into(),
-            msb_project: None,
-            msb_bin: None,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

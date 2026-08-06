@@ -1,17 +1,15 @@
 //! Node runtime abstraction for MicroCommandControl agents.
 //!
-//! - [`MockRuntime`] — Phase 3 / CI (no hypervisor)
-//! - [`MsbCliRuntime`] — real microVMs via `msb` CLI (project + Sandboxfile)
-//!
-//! Optional SDK embed can land later behind a feature; CLI is the Phase 4 path.
+//! - [`MockRuntime`] — unit/CI (no hypervisor)
+//! - [`MicrosandboxRuntime`] — **primary**: official `microsandbox` Rust SDK
 
 mod mock;
-mod msb_cli;
+mod msb_sdk;
 mod naming;
 mod spec;
 
 pub use mock::MockRuntime;
-pub use msb_cli::MsbCliRuntime;
+pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
 pub use spec::{desired_from_sync, DesiredSandbox, RuntimeKind, SandboxPhase};
 
@@ -21,10 +19,10 @@ use async_trait::async_trait;
 /// Execution backend on a node.
 #[async_trait]
 pub trait NodeRuntime: Send + Sync {
-    /// Human-readable backend name (`mock`, `msb-cli`, …).
+    /// Human-readable backend name (`mock`, `msb`, …).
     fn kind(&self) -> RuntimeKind;
 
-    /// Ensure sandbox exists and is running. Returns runtime id (usually msb name).
+    /// Ensure sandbox exists and is running. Returns runtime id (msb name).
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus>;
 
     /// Stop and remove a sandbox we own (scale-down / delete).
@@ -46,36 +44,12 @@ pub struct SandboxStatus {
 }
 
 /// Select a runtime for the agent.
-pub fn select_runtime(
-    kind: RuntimeKind,
-    project_dir: impl Into<std::path::PathBuf>,
-    msb_bin: Option<std::path::PathBuf>,
-) -> Result<Box<dyn NodeRuntime>> {
+///
+/// `auto` / `msb` → embedded microsandbox SDK.  
+/// `mock` → fake runtime for CI.
+pub fn select_runtime(kind: RuntimeKind) -> Result<Box<dyn NodeRuntime>> {
     match kind {
         RuntimeKind::Mock => Ok(Box::new(MockRuntime::new())),
-        RuntimeKind::MsbCli => {
-            let bin = msb_bin.unwrap_or_else(|| std::path::PathBuf::from("msb"));
-            Ok(Box::new(MsbCliRuntime::new(project_dir, bin)?))
-        }
-        RuntimeKind::Auto => {
-            let bin = msb_bin.unwrap_or_else(|| std::path::PathBuf::from("msb"));
-            if which_msb(&bin) {
-                Ok(Box::new(MsbCliRuntime::new(project_dir, bin)?))
-            } else {
-                tracing::warn!("msb not found on PATH; using mock runtime");
-                Ok(Box::new(MockRuntime::new()))
-            }
-        }
+        RuntimeKind::Auto | RuntimeKind::Msb => Ok(Box::new(MicrosandboxRuntime::new())),
     }
-}
-
-fn which_msb(bin: &std::path::Path) -> bool {
-    if bin.is_absolute() {
-        return bin.is_file();
-    }
-    std::process::Command::new(bin)
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }

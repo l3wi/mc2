@@ -440,23 +440,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 4 — Microsandbox runtime
 
-- [x] `MicrosandboxRuntime` embed (or msb CLI fallback) — **CLI path (`MsbCliRuntime`)**; SDK embed deferred (heavy / edition 2024)  
+- [x] `MicrosandboxRuntime` embed via official **microsandbox Rust SDK** (no CLI subprocess)  
 - [x] Create/stop/remove real sandboxes from service spec  
 - [x] Ports, resources, env, network profiles  
 - [x] Labels; deterministic names  
-- [x] Reattach after agent restart (detached `msb run -d` + Sandboxfile project)
+- [x] Reattach after agent restart (`Sandbox::get` / `start_detached` / `create_detached`)
 
-**Exit:** real microVM runs; published port works on node. ✅ (via `msb` CLI; CI uses mock)
+**Exit:** real microVM runs; published port works on node. ✅ (SDK embed; CI uses mock)
 
 #### Implementation notes (Phase 4)
 
 - **Branch:** `feat/phase-4-msb-runtime`
-- **Crate:** `mcc-runtime` — `NodeRuntime` trait, `MockRuntime`, `MsbCliRuntime`
-- **Names:** `{stack}-{service}-{ordinal}` → msb sandbox name
-- **Project:** `~/.mcc/agent/<node>/msb/` Sandboxfile managed by agent
-- **Agent:** `--runtime auto|mock|msb` (`MCC_RUNTIME`); reconcile = Sync → ensure_running / ensure_removed → ReportStatus
-- **CLI:** `mcc doctor` checks msb / platform
-- **CI:** mock runtime only (no KVM required)
+- **Crate:** `mcc-runtime` — `NodeRuntime` trait, `MockRuntime`, **`MicrosandboxRuntime`** (`microsandbox` 0.6.x SDK)
+- **Names:** `{stack}-{service}-{ordinal}` → sandbox name
+- **Lifecycle:** `Sandbox::builder(…).create_detached()` / `start_detached` / `stop` / `remove`; no `msb` CLI
+- **Agent:** `--runtime auto|msb|mock` (`MCC_RUNTIME`); reconcile = Sync → ensure_running / ensure_removed → ReportStatus
+- **CLI:** `mcc doctor` (platform; optional msb CLI check only as tooling)
+- **CI:** `--runtime mock` / unit tests on mock (no KVM required)
 
 ### Phase 5 — Secrets
 

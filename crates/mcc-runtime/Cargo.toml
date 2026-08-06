@@ -1,6 +1,6 @@
 [package]
 name = "mcc-runtime"
-description = "NodeRuntime trait and microsandbox backends for MicroCommandControl agents"
+description = "NodeRuntime trait and microsandbox SDK backend for MicroCommandControl agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,10 +13,11 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["process", "io-util", "time", "fs", "sync", "macros", "rt"] }
+tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
+# Official microsandbox Rust SDK (libkrun embed) — not the msb CLI.
+microsandbox = "0.6.8"
 
 [dev-dependencies]
 tempfile = "3"

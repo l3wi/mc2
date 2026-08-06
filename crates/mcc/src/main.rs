@@ -132,17 +132,16 @@ fn doctor_cmd(args: DoctorArgs) -> Result<()> {
                 let v = String::from_utf8_lossy(&o.stdout);
                 let e = String::from_utf8_lossy(&o.stderr);
                 println!(
-                    "  msb: ok — {}",
+                    "  msb CLI: ok — {} (optional tooling; agent embeds the SDK)",
                     v.trim().lines().next().unwrap_or(e.trim())
                 );
             }
-            Ok(o) => println!("  msb: failed ({})", o.status),
-            Err(e) => {
-                println!("  msb: not found ({e}) — install microsandbox CLI for real microVMs")
-            }
+            Ok(o) => println!("  msb CLI: failed ({}) — optional", o.status),
+            Err(e) => println!("  msb CLI: not on PATH ({e}) — optional; agent uses Rust SDK"),
         }
+        println!("  agent runtime: microsandbox crate (embedded SDK, not CLI)");
     }
-    println!("  agent runtime flag: --runtime auto|mock|msb (MCC_RUNTIME)");
+    println!("  agent --runtime: auto|msb (SDK) | mock (CI)  [MCC_RUNTIME]");
     Ok(())
 }
 

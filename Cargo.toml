@@ -16,7 +16,8 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/placeholder/mcc"
 authors = ["MCC contributors"]
-rust-version = "1.80"
+# microsandbox 0.6.x / smoltcp need a recent stable (1.91+).
+rust-version = "1.91"
 
 [workspace.dependencies]
 mcc-api = { path = "crates/mcc-api" }

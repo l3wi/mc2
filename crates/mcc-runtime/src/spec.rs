@@ -10,21 +10,21 @@ use crate::sandbox_name;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeKind {
-    /// Prefer `msb` CLI if available, else mock.
+    /// Embedded microsandbox SDK (same as [`Self::Msb`]).
     #[default]
     Auto,
     /// Always mock (CI / no hypervisor).
     Mock,
-    /// Real microVMs via `msb` CLI + Sandboxfile project.
-    MsbCli,
+    /// Real microVMs via the official **microsandbox Rust SDK**.
+    Msb,
 }
 
 impl RuntimeKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
+            "auto" | "sdk" | "embed" => Some(Self::Auto),
             "mock" => Some(Self::Mock),
-            "msb" | "msb-cli" | "cli" => Some(Self::MsbCli),
+            "msb" | "microsandbox" => Some(Self::Msb),
             _ => None,
         }
     }
@@ -33,7 +33,7 @@ impl RuntimeKind {
         match self {
             Self::Auto => "auto",
             Self::Mock => "mock",
-            Self::MsbCli => "msb-cli",
+            Self::Msb => "msb",
         }
     }
 }
@@ -103,46 +103,15 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
     Ok(out)
 }
 
-/// Map MCC network profiles to msb `network.scope`.
-pub fn msb_network_scope(profiles: &[String]) -> &'static str {
-    if profiles.iter().any(|p| p == "none") {
-        return "none";
-    }
-    if profiles.iter().any(|p| p == "host" || p == "any") {
-        return "any";
-    }
-    if profiles.iter().any(|p| p == "private" || p == "local") {
-        return "local";
-    }
-    // default / public
-    "public"
-}
-
-/// Build the guest start command line for Sandboxfile `scripts.start`.
-pub fn start_command(spec: &ServiceSpec) -> String {
+/// Guest command argv for the SDK `background_command` (detached run).
+pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
     if let Some(ref cmd) = spec.command {
         if !cmd.is_empty() {
-            return shell_join(cmd);
+            return cmd.clone();
         }
     }
     // Keep the VM alive if no command was provided.
-    "sleep infinity".into()
-}
-
-fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|p| {
-            if p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./:@=".contains(c))
-            {
-                p.clone()
-            } else {
-                format!("'{}'", p.replace('\'', "'\\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    vec!["sleep".into(), "infinity".into()]
 }
 
 #[cfg(test)]
@@ -150,9 +119,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_mapping() {
-        assert_eq!(msb_network_scope(&["public".into()]), "public");
-        assert_eq!(msb_network_scope(&["private".into()]), "local");
-        assert_eq!(msb_network_scope(&[]), "public");
+    fn start_parts_default() {
+        let spec = ServiceSpec {
+            image: "alpine".into(),
+            replicas: 1,
+            resources: Default::default(),
+            ports: vec![],
+            network: Default::default(),
+            env: Default::default(),
+            secrets: vec![],
+            volumes: vec![],
+            restart_policy: "on-failure".into(),
+            health: None,
+            labels: Default::default(),
+            command: None,
+            node_name: None,
+            node_selector: Default::default(),
+        };
+        assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
     }
 }
