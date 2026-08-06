@@ -1,23 +1,44 @@
 //! Microsandbox backend using the official Rust SDK (`Sandbox::builder` / embed).
+//!
+//! Always uses the **local** backend. Host `MSB_API_KEY` / cloud profiles must not
+//! hijack MCC agent sandboxes.
 
 use crate::spec::start_command_parts;
 use crate::{DesiredSandbox, NodeRuntime, SandboxPhase, SandboxStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
-use microsandbox::{NetworkPolicy, NetworkProfile, Sandbox};
+use microsandbox::{set_default_backend, LocalBackend, NetworkPolicy, NetworkProfile, Sandbox};
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
-/// Real microVM backend via the **microsandbox** crate (not the `msb` CLI).
+/// Real microVM backend via the **microsandbox** crate (local libkrun only).
 #[derive(Debug, Default)]
 pub struct MicrosandboxRuntime;
+
+/// Ensure process-wide default is LocalBackend once per agent process.
+static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 impl MicrosandboxRuntime {
     pub fn new() -> Self {
         Self
     }
+}
+
+async fn ensure_local_backend() -> Result<()> {
+    if LOCAL_BACKEND_INSTALLED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    // Install local even if MSB_API_KEY / cloud profile would otherwise win.
+    let local = LocalBackend::new()
+        .await
+        .context("LocalBackend::new (open microsandbox local DB)")?;
+    set_default_backend(local);
+    LOCAL_BACKEND_INSTALLED.store(true, Ordering::SeqCst);
+    info!("microsandbox: forced LocalBackend (ignores MSB_API_KEY / cloud profiles)");
+    Ok(())
 }
 
 fn map_status(s: MsbStatus) -> SandboxPhase {
@@ -49,6 +70,8 @@ fn network_profiles(desired: &DesiredSandbox) -> Vec<NetworkProfile> {
 }
 
 async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
+    ensure_local_backend().await?;
+
     let cpus = desired.spec.resources.cpus.clamp(1, 255) as u8;
     let mem = desired.spec.resources.memory_mib.min(u32::MAX as u64) as u32;
 
@@ -60,7 +83,6 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
         .memory(mem)
         .detached(true);
 
-    // Guest command for detached run (replaces image CMD; keeps ENTRYPOINT).
     let cmd = start_command_parts(&desired.spec);
     b = b.background_command(cmd);
 
@@ -99,7 +121,7 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
         image = %desired.spec.image,
         cpus,
         memory_mib = mem,
-        "creating detached microsandbox via SDK"
+        "creating detached microsandbox via SDK (local)"
     );
 
     b.create_detached()
@@ -109,6 +131,7 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
 }
 
 async fn observe(name: &str) -> Result<Option<MsbStatus>> {
+    ensure_local_backend().await?;
     match Sandbox::get(name).await {
         Ok(handle) => Ok(Some(handle.status_snapshot())),
         Err(e) => {
@@ -121,6 +144,7 @@ async fn observe(name: &str) -> Result<Option<MsbStatus>> {
 #[async_trait]
 impl NodeRuntime for MicrosandboxRuntime {
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus> {
+        ensure_local_backend().await?;
         let name = desired.runtime_id.as_str();
 
         match observe(name).await? {
@@ -131,7 +155,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                         return Ok(SandboxStatus {
                             runtime_id: name.into(),
                             phase,
-                            message: Some("microsandbox sdk".into()),
+                            message: Some("microsandbox sdk (local)".into()),
                         });
                     }
                     SandboxPhase::Creating => {
@@ -142,7 +166,6 @@ impl NodeRuntime for MicrosandboxRuntime {
                         });
                     }
                     SandboxPhase::Failed => {
-                        // Replace crashed sandbox
                         warn!(%name, "sandbox crashed; recreating");
                         let _ = Sandbox::remove(name).await;
                         create_detached(desired).await?;
@@ -165,7 +188,6 @@ impl NodeRuntime for MicrosandboxRuntime {
             }
         }
 
-        // Refresh status after create/start
         let phase = match observe(name).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Creating,
@@ -174,11 +196,12 @@ impl NodeRuntime for MicrosandboxRuntime {
         Ok(SandboxStatus {
             runtime_id: name.into(),
             phase,
-            message: Some("microsandbox sdk".into()),
+            message: Some("microsandbox sdk (local)".into()),
         })
     }
 
     async fn ensure_removed(&self, runtime_id: &str) -> Result<()> {
+        ensure_local_backend().await?;
         let name = runtime_id;
         info!(%name, "stopping/removing microsandbox via SDK");
 
@@ -197,7 +220,6 @@ impl NodeRuntime for MicrosandboxRuntime {
         match Sandbox::remove(name).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Missing is fine
                 let msg = e.to_string();
                 if msg.to_ascii_lowercase().contains("not found")
                     || msg.to_ascii_lowercase().contains("no such")
@@ -211,6 +233,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn status(&self, runtime_id: &str) -> Result<SandboxStatus> {
+        ensure_local_backend().await?;
         let phase = match observe(runtime_id).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Stopped,
@@ -223,28 +246,14 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn list(&self) -> Result<Vec<String>> {
+        ensure_local_backend().await?;
         let page = Sandbox::list().await.context("Sandbox::list")?;
-        // SandboxPage API — try common field names via debug if needed
-        Ok(page_names(page))
+        Ok(page
+            .sandboxes
+            .into_iter()
+            .map(|h| h.name().to_string())
+            .collect())
     }
-}
-
-fn page_names(page: microsandbox::SandboxPage) -> Vec<String> {
-    // SandboxPage exposes items/sandboxes; use Display/debug-friendly access.
-    // From SDK: typically `.items` or iterator — check via public API.
-    page_names_impl(page)
-}
-
-fn page_names_impl(page: microsandbox::SandboxPage) -> Vec<String> {
-    // Prefer documented accessors; fall back empty if shape differs at compile time.
-    #[allow(unused_mut)]
-    let mut names = Vec::new();
-    // `SandboxPage` in 0.6.x: public field `sandboxes: Vec<SandboxHandle>`
-    // and each handle has `.name()`.
-    for h in page.sandboxes {
-        names.push(h.name().to_string());
-    }
-    names
 }
 
 #[cfg(test)]
