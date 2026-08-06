@@ -86,6 +86,7 @@ async fn apply_schedules_and_agent_marks_running() {
                 phase: "Running".into(),
                 message: "test harness (no hypervisor)".into(),
                 runtime_id: rid,
+                ssh: None,
             }
         })
         .collect();

@@ -1,10 +1,11 @@
 //! Agent gRPC service (`mcc.agent.v1.AgentService`).
 
 use crate::secrets::resolve_injections;
+use crate::ssh::resolve_ssh_desired;
 use mcc_api::agent::agent_service_server::AgentService;
 use mcc_api::agent::{
     HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, ReportStatusRequest,
-    ReportStatusResponse, SecretInjection, SyncRequest, SyncResponse,
+    ReportStatusResponse, SecretInjection, SshDesired, SyncRequest, SyncResponse,
 };
 use mcc_api::ServiceSpec;
 use mcc_store::{hash_token, NodeHeartbeat, NodeJoin, SecretsKey, Store};
@@ -142,6 +143,19 @@ impl AgentService for AgentSvc {
                 })
                 .collect();
 
+            let ssh_res = resolve_ssh_desired(self.store.clone(), &i.id, spec.ssh.as_ref())
+                .await
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let ssh = Some(SshDesired {
+                enabled: ssh_res.enabled,
+                bind: ssh_res.bind,
+                port: u32::from(ssh_res.port),
+                user: ssh_res.user,
+                sftp: ssh_res.sftp,
+                authorized_public_keys: ssh_res.authorized_public_keys,
+                config_hash: ssh_res.config_hash,
+            });
+
             instances.push(mcc_api::agent::DesiredInstance {
                 instance_id: i.id,
                 stack: i.stack,
@@ -149,6 +163,7 @@ impl AgentService for AgentSvc {
                 ordinal: i.ordinal,
                 spec_json: i.spec_json,
                 secrets,
+                ssh,
             });
         }
 
@@ -201,6 +216,31 @@ impl AgentService for AgentSvc {
                 )
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+
+            if let Some(ref ssh) = st.ssh {
+                let _ = self
+                    .store
+                    .update_instance_ssh_observed(
+                        &st.instance_id,
+                        &ssh.phase,
+                        if ssh.bind.is_empty() {
+                            None
+                        } else {
+                            Some(ssh.bind.as_str())
+                        },
+                        if ssh.port == 0 {
+                            None
+                        } else {
+                            Some(ssh.port as u16)
+                        },
+                        if ssh.message.is_empty() {
+                            None
+                        } else {
+                            Some(ssh.message.as_str())
+                        },
+                    )
+                    .await;
+            }
         }
 
         Ok(Response::new(ReportStatusResponse { ok: true }))

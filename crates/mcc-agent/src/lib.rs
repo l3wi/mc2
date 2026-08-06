@@ -9,9 +9,12 @@ use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
+mod ssh_serve;
+
 use mcc_runtime::{
     backoff_secs, default_runtime, desired_from_sync, NodeRuntime, RestartPolicy, SandboxPhase,
 };
+use ssh_serve::SshServeTable;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,6 +145,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     // Track runtime ids we created so we can GC on scale-down.
     let mut owned: HashSet<String> = HashSet::new();
     let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
+    let mut ssh_table = SshServeTable::new();
 
     if let Err(e) = reconcile(
         &mut client,
@@ -150,6 +154,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         runtime.as_ref(),
         &mut owned,
         &mut rt_state,
+        &mut ssh_table,
     )
     .await
     {
@@ -188,6 +193,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     runtime.as_ref(),
                     &mut owned,
                     &mut rt_state,
+                    &mut ssh_table,
                 )
                 .await
                 {
@@ -212,6 +218,7 @@ async fn reconcile(
     runtime: &dyn NodeRuntime,
     owned: &mut HashSet<String>,
     rt_state: &mut HashMap<String, InstanceRuntimeState>,
+    ssh_table: &mut SshServeTable,
 ) -> Result<()> {
     let sync = client
         .sync(SyncRequest {
@@ -245,6 +252,7 @@ async fn reconcile(
         // Backoff gate before ensure_running when we recently recreated.
         if let Some(next) = state.next_restart_ok {
             if now < next {
+                let ssh = ssh_table.reconcile(d, false).await;
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Creating".into(),
@@ -253,6 +261,7 @@ async fn reconcile(
                         next.saturating_duration_since(now).as_secs()
                     ),
                     runtime_id: d.runtime_id.clone(),
+                    ssh: Some(ssh),
                 });
                 continue;
             }
@@ -345,6 +354,8 @@ async fn reconcile(
                     SandboxPhase::Stopped => "Stopped",
                     SandboxPhase::Pending | SandboxPhase::Unknown => "Creating",
                 };
+                let running = st.phase == SandboxPhase::Running;
+                let ssh = ssh_table.reconcile(d, running).await;
                 info!(
                     instance_id = %d.instance_id,
                     runtime_id = %st.runtime_id,
@@ -356,6 +367,7 @@ async fn reconcile(
                     phase: phase.into(),
                     message: st.message.unwrap_or_default(),
                     runtime_id: st.runtime_id,
+                    ssh: Some(ssh),
                 });
             }
             Err(e) => {
@@ -372,15 +384,20 @@ async fn reconcile(
                         Some(now + Duration::from_secs(backoff_secs(state.restart_count)));
                     state.running_since = None;
                 }
+                let ssh = ssh_table.reconcile(d, false).await;
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
                     message: format!("{e:#}"),
                     runtime_id: d.runtime_id.clone(),
+                    ssh: Some(ssh),
                 });
             }
         }
     }
+
+    let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
+    ssh_table.close_missing(&keep_ids);
 
     if reports.is_empty() {
         return Ok(());

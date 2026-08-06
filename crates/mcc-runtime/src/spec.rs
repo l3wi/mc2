@@ -39,6 +39,18 @@ pub struct InjectedSecret {
     pub allow_hosts: Vec<String>,
 }
 
+/// Host-side SSH serve desired state (from control plane).
+#[derive(Debug, Clone, Default)]
+pub struct DesiredSsh {
+    pub enabled: bool,
+    pub bind: String,
+    pub port: u16,
+    pub user: String,
+    pub sftp: bool,
+    pub authorized_public_keys: Vec<String>,
+    pub config_hash: String,
+}
+
 /// Desired sandbox derived from a control-plane instance assignment.
 #[derive(Debug, Clone)]
 pub struct DesiredSandbox {
@@ -49,6 +61,7 @@ pub struct DesiredSandbox {
     pub runtime_id: String,
     pub spec: ServiceSpec,
     pub secrets: Vec<InjectedSecret>,
+    pub ssh: DesiredSsh,
 }
 
 /// Map gRPC desired instances into runtime work items.
@@ -67,6 +80,27 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
                 allow_hosts: s.allow_hosts.clone(),
             })
             .collect();
+        let ssh = d
+            .ssh
+            .as_ref()
+            .map(|s| DesiredSsh {
+                enabled: s.enabled,
+                bind: if s.bind.is_empty() {
+                    "127.0.0.1".into()
+                } else {
+                    s.bind.clone()
+                },
+                port: s.port as u16,
+                user: if s.user.is_empty() {
+                    "root".into()
+                } else {
+                    s.user.clone()
+                },
+                sftp: s.sftp,
+                authorized_public_keys: s.authorized_public_keys.clone(),
+                config_hash: s.config_hash.clone(),
+            })
+            .unwrap_or_default();
         out.push(DesiredSandbox {
             instance_id: d.instance_id.clone(),
             stack: d.stack.clone(),
@@ -75,6 +109,7 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
             runtime_id,
             spec,
             secrets,
+            ssh,
         });
     }
     Ok(out)
@@ -113,6 +148,7 @@ mod tests {
             command: None,
             node_name: None,
             node_selector: Default::default(),
+            ssh: None,
         };
         assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
     }
@@ -134,6 +170,7 @@ mod tests {
             command: Some(vec!["sleep".into(), "infinity".into()]),
             node_name: None,
             node_selector: Default::default(),
+            ssh: None,
         };
         let inst = DesiredInstance {
             instance_id: "i1".into(),
@@ -146,6 +183,7 @@ mod tests {
                 value: "plaintext-for-agent".into(),
                 allow_hosts: vec!["api.example.com".into()],
             }],
+            ssh: None,
         };
         let work = desired_from_sync(&[inst]).unwrap();
         assert_eq!(work.len(), 1);

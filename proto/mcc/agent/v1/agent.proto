@@ -77,6 +77,8 @@ message DesiredInstance {
   string spec_json = 5;
   // Resolved secret injection material (plaintext values; gRPC only to owning agent).
   repeated SecretInjection secrets = 6;
+  // Host-side SSH serve desired state (resolved public keys).
+  SshDesired ssh = 7;
 }
 
 // Host-side msb secret injection: guest sees placeholder; value for allowlisted hosts.
@@ -86,9 +88,28 @@ message SecretInjection {
   repeated string allow_hosts = 3;
 }
 
+// Host-side SSH front end (not guest sshd).
+message SshDesired {
+  bool enabled = 1;
+  string bind = 2;
+  uint32 port = 3; // 0 = auto
+  string user = 4;
+  bool sftp = 5;
+  repeated string authorized_public_keys = 6;
+  string config_hash = 7;
+}
+
 message InstanceStatus {
   string instance_id = 1;
   string phase = 2; // Pending | Scheduled | Creating | Running | Failed | Stopped
   string message = 3;
   string runtime_id = 4;
+  SshObserved ssh = 5;
+}
+
+message SshObserved {
+  string phase = 1; // Closed | Opening | Open | Failed
+  string bind = 2;
+  uint32 port = 3;
+  string message = 4;
 }

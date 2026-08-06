@@ -198,6 +198,7 @@ async fn secret_reaches_agent_sync_for_sandbox() {
                 phase: "Running".into(),
                 message: "secrets smoke (injection material verified; no hypervisor)".into(),
                 runtime_id: work[0].runtime_id.clone(),
+                ssh: None,
             }],
         })
         .await

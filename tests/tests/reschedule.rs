@@ -149,6 +149,7 @@ services:
                 phase: "Running".into(),
                 message: "reschedule harness".into(),
                 runtime_id: "resched-web-0".into(),
+                ssh: None,
             }],
         })
         .await

@@ -38,10 +38,91 @@ enum Commands {
     Ps(OperatorArgs),
     /// Cluster secrets (encrypted at rest; values never listed)
     Secret(SecretCmd),
+    /// SSH authorized keys + endpoints
+    Ssh(SshCmd),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
     /// Show cluster / binary version info
     Version,
+}
+
+#[derive(Debug, Parser)]
+struct SshCmd {
+    #[command(subcommand)]
+    command: SshCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum SshCommands {
+    /// Manage cluster authorized public keys
+    Key(SshKeyCmd),
+    /// List open SSH endpoints
+    #[command(name = "ls", alias = "list")]
+    Ls(OperatorArgs),
+    /// Show SSH state for an instance
+    Show(SshInstanceArgs),
+    /// Open SSH on an instance (API override)
+    Open(SshOpenArgs),
+    /// Close SSH on an instance
+    Close(SshInstanceArgs),
+}
+
+#[derive(Debug, Parser)]
+struct SshKeyCmd {
+    #[command(subcommand)]
+    command: SshKeyCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum SshKeyCommands {
+    /// Add or replace an authorized public key
+    Add(SshKeyAddArgs),
+    #[command(name = "ls", alias = "list")]
+    Ls(OperatorArgs),
+    #[command(name = "rm", alias = "delete")]
+    Rm(SshKeyRmArgs),
+}
+
+#[derive(Debug, Parser)]
+struct SshKeyAddArgs {
+    name: String,
+    /// Public key line (or use --file)
+    #[arg(long)]
+    key: Option<String>,
+    /// Path to .pub file
+    #[arg(long)]
+    file: Option<String>,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SshKeyRmArgs {
+    name: String,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SshInstanceArgs {
+    /// Instance id
+    id: String,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SshOpenArgs {
+    id: String,
+    /// Authorized key names (repeatable)
+    #[arg(long = "key", required = true)]
+    keys: Vec<String>,
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+    #[command(flatten)]
+    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -146,6 +227,17 @@ async fn main() -> Result<()> {
             SecretCommands::Set(a) => secret_set(a).await?,
             SecretCommands::Ls(a) => secret_ls(a).await?,
             SecretCommands::Rm(a) => secret_rm(a).await?,
+        },
+        Commands::Ssh(SshCmd { command }) => match command {
+            SshCommands::Key(SshKeyCmd { command }) => match command {
+                SshKeyCommands::Add(a) => ssh_key_add(a).await?,
+                SshKeyCommands::Ls(a) => ssh_key_ls(a).await?,
+                SshKeyCommands::Rm(a) => ssh_key_rm(a).await?,
+            },
+            SshCommands::Ls(a) => ssh_endpoints_ls(a).await?,
+            SshCommands::Show(a) => ssh_instance_show(a).await?,
+            SshCommands::Open(a) => ssh_instance_open(a).await?,
+            SshCommands::Close(a) => ssh_instance_close(a).await?,
         },
         Commands::Doctor(args) => {
             let code = doctor_cmd(args)?;
@@ -342,6 +434,162 @@ async fn secret_rm(args: SecretRmArgs) -> Result<()> {
     }
     let body = res.text().await.unwrap_or_default();
     bail!("secret rm failed: {status} {body}");
+}
+
+async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
+    let public_key = if let Some(k) = args.key {
+        k
+    } else if let Some(path) = args.file {
+        std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?
+    } else {
+        bail!("pass --key or --file");
+    };
+    let url = format!(
+        "{}/v1/ssh/keys/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.name)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.put(&url).json(&serde_json::json!({
+        "publicKey": public_key.trim()
+    }));
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("PUT ssh key")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh-key add failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ssh_key_ls(args: OperatorArgs) -> Result<()> {
+    let url = format!("{}/v1/ssh/keys", args.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(t) = args.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("GET ssh keys")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh-key ls failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ssh_key_rm(args: SshKeyRmArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/ssh/keys/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.name)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.delete(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("DELETE ssh key")?;
+    let status = res.status();
+    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
+        println!("deleted {}", args.name);
+        return Ok(());
+    }
+    let body = res.text().await.unwrap_or_default();
+    bail!("ssh-key rm failed: {status} {body}");
+}
+
+async fn ssh_endpoints_ls(args: OperatorArgs) -> Result<()> {
+    let url = format!("{}/v1/ssh/endpoints", args.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(t) = args.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("GET ssh endpoints")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh ls failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ssh_instance_show(args: SshInstanceArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/instances/{}/ssh",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.id)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("GET instance ssh")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh show failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ssh_instance_open(args: SshOpenArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/instances/{}/ssh",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.id)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.put(&url).json(&serde_json::json!({
+        "enabled": true,
+        "bind": args.bind,
+        "port": args.port,
+        "authorizedKeys": args.keys,
+    }));
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("PUT instance ssh open")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh open failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn ssh_instance_close(args: SshInstanceArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/instances/{}/ssh",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.id)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.put(&url).json(&serde_json::json!({
+        "enabled": false,
+        "authorizedKeys": []
+    }));
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("PUT instance ssh close")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("ssh close failed: {status} {body}");
+    }
+    println!("{body}");
+    Ok(())
 }
 
 fn urlencoding_simple(s: &str) -> String {

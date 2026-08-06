@@ -1,8 +1,9 @@
 //! SQLite-backed store (default production backend).
 
 use crate::{
-    verify_token, ClusterCounts, ClusterMeta, InstanceRecord, NodeHeartbeat, NodeJoin, NodeRecord,
-    SecretBlob, SecretMeta, StackRecord, Store, StoreError,
+    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstanceRecord,
+    InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, SecretBlob, SecretMeta,
+    SshAuthorizedKey, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;
@@ -69,6 +70,24 @@ impl SqliteStore {
             last_heartbeat: row.get("last_heartbeat"),
             created_at: row.get("created_at"),
             node_token_hash: row.get("node_token_hash"),
+        }
+    }
+
+    fn map_instance_ssh(row: &sqlx::sqlite::SqliteRow) -> InstanceSshRecord {
+        InstanceSshRecord {
+            instance_id: row.get("instance_id"),
+            has_override: row.get::<i64, _>("has_override") != 0,
+            desired: row.get::<i64, _>("desired") != 0,
+            desired_bind: row.get("desired_bind"),
+            desired_port: row.get::<Option<i64>, _>("desired_port").map(|p| p as u16),
+            desired_user: row.get("desired_user"),
+            desired_sftp: row.get::<Option<i64>, _>("desired_sftp").map(|v| v != 0),
+            desired_key_names_json: row.get("desired_key_names_json"),
+            phase: row.get("phase"),
+            bind: row.get("bind"),
+            port: row.get::<Option<i64>, _>("port").map(|p| p as u16),
+            message: row.get("message"),
+            updated_at: row.get("updated_at"),
         }
     }
 
@@ -712,6 +731,236 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn put_ssh_key(
+        &self,
+        name: &str,
+        public_key: &str,
+    ) -> Result<SshAuthorizedKey, StoreError> {
+        validate_public_key(public_key).map_err(|e| StoreError::Other(anyhow::anyhow!(e)))?;
+        let now = Utc::now().to_rfc3339();
+        let pk = public_key.trim();
+        let fp = ssh_fingerprint(pk);
+        let existing = self.get_ssh_key(name).await?;
+        if existing.is_some() {
+            sqlx::query(
+                r#"UPDATE ssh_authorized_keys SET public_key = ?1, fingerprint = ?2, updated_at = ?3 WHERE name = ?4"#,
+            )
+            .bind(pk)
+            .bind(&fp)
+            .bind(&now)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO ssh_authorized_keys (name, public_key, fingerprint, labels_json, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, '{}', ?4, ?5)"#,
+            )
+            .bind(name)
+            .bind(pk)
+            .bind(&fp)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+        self.get_ssh_key(name)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(name.into()))
+    }
+
+    async fn get_ssh_key(&self, name: &str) -> Result<Option<SshAuthorizedKey>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT name, public_key, fingerprint, labels_json, created_at, updated_at
+               FROM ssh_authorized_keys WHERE name = ?1"#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.map(|r| SshAuthorizedKey {
+            name: r.get("name"),
+            public_key: r.get("public_key"),
+            fingerprint: r.get("fingerprint"),
+            labels_json: r.get("labels_json"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn list_ssh_keys(&self) -> Result<Vec<SshAuthorizedKey>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT name, public_key, fingerprint, labels_json, created_at, updated_at
+               FROM ssh_authorized_keys ORDER BY name"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SshAuthorizedKey {
+                name: r.get("name"),
+                public_key: r.get("public_key"),
+                fingerprint: r.get("fingerprint"),
+                labels_json: r.get("labels_json"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    async fn delete_ssh_key(&self, name: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query(r#"DELETE FROM ssh_authorized_keys WHERE name = ?1"#)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_instance_ssh(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT instance_id, has_override, desired, desired_bind, desired_port, desired_user,
+                      desired_sftp, desired_key_names_json, phase, bind, port, message, updated_at
+               FROM instance_ssh WHERE instance_id = ?1"#,
+        )
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.as_ref().map(Self::map_instance_ssh))
+    }
+
+    async fn put_instance_ssh_desired(
+        &self,
+        rec: &InstanceSshRecord,
+    ) -> Result<InstanceSshRecord, StoreError> {
+        if self.get_instance(&rec.instance_id).await?.is_none() {
+            return Err(StoreError::NotFound(rec.instance_id.clone()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let existing = self.get_instance_ssh(&rec.instance_id).await?;
+        let phase = existing
+            .as_ref()
+            .map(|e| e.phase.clone())
+            .unwrap_or_else(|| "Closed".into());
+        let bind = existing.as_ref().and_then(|e| e.bind.clone());
+        let port = existing.as_ref().and_then(|e| e.port);
+        let message = existing.as_ref().and_then(|e| e.message.clone());
+
+        sqlx::query(
+            r#"INSERT INTO instance_ssh (
+                 instance_id, has_override, desired, desired_bind, desired_port, desired_user,
+                 desired_sftp, desired_key_names_json, phase, bind, port, message, updated_at
+               ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+               ON CONFLICT(instance_id) DO UPDATE SET
+                 has_override = excluded.has_override,
+                 desired = excluded.desired,
+                 desired_bind = excluded.desired_bind,
+                 desired_port = excluded.desired_port,
+                 desired_user = excluded.desired_user,
+                 desired_sftp = excluded.desired_sftp,
+                 desired_key_names_json = excluded.desired_key_names_json,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(&rec.instance_id)
+        .bind(if rec.has_override { 1i64 } else { 0 })
+        .bind(if rec.desired { 1i64 } else { 0 })
+        .bind(&rec.desired_bind)
+        .bind(rec.desired_port.map(|p| p as i64))
+        .bind(&rec.desired_user)
+        .bind(rec.desired_sftp.map(|s| if s { 1i64 } else { 0 }))
+        .bind(&rec.desired_key_names_json)
+        .bind(&phase)
+        .bind(&bind)
+        .bind(port.map(|p| p as i64))
+        .bind(&message)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+
+        self.get_instance_ssh(&rec.instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(rec.instance_id.clone()))
+    }
+
+    async fn clear_instance_ssh_override(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError> {
+        let Some(_) = self.get_instance_ssh(instance_id).await? else {
+            return Ok(None);
+        };
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"UPDATE instance_ssh SET has_override = 0, desired = 0,
+                desired_bind = NULL, desired_port = NULL, desired_user = NULL,
+                desired_sftp = NULL, desired_key_names_json = NULL, updated_at = ?1
+               WHERE instance_id = ?2"#,
+        )
+        .bind(&now)
+        .bind(instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        self.get_instance_ssh(instance_id).await
+    }
+
+    async fn update_instance_ssh_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        bind: Option<&str>,
+        port: Option<u16>,
+        message: Option<&str>,
+    ) -> Result<InstanceSshRecord, StoreError> {
+        if self.get_instance(instance_id).await?.is_none() {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO instance_ssh (
+                 instance_id, has_override, desired, phase, bind, port, message, updated_at
+               ) VALUES (?1, 0, 0, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(instance_id) DO UPDATE SET
+                 phase = excluded.phase,
+                 bind = excluded.bind,
+                 port = excluded.port,
+                 message = excluded.message,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(instance_id)
+        .bind(phase)
+        .bind(bind)
+        .bind(port.map(|p| p as i64))
+        .bind(message)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        self.get_instance_ssh(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+    }
+
+    async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT instance_id, has_override, desired, desired_bind, desired_port, desired_user,
+                      desired_sftp, desired_key_names_json, phase, bind, port, message, updated_at
+               FROM instance_ssh"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows.iter().map(Self::map_instance_ssh).collect())
     }
 }
 

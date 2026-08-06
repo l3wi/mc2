@@ -352,8 +352,10 @@ mod tests {
                 command: None,
                 node_name: None,
                 node_selector: BTreeMap::new(),
+                ssh: None,
             },
             secrets: vec![],
+            ssh: Default::default(),
         };
         let p = network_profiles(&d);
         assert!(p.contains(&NetworkProfile::Public));

@@ -195,6 +195,7 @@ mod tests {
             command: None,
             node_name: Some("linux".into()),
             node_selector: BTreeMap::new(),
+            ssh: None,
         };
         let id = pick_node(
             &pending("web"),
@@ -239,6 +240,7 @@ mod tests {
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
+            ssh: None,
         };
         assert!(!may_reschedule_on_node_loss(&sticky));
         sticky.volumes.clear();
@@ -271,6 +273,7 @@ mod tests {
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
+            ssh: None,
         };
         let id = pick_node(
             &pending("web"),

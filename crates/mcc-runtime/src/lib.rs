@@ -10,7 +10,7 @@ mod spec;
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
-pub use spec::{desired_from_sync, DesiredSandbox, InjectedSecret, SandboxPhase};
+pub use spec::{desired_from_sync, DesiredSandbox, DesiredSsh, InjectedSecret, SandboxPhase};
 
 use anyhow::Result;
 use async_trait::async_trait;

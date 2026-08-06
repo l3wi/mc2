@@ -1,8 +1,9 @@
 //! In-memory store for unit tests.
 
 use crate::{
-    verify_token, ClusterCounts, ClusterMeta, InstancePhase, InstanceRecord, NodeHeartbeat,
-    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, StackRecord, Store, StoreError,
+    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstancePhase,
+    InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus, SecretBlob,
+    SecretMeta, SshAuthorizedKey, StackRecord, Store, StoreError,
 };
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -20,6 +21,8 @@ struct Inner {
     stacks: HashMap<String, StackRecord>,
     instances: HashMap<String, InstanceRecord>,
     secrets: HashMap<String, SecretBlob>,
+    ssh_keys: HashMap<String, SshAuthorizedKey>,
+    instance_ssh: HashMap<String, InstanceSshRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -443,6 +446,145 @@ impl Store for MemoryStore {
 
     async fn delete_secret(&self, name: &str) -> Result<bool, StoreError> {
         Ok(self.inner.write().await.secrets.remove(name).is_some())
+    }
+
+    async fn put_ssh_key(
+        &self,
+        name: &str,
+        public_key: &str,
+    ) -> Result<SshAuthorizedKey, StoreError> {
+        validate_public_key(public_key).map_err(|e| StoreError::Other(anyhow::anyhow!(e)))?;
+        let now = Utc::now().to_rfc3339();
+        let mut g = self.inner.write().await;
+        let rec = if let Some(existing) = g.ssh_keys.get(name) {
+            SshAuthorizedKey {
+                name: name.into(),
+                public_key: public_key.trim().into(),
+                fingerprint: ssh_fingerprint(public_key),
+                labels_json: existing.labels_json.clone(),
+                created_at: existing.created_at.clone(),
+                updated_at: now,
+            }
+        } else {
+            SshAuthorizedKey {
+                name: name.into(),
+                public_key: public_key.trim().into(),
+                fingerprint: ssh_fingerprint(public_key),
+                labels_json: "{}".into(),
+                created_at: now.clone(),
+                updated_at: now,
+            }
+        };
+        g.ssh_keys.insert(name.into(), rec.clone());
+        Ok(rec)
+    }
+
+    async fn get_ssh_key(&self, name: &str) -> Result<Option<SshAuthorizedKey>, StoreError> {
+        Ok(self.inner.read().await.ssh_keys.get(name).cloned())
+    }
+
+    async fn list_ssh_keys(&self) -> Result<Vec<SshAuthorizedKey>, StoreError> {
+        let mut v: Vec<_> = self.inner.read().await.ssh_keys.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    async fn delete_ssh_key(&self, name: &str) -> Result<bool, StoreError> {
+        Ok(self.inner.write().await.ssh_keys.remove(name).is_some())
+    }
+
+    async fn get_instance_ssh(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .instance_ssh
+            .get(instance_id)
+            .cloned())
+    }
+
+    async fn put_instance_ssh_desired(
+        &self,
+        rec: &InstanceSshRecord,
+    ) -> Result<InstanceSshRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        if !g.instances.contains_key(&rec.instance_id) {
+            return Err(StoreError::NotFound(rec.instance_id.clone()));
+        }
+        let mut out = rec.clone();
+        out.updated_at = Utc::now().to_rfc3339();
+        if let Some(existing) = g.instance_ssh.get(&rec.instance_id) {
+            // Keep observed fields unless resetting desired off
+            out.phase = existing.phase.clone();
+            out.bind = existing.bind.clone();
+            out.port = existing.port;
+            out.message = existing.message.clone();
+        }
+        g.instance_ssh.insert(rec.instance_id.clone(), out.clone());
+        Ok(out)
+    }
+
+    async fn clear_instance_ssh_override(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError> {
+        let mut g = self.inner.write().await;
+        let Some(mut rec) = g.instance_ssh.get(instance_id).cloned() else {
+            return Ok(None);
+        };
+        rec.has_override = false;
+        rec.desired = false;
+        rec.desired_bind = None;
+        rec.desired_port = None;
+        rec.desired_user = None;
+        rec.desired_sftp = None;
+        rec.desired_key_names_json = None;
+        rec.updated_at = Utc::now().to_rfc3339();
+        g.instance_ssh.insert(instance_id.into(), rec.clone());
+        Ok(Some(rec))
+    }
+
+    async fn update_instance_ssh_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        bind: Option<&str>,
+        port: Option<u16>,
+        message: Option<&str>,
+    ) -> Result<InstanceSshRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        if !g.instances.contains_key(instance_id) {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        let mut rec =
+            g.instance_ssh
+                .get(instance_id)
+                .cloned()
+                .unwrap_or_else(|| InstanceSshRecord {
+                    instance_id: instance_id.into(),
+                    ..Default::default()
+                });
+        rec.phase = phase.into();
+        rec.bind = bind.map(str::to_string);
+        rec.port = port;
+        rec.message = message.map(str::to_string);
+        rec.updated_at = Utc::now().to_rfc3339();
+        g.instance_ssh.insert(instance_id.into(), rec.clone());
+        Ok(rec)
+    }
+
+    async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .instance_ssh
+            .values()
+            .cloned()
+            .collect())
     }
 }
 

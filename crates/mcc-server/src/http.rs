@@ -26,6 +26,18 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/instances", get(list_instances))
         .route("/v1/secrets", get(list_secrets))
         .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
+        .route("/v1/ssh/keys", get(list_ssh_keys))
+        .route(
+            "/v1/ssh/keys/{name}",
+            put(put_ssh_key).get(get_ssh_key).delete(delete_ssh_key),
+        )
+        .route("/v1/ssh/endpoints", get(list_ssh_endpoints))
+        .route(
+            "/v1/instances/{id}/ssh",
+            get(get_instance_ssh)
+                .put(put_instance_ssh)
+                .delete(delete_instance_ssh),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -198,6 +210,275 @@ async fn delete_secret(
             Json(json!({ "error": e.to_string() })),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshKeyBody {
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstanceSshPutBody {
+    enabled: bool,
+    #[serde(default)]
+    bind: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    sftp: Option<bool>,
+    #[serde(default)]
+    authorized_keys: Vec<String>,
+}
+
+async fn list_ssh_keys(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<Vec<mcc_store::SshAuthorizedKey>>, (StatusCode, Json<serde_json::Value>)> {
+    state.store.list_ssh_keys().await.map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })
+}
+
+async fn get_ssh_key(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<Json<mcc_store::SshAuthorizedKey>, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.get_ssh_key(&name).await {
+        Ok(Some(k)) => Ok(Json(k)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("ssh key not found: {name}") })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+async fn put_ssh_key(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+    Json(body): Json<SshKeyBody>,
+) -> Result<Json<mcc_store::SshAuthorizedKey>, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.put_ssh_key(&name, &body.public_key).await {
+        Ok(k) => Ok(Json(k)),
+        Err(e) => {
+            let msg = e.to_string();
+            let code =
+                if msg.contains("unsupported") || msg.contains("empty") || msg.contains("short") {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+            Err((code, Json(json!({ "error": msg }))))
+        }
+    }
+}
+
+async fn delete_ssh_key(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.delete_ssh_key(&name).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("ssh key not found: {name}") })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+async fn get_instance_ssh(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .store
+        .get_instance(&id)
+        .await
+        .map_err(store_err)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("instance not found: {id}") })),
+        ));
+    }
+    let rec = state.store.get_instance_ssh(&id).await.map_err(store_err)?;
+    Ok(Json(ssh_view(&id, rec.as_ref())))
+}
+
+async fn put_instance_ssh(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<InstanceSshPutBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .store
+        .get_instance(&id)
+        .await
+        .map_err(store_err)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("instance not found: {id}") })),
+        ));
+    }
+    if body.enabled && body.authorized_keys.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "authorizedKeys required when enabled" })),
+        ));
+    }
+    for name in &body.authorized_keys {
+        if state
+            .store
+            .get_ssh_key(name)
+            .await
+            .map_err(store_err)?
+            .is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("ssh key not found: {name}") })),
+            ));
+        }
+    }
+    let desired = crate::ssh::desired_from_put(
+        &id,
+        body.enabled,
+        body.bind,
+        body.port,
+        body.user,
+        body.sftp,
+        body.authorized_keys,
+    );
+    let rec = state
+        .store
+        .put_instance_ssh_desired(&desired)
+        .await
+        .map_err(store_err)?;
+    Ok(Json(ssh_view(&id, Some(&rec))))
+}
+
+async fn delete_instance_ssh(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .store
+        .get_instance(&id)
+        .await
+        .map_err(store_err)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("instance not found: {id}") })),
+        ));
+    }
+    let _ = state
+        .store
+        .clear_instance_ssh_override(&id)
+        .await
+        .map_err(store_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_ssh_endpoints(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let rows = state.store.list_instance_ssh().await.map_err(store_err)?;
+    let instances = state.store.list_instances().await.map_err(store_err)?;
+    let nodes = state.store.list_nodes().await.map_err(store_err)?;
+    let mut endpoints = Vec::new();
+    for r in rows {
+        if r.phase != "Open" {
+            continue;
+        }
+        let inst = instances.iter().find(|i| i.id == r.instance_id);
+        let node_name = inst
+            .and_then(|i| i.node_id.as_ref())
+            .and_then(|nid| nodes.iter().find(|n| n.id == *nid))
+            .map(|n| n.name.clone());
+        let port = r.port.unwrap_or(0);
+        let bind = r.bind.clone().unwrap_or_else(|| "127.0.0.1".into());
+        endpoints.push(json!({
+            "instanceId": r.instance_id,
+            "stack": inst.map(|i| i.stack.clone()),
+            "service": inst.map(|i| i.service.clone()),
+            "ordinal": inst.map(|i| i.ordinal),
+            "nodeId": inst.and_then(|i| i.node_id.clone()),
+            "nodeName": node_name,
+            "phase": r.phase,
+            "bind": bind,
+            "port": port,
+            "connectHint": format!("ssh -p {port} root@{bind}"),
+        }));
+    }
+    Ok(Json(json!({ "endpoints": endpoints })))
+}
+
+fn ssh_view(instance_id: &str, rec: Option<&mcc_store::InstanceSshRecord>) -> serde_json::Value {
+    match rec {
+        None => json!({
+            "instanceId": instance_id,
+            "desired": false,
+            "phase": "Closed",
+            "bind": null,
+            "port": null,
+            "message": null,
+        }),
+        Some(r) => {
+            let keys: Vec<String> = r
+                .desired_key_names_json
+                .as_ref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default();
+            json!({
+                "instanceId": r.instance_id,
+                "hasOverride": r.has_override,
+                "desired": r.desired,
+                "desiredBind": r.desired_bind,
+                "desiredPort": r.desired_port,
+                "desiredUser": r.desired_user,
+                "desiredSftp": r.desired_sftp,
+                "authorizedKeys": keys,
+                "phase": r.phase,
+                "bind": r.bind,
+                "port": r.port,
+                "message": r.message,
+                "updatedAt": r.updated_at,
+            })
+        }
+    }
+}
+
+fn store_err(e: impl ToString) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
 }
 
 #[cfg(test)]

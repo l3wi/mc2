@@ -8,6 +8,7 @@ mod instance;
 mod memory;
 mod node;
 mod sqlite;
+mod ssh;
 mod token;
 
 pub use crypto::{CryptoError, SecretsKey};
@@ -15,6 +16,7 @@ pub use instance::{InstancePhase, InstanceRecord, StackRecord};
 pub use memory::MemoryStore;
 pub use node::{NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus};
 pub use sqlite::SqliteStore;
+pub use ssh::{ssh_fingerprint, validate_public_key, InstanceSshRecord, SshAuthorizedKey};
 pub use token::{hash_token, verify_token, TokenKind};
 
 /// Metadata for a secret (never includes plaintext).
@@ -174,4 +176,48 @@ pub trait Store: Send + Sync {
     async fn list_secret_meta(&self) -> Result<Vec<SecretMeta>, StoreError>;
 
     async fn delete_secret(&self, name: &str) -> Result<bool, StoreError>;
+
+    // --- SSH authorized keys + instance endpoints ---
+
+    async fn put_ssh_key(
+        &self,
+        name: &str,
+        public_key: &str,
+    ) -> Result<SshAuthorizedKey, StoreError>;
+
+    async fn get_ssh_key(&self, name: &str) -> Result<Option<SshAuthorizedKey>, StoreError>;
+
+    async fn list_ssh_keys(&self) -> Result<Vec<SshAuthorizedKey>, StoreError>;
+
+    /// Delete key. Returns false if missing.
+    async fn delete_ssh_key(&self, name: &str) -> Result<bool, StoreError>;
+
+    async fn get_instance_ssh(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError>;
+
+    /// Upsert full desired SSH override for an instance (API PUT).
+    async fn put_instance_ssh_desired(
+        &self,
+        rec: &InstanceSshRecord,
+    ) -> Result<InstanceSshRecord, StoreError>;
+
+    /// Clear API override (desired falls back to YAML). Observed phase may be closed by agent.
+    async fn clear_instance_ssh_override(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceSshRecord>, StoreError>;
+
+    /// Agent ReportStatus: update observed bind/port/phase.
+    async fn update_instance_ssh_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        bind: Option<&str>,
+        port: Option<u16>,
+        message: Option<&str>,
+    ) -> Result<InstanceSshRecord, StoreError>;
+
+    async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError>;
 }

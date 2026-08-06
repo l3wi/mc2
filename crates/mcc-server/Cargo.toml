@@ -12,6 +12,8 @@ mcc-api = { workspace = true }
 mcc-store = { workspace = true }
 mcc-metrics = { workspace = true }
 anyhow = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = { workspace = true }
@@ -21,7 +23,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.8"
-hex = "0.4"
 http = "1"
 tonic = { version = "0.12", features = ["transport", "tls"] }
 rcgen = "0.13"

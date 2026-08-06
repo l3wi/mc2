@@ -8,6 +8,7 @@ mod http;
 mod reschedule;
 mod scheduler;
 mod secrets;
+mod ssh;
 mod tls;
 mod watcher;
 

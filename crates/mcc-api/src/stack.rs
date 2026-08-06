@@ -57,6 +57,41 @@ pub struct ServiceSpec {
     /// Soft placement by node labels.
     #[serde(default)]
     pub node_selector: BTreeMap<String, String>,
+    /// Host-side msb SSH serve (not guest sshd). Optional.
+    #[serde(default)]
+    pub ssh: Option<SshSpec>,
+}
+
+/// Desired host-side SSH front end for a service (msb `ssh` feature).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ssh_bind")]
+    pub bind: String,
+    /// Host port on the agent; `0` = auto-allocate.
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default = "default_ssh_user")]
+    pub user: String,
+    #[serde(default = "default_true")]
+    pub sftp: bool,
+    /// Cluster key names (`mcc ssh-key` / `/v1/ssh/keys`).
+    #[serde(default)]
+    pub authorized_keys: Vec<String>,
+}
+
+fn default_ssh_bind() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_ssh_user() -> String {
+    "root".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_replicas() -> u32 {
