@@ -1,9 +1,26 @@
 # SSH control plane — authorized keys + open/close ports
 
-**Status:** Implemented (control plane + agent serve via `msb ssh serve`; SDK `ssh` feature blocked on crates.io)  
+**Status:** Implemented (control plane + **configurable** agent SSH backend)  
 **Date:** 2026-08-06  
-**Depends on:** msb host-side SSH (`ssh` feature), agent-owned sandboxes  
+**Depends on:** agent backend choice (`auto` / `msb-cli` / `disabled` / `sdk`); msb host-side SSH when using CLI  
 **Related:** [microsandbox.md](./microsandbox.md), Phase 5 secrets, Phase 6 reschedule
+
+### Agent SSH backend (configurable)
+
+Live SSH is **not** hard-wired to host `msb`. On each agent:
+
+| Mode | Env / flag | Behavior |
+| ---- | ---------- | -------- |
+| `auto` (default) | `MCC_SSH_BACKEND=auto` | Use `msb ssh` if available; else Failed with config hint |
+| `msb-cli` | `MCC_SSH_BACKEND=msb-cli` | Require `msb ssh serve` / `authorize` |
+| `disabled` | `MCC_SSH_BACKEND=disabled` | Never open listeners (keys/desired still in CP) |
+| `sdk` | `MCC_SSH_BACKEND=sdk` | In-process SDK (not available until upstream deps fix) |
+
+```bash
+mcc agent --server http://… --ssh-backend auto --msb-bin /path/to/msb
+# or: export MCC_SSH_BACKEND=disabled
+# or: export MCC_MSB_BIN=/opt/msb-new/bin/msb
+```
 
 ---
 
