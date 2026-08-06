@@ -1,0 +1,22 @@
+[package]
+name = "mcc"
+description = "MicroCommandControl — dual-mode CLI (server | agent | operator commands)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mcc"
+path = "src/main.rs"
+
+[dependencies]
+mcc-server = { workspace = true }
+mcc-agent = { workspace = true }
+mcc-api = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

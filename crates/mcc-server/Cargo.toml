@@ -1,0 +1,20 @@
+[package]
+name = "mcc-server"
+description = "MicroCommandControl server (control plane)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mcc-api = { workspace = true }
+mcc-store = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "mcc_server"
+path = "src/lib.rs"

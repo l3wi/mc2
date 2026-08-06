@@ -1,0 +1,15 @@
+[package]
+name = "mcc-api"
+description = "Shared API types and constants for MicroCommandControl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[lib]
+name = "mcc_api"
+path = "src/lib.rs"

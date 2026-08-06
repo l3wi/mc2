@@ -1,0 +1,19 @@
+[package]
+name = "mcc-agent"
+description = "MicroCommandControl node agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mcc-api = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "mcc_agent"
+path = "src/lib.rs"

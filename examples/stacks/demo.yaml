@@ -1,0 +1,32 @@
+# Example stack for MicroCommandControl (Phase 3+ apply).
+# Phase 0: schema reference only — `mcc apply` is not implemented yet.
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: demo
+  labels:
+    env: lab
+
+services:
+  web:
+    image: python:3.12
+    replicas: 1
+    resources:
+      cpus: 1
+      memoryMiB: 512
+    ports:
+      - host: 8080
+        guest: 8000
+        protocol: tcp
+        # bind defaults to 127.0.0.1
+    network:
+      profiles: [public]
+    env:
+      APP_ENV: lab
+    restartPolicy: on-failure
+    command: ["python", "-m", "http.server", "8000"]
+    labels:
+      app: web
+
+# volumes: {}
+# ingress:  # reserved — not implemented in MVP

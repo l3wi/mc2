@@ -1,0 +1,82 @@
+// MicroCommandControl agent API (gRPC).
+// Phase 0: schema placeholder. Phase 2: implemented with tonic/prost.
+syntax = "proto3";
+
+package mcc.agent.v1;
+
+// Agent control-plane service. Agents call these RPCs against the server.
+service AgentService {
+  // Register a node with a join token; returns node credentials.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Periodic capacity + health report.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Pull desired instance specs for this node.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+
+  // Report instance phase / errors / resource summary.
+  rpc ReportStatus(ReportStatusRequest) returns (ReportStatusResponse);
+}
+
+message JoinRequest {
+  string join_token = 1;
+  string node_name = 2;
+  map<string, string> labels = 3;
+  string arch = 4;
+  Capacity capacity = 5;
+}
+
+message JoinResponse {
+  string node_id = 1;
+  // Phase 2: node token and/or client cert material
+  string node_token = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  Capacity capacity = 2;
+  string status = 3; // Ready | NotReady | Draining
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+message SyncRequest {
+  string node_id = 1;
+}
+
+message SyncResponse {
+  repeated DesiredInstance instances = 1;
+}
+
+message ReportStatusRequest {
+  string node_id = 1;
+  repeated InstanceStatus instances = 2;
+}
+
+message ReportStatusResponse {
+  bool ok = 1;
+}
+
+message Capacity {
+  uint32 cpus = 1;
+  uint64 memory_mib = 2;
+}
+
+message DesiredInstance {
+  string instance_id = 1;
+  string stack = 2;
+  string service = 3;
+  uint32 ordinal = 4;
+  // Opaque JSON/YAML service spec until typed messages land
+  string spec_json = 5;
+}
+
+message InstanceStatus {
+  string instance_id = 1;
+  string phase = 2; // Pending | Scheduled | Creating | Running | Failed | Stopped
+  string message = 3;
+  string runtime_id = 4;
+}
