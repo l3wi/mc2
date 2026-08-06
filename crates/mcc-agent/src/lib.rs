@@ -1,7 +1,7 @@
 //! MicroCommandControl node agent.
 //!
-//! Phase 2: join + heartbeat over gRPC.
-//! Phase 3–4: sync desired instances and drive NodeRuntime (mock or msb).
+//! Join + heartbeat over gRPC; reconcile desired instances via the
+//! embedded microsandbox Rust SDK (only runtime).
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -9,7 +9,7 @@ use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
-use mcc_runtime::{desired_from_sync, select_runtime, NodeRuntime, RuntimeKind, SandboxPhase};
+use mcc_runtime::{default_runtime, desired_from_sync, NodeRuntime, SandboxPhase};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,10 +56,6 @@ pub struct AgentArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// Runtime backend: auto | msb (SDK embed) | mock (CI)
-    #[arg(long, default_value = "auto", env = "MCC_RUNTIME")]
-    pub runtime: String,
-
     /// Log and exit without connecting
     #[arg(long, hide = true)]
     pub dry_run: bool,
@@ -73,16 +69,13 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         .or_else(hostname)
         .unwrap_or_else(|| "unknown".into());
 
-    let runtime_kind = RuntimeKind::parse(&args.runtime)
-        .with_context(|| format!("invalid --runtime {}", args.runtime))?;
-
-    let runtime: Arc<dyn NodeRuntime> = Arc::from(select_runtime(runtime_kind)?);
+    let runtime: Arc<dyn NodeRuntime> = Arc::new(default_runtime());
 
     info!(
         node = %name,
         server = ?args.server,
         has_token = args.token.is_some(),
-        runtime = runtime.kind().as_str(),
+        runtime = "microsandbox-sdk",
         api = mcc_api::API_VERSION,
         "MicroCommandControl agent starting"
     );
@@ -128,7 +121,6 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         cpus,
         memory_mib,
         arch = %arch,
-        runtime = runtime.kind().as_str(),
         "joined control plane"
     );
 
@@ -239,7 +231,6 @@ async fn reconcile(
                     instance_id = %d.instance_id,
                     runtime_id = %st.runtime_id,
                     phase,
-                    backend = runtime.kind().as_str(),
                     "runtime reconciled"
                 );
                 reports.push(InstanceStatus {
@@ -398,7 +389,6 @@ mod tests {
             cpus: None,
             memory_mib: None,
             labels: vec![],
-            runtime: "mock".into(),
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

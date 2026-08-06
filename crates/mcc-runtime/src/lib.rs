@@ -1,28 +1,22 @@
-//! Node runtime abstraction for MicroCommandControl agents.
+//! Node runtime for MicroCommandControl agents.
 //!
-//! - [`MockRuntime`] — unit/CI (no hypervisor)
-//! - [`MicrosandboxRuntime`] — **primary**: official `microsandbox` Rust SDK
+//! Sole backend: official [`microsandbox`](https://docs.rs/microsandbox) Rust SDK.
 
-mod mock;
 mod msb_sdk;
 mod naming;
 mod spec;
 
-pub use mock::MockRuntime;
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
-pub use spec::{desired_from_sync, DesiredSandbox, RuntimeKind, SandboxPhase};
+pub use spec::{desired_from_sync, DesiredSandbox, SandboxPhase};
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Execution backend on a node.
+/// Execution backend on a node (microsandbox SDK only).
 #[async_trait]
 pub trait NodeRuntime: Send + Sync {
-    /// Human-readable backend name (`mock`, `msb`, …).
-    fn kind(&self) -> RuntimeKind;
-
-    /// Ensure sandbox exists and is running. Returns runtime id (msb name).
+    /// Ensure sandbox exists and is running. Returns runtime id (sandbox name).
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus>;
 
     /// Stop and remove a sandbox we own (scale-down / delete).
@@ -43,13 +37,7 @@ pub struct SandboxStatus {
     pub message: Option<String>,
 }
 
-/// Select a runtime for the agent.
-///
-/// `auto` / `msb` → embedded microsandbox SDK.  
-/// `mock` → fake runtime for CI.
-pub fn select_runtime(kind: RuntimeKind) -> Result<Box<dyn NodeRuntime>> {
-    match kind {
-        RuntimeKind::Mock => Ok(Box::new(MockRuntime::new())),
-        RuntimeKind::Auto | RuntimeKind::Msb => Ok(Box::new(MicrosandboxRuntime::new())),
-    }
+/// Construct the only supported runtime: embedded microsandbox SDK.
+pub fn default_runtime() -> MicrosandboxRuntime {
+    MicrosandboxRuntime::new()
 }

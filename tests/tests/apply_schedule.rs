@@ -1,4 +1,7 @@
-//! Integration: apply stack → schedule onto Ready node → agent mock Running.
+//! Integration: apply stack → schedule onto Ready node → agent reports Running.
+//!
+//! Does not start microVMs (no hypervisor in CI). Agent status is reported over gRPC
+//! the same way a real agent would after SDK reconcile.
 
 use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
@@ -62,7 +65,7 @@ async fn apply_schedules_and_agent_marks_running() {
     assert_eq!(body["scheduled"], 2);
     assert_eq!(body["pending"], 0);
 
-    // Simulate agent mock runtime: Sync + ReportStatus Running
+    // Simulate agent after SDK reconcile: Sync + ReportStatus Running
     let sync = agent
         .sync(SyncRequest {
             node_id: join.node_id.clone(),
@@ -81,8 +84,8 @@ async fn apply_schedules_and_agent_marks_running() {
             InstanceStatus {
                 instance_id: d.instance_id.clone(),
                 phase: "Running".into(),
-                message: "mock".into(),
-                runtime_id: format!("mock://{rid}"),
+                message: "test harness (no hypervisor)".into(),
+                runtime_id: rid,
             }
         })
         .collect();

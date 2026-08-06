@@ -17,15 +17,12 @@ DATA=/tmp/mcc-dev
 # Terminal 1 — control plane (prints API + join tokens once)
 ./target/debug/mcc server --data-dir "$DATA" --bind 127.0.0.1:7443 --grpc-bind 127.0.0.1:7444
 
-# Terminal 2 — agent (embeds microsandbox SDK; needs KVM/HVF)
+# Terminal 2 — agent (embeds microsandbox SDK; needs KVM / Apple Silicon HVF)
 ./target/debug/mcc agent \
   --server https://127.0.0.1:7444 \
   --tls-ca "$DATA/tls/ca.pem" \
   --token "<join-token>" \
-  --name "$(hostname)" \
-  --runtime auto
-# --runtime mock   # CI / no hypervisor (no real microVMs)
-# --runtime msb    # same as auto: official Rust SDK
+  --name "$(hostname)"
 
 # Terminal 3 — operator
 export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"

@@ -79,7 +79,7 @@ cargo test -p mcc --test cli_smoke
 
 `.github/workflows/ci.yml`: `fmt` → `clippy -D warnings` → `cargo test --workspace` → `cargo build -p mcc`.
 
-Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Mock runtimes (Phase 3+) belong in CI; real microsandbox stays lab-only or `#[ignore]`.
+Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not boot real microVMs in CI; exercise control-plane + gRPC with reported status. Real microsandbox runs are lab-only.
 
 ---
 
@@ -89,7 +89,7 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Mock ru
 | ----- | ----------- | ------------------ |
 | 2 Agent join | token/node field validation | join → node Ready in DB; REST list nodes |
 | 3 Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
-| 4 msb runtime | naming, profile mapping | mock lifecycle in CI; real SDK lab-only (`--runtime auto`) |
+| 4 msb runtime | naming, profile mapping | unit only in CI; full SDK lab-only |
 | 5 Secrets | encrypt/decrypt roundtrip | set secret → not echoed on REST; agent gets material |
 | 6 Reschedule | policy pure functions | multi-node harness with mock agents |
 

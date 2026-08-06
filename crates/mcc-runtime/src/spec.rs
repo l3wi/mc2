@@ -6,38 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox_name;
 
-/// Which backend the agent should use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeKind {
-    /// Embedded microsandbox SDK (same as [`Self::Msb`]).
-    #[default]
-    Auto,
-    /// Always mock (CI / no hypervisor).
-    Mock,
-    /// Real microVMs via the official **microsandbox Rust SDK**.
-    Msb,
-}
-
-impl RuntimeKind {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "auto" | "sdk" | "embed" => Some(Self::Auto),
-            "mock" => Some(Self::Mock),
-            "msb" | "microsandbox" => Some(Self::Msb),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Mock => "mock",
-            Self::Msb => "msb",
-        }
-    }
-}
-
 /// Phase reported to the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -59,16 +27,6 @@ impl SandboxPhase {
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
             Self::Unknown => "Unknown",
-        }
-    }
-
-    pub fn from_msb_status(s: &str) -> Self {
-        match s.to_ascii_uppercase().as_str() {
-            "RUNNING" => Self::Running,
-            "STOPPED" | "STOPPING" => Self::Stopped,
-            "FAILED" | "CRASHED" | "ERROR" => Self::Failed,
-            "CREATING" | "STARTING" => Self::Creating,
-            _ => Self::Unknown,
         }
     }
 }

@@ -446,17 +446,17 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 - [x] Labels; deterministic names  
 - [x] Reattach after agent restart (`Sandbox::get` / `start_detached` / `create_detached`)
 
-**Exit:** real microVM runs; published port works on node. ✅ (SDK embed; CI uses mock)
+**Exit:** real microVM runs; published port works on node. ✅ (SDK embed only)
 
 #### Implementation notes (Phase 4)
 
 - **Branch:** `feat/phase-4-msb-runtime`
-- **Crate:** `mcc-runtime` — `NodeRuntime` trait, `MockRuntime`, **`MicrosandboxRuntime`** (`microsandbox` 0.6.x SDK)
+- **Crate:** `mcc-runtime` — `NodeRuntime` + **`MicrosandboxRuntime`** only (`microsandbox` 0.6.x SDK). No mock/CLI backends.
 - **Names:** `{stack}-{service}-{ordinal}` → sandbox name
-- **Lifecycle:** `Sandbox::builder(…).create_detached()` / `start_detached` / `stop` / `remove`; no `msb` CLI
-- **Agent:** `--runtime auto|msb|mock` (`MCC_RUNTIME`); reconcile = Sync → ensure_running / ensure_removed → ReportStatus
-- **CLI:** `mcc doctor` (platform; optional msb CLI check only as tooling)
-- **CI:** `--runtime mock` / unit tests on mock (no KVM required)
+- **Lifecycle:** `Sandbox::builder(…).create_detached()` / `start_detached` / `stop` / `remove`
+- **Agent:** always uses SDK; reconcile = Sync → ensure_running / ensure_removed → ReportStatus
+- **CLI:** `mcc doctor` (platform; optional msb CLI presence check for host tooling only)
+- **CI:** control-plane + gRPC tests without starting VMs; real microVMs are lab/manual
 
 ### Phase 5 — Secrets
 
@@ -556,7 +556,7 @@ just run-agent
 | ----- | ---- | -------- |
 | Unit | Scheduler filters/scoring; YAML parse; secret encrypt/decrypt; token hash | `crates/*/src` `#[cfg(test)]` |
 | Store | SQLite migrations + CRUD + reopen | unit + `tests/tests/store_persistence.rs` |
-| Integration | Server HTTP/auth; later agent join; mock runtime (no KVM in CI) | `tests/` (`mcc-tests`), `crates/mcc/tests/` |
+| Integration | Server HTTP/auth; agent join; apply without booting VMs | `tests/` (`mcc-tests`), `crates/mcc/tests/` |
 | Manual / lab | Real msb on Linux KVM + macOS Apple Silicon | outside CI |
 | Optional CI | Linux nested-virt only if available; otherwise label `msb` tests ignored | — |
 
@@ -569,7 +569,7 @@ just run-agent
 | Risk | Mitigation |
 | ---- | ---------- |
 | microsandbox beta API churn | Pin version; runtime trait; CLI fallback |
-| Embed complexity / link issues | Phase 3 mock first; Phase 4 fallback subprocess |
+| Embed complexity / link issues | Pin `microsandbox` version; runtime trait keeps CP free of SDK types |
 | macOS signing / HVF entitlements | Follow msb docs; document `codesign` if needed |
 | Secret key loss | Document backup; accept re-entry in v1 |
 | Port bind defaults (127.0.0.1 vs 0.0.0.0) | Default loopback; explicit bind in YAML for LAN |
@@ -643,7 +643,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
 | 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
 | 3 | **done** | apply YAML, spread scheduler, mock agent Running |
-| 4 | **done** | NodeRuntime + msb CLI microVMs; mock for CI |
+| 4 | **done** | NodeRuntime + microsandbox SDK only |
 | 5 | next | encrypted secrets + injection |
 | 6–7 | pending | — |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

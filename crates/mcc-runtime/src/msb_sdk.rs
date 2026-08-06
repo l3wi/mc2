@@ -1,7 +1,7 @@
 //! Microsandbox backend using the official Rust SDK (`Sandbox::builder` / embed).
 
 use crate::spec::start_command_parts;
-use crate::{DesiredSandbox, NodeRuntime, RuntimeKind, SandboxPhase, SandboxStatus};
+use crate::{DesiredSandbox, NodeRuntime, SandboxPhase, SandboxStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
@@ -119,10 +119,6 @@ async fn observe(name: &str) -> Result<Option<MsbStatus>> {
 
 #[async_trait]
 impl NodeRuntime for MicrosandboxRuntime {
-    fn kind(&self) -> RuntimeKind {
-        RuntimeKind::Msb
-    }
-
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus> {
         let name = desired.runtime_id.as_str();
 

@@ -126,22 +126,21 @@ fn doctor_cmd(args: DoctorArgs) -> Result<()> {
     {
         println!("  hypervisor: Apple Silicon HVF expected (agent machine)");
     }
+    println!("  agent runtime: microsandbox Rust SDK only (embedded)");
     if args.msb {
         match std::process::Command::new("msb").arg("version").output() {
             Ok(o) if o.status.success() => {
                 let v = String::from_utf8_lossy(&o.stdout);
                 let e = String::from_utf8_lossy(&o.stderr);
                 println!(
-                    "  msb CLI: ok — {} (optional tooling; agent embeds the SDK)",
+                    "  msb CLI: ok — {} (optional host tooling; not used by agent)",
                     v.trim().lines().next().unwrap_or(e.trim())
                 );
             }
             Ok(o) => println!("  msb CLI: failed ({}) — optional", o.status),
-            Err(e) => println!("  msb CLI: not on PATH ({e}) — optional; agent uses Rust SDK"),
+            Err(e) => println!("  msb CLI: not on PATH ({e}) — optional"),
         }
-        println!("  agent runtime: microsandbox crate (embedded SDK, not CLI)");
     }
-    println!("  agent --runtime: auto|msb (SDK) | mock (CI)  [MCC_RUNTIME]");
     Ok(())
 }
 
