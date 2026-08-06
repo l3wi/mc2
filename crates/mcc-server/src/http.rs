@@ -2,15 +2,17 @@
 
 use crate::apply::{apply_stack_yaml, list_instance_views};
 use crate::auth::AuthUser;
+use crate::secrets::set_secret;
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, put},
     Json, Router,
 };
 use mcc_api::{ClusterStatus, NodeView};
+use mcc_store::SecretMeta;
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::trace::TraceLayer;
@@ -20,8 +22,10 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/nodes", get(list_nodes))
-        .route("/v1/stacks:apply", post(apply_stack))
+        .route("/v1/stacks:apply", axum::routing::post(apply_stack))
         .route("/v1/instances", get(list_instances))
+        .route("/v1/secrets", get(list_secrets))
+        .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -29,6 +33,11 @@ pub fn router(state: AppState) -> Router {
 #[derive(Debug, Deserialize)]
 struct ApplyBody {
     yaml: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretBody {
+    value: String,
 }
 
 async fn health() -> impl IntoResponse {
@@ -132,6 +141,65 @@ async fn list_instances(
         })
 }
 
+/// List secret names only — never values.
+async fn list_secrets(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<Vec<SecretMeta>>, (StatusCode, Json<serde_json::Value>)> {
+    state.store.list_secret_meta().await.map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })
+}
+
+/// Create or replace a secret. Body is never returned.
+async fn put_secret(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+    Json(body): Json<SecretBody>,
+) -> Result<Json<SecretMeta>, (StatusCode, Json<serde_json::Value>)> {
+    match set_secret(
+        state.store.clone(),
+        state.secrets_key.as_ref(),
+        &name,
+        &body.value,
+    )
+    .await
+    {
+        Ok(meta) => Ok(Json(meta)),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("required") || msg.contains("empty") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((code, Json(json!({ "error": msg }))))
+        }
+    }
+}
+
+async fn delete_secret(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.delete_secret(&name).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("secret not found: {name}") })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +214,7 @@ mod tests {
             store,
             data_dir: std::path::PathBuf::from("/tmp/mcc-test"),
             version: "0.1.0-test",
+            secrets_key: std::sync::Arc::new(mcc_store::SecretsKey::from_bytes([1u8; 32])),
         }
     }
 

@@ -31,6 +31,14 @@ impl SandboxPhase {
     }
 }
 
+/// Host-side secret injection material (plaintext only on agent).
+#[derive(Debug, Clone)]
+pub struct InjectedSecret {
+    pub env: String,
+    pub value: String,
+    pub allow_hosts: Vec<String>,
+}
+
 /// Desired sandbox derived from a control-plane instance assignment.
 #[derive(Debug, Clone)]
 pub struct DesiredSandbox {
@@ -40,6 +48,7 @@ pub struct DesiredSandbox {
     pub ordinal: u32,
     pub runtime_id: String,
     pub spec: ServiceSpec,
+    pub secrets: Vec<InjectedSecret>,
 }
 
 /// Map gRPC desired instances into runtime work items.
@@ -49,6 +58,15 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
         let spec: ServiceSpec = serde_json::from_str(&d.spec_json)
             .map_err(|e| anyhow::anyhow!("parse spec for {}: {e}", d.instance_id))?;
         let runtime_id = sandbox_name(&d.stack, &d.service, d.ordinal);
+        let secrets = d
+            .secrets
+            .iter()
+            .map(|s| InjectedSecret {
+                env: s.env.clone(),
+                value: s.value.clone(),
+                allow_hosts: s.allow_hosts.clone(),
+            })
+            .collect();
         out.push(DesiredSandbox {
             instance_id: d.instance_id.clone(),
             stack: d.stack.clone(),
@@ -56,6 +74,7 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
             ordinal: d.ordinal,
             runtime_id,
             spec,
+            secrets,
         });
     }
     Ok(out)

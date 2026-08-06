@@ -1,11 +1,13 @@
 //! Agent gRPC service (`mcc.agent.v1.AgentService`).
 
+use crate::secrets::resolve_injections;
 use mcc_api::agent::agent_service_server::AgentService;
 use mcc_api::agent::{
     HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, ReportStatusRequest,
-    ReportStatusResponse, SyncRequest, SyncResponse,
+    ReportStatusResponse, SecretInjection, SyncRequest, SyncResponse,
 };
-use mcc_store::{hash_token, NodeHeartbeat, NodeJoin, Store};
+use mcc_api::ServiceSpec;
+use mcc_store::{hash_token, NodeHeartbeat, NodeJoin, SecretsKey, Store};
 use rand::RngCore;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -15,6 +17,7 @@ use tracing::{info, warn};
 #[derive(Clone)]
 pub struct AgentSvc {
     pub store: Arc<dyn Store>,
+    pub secrets_key: Arc<SecretsKey>,
 }
 
 fn gen_node_token() -> String {
@@ -119,22 +122,39 @@ impl AgentService for AgentSvc {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let instances = rows
-            .into_iter()
-            .filter(|i| {
-                matches!(
-                    i.phase.as_str(),
-                    "Scheduled" | "Creating" | "Running" | "Pending"
-                )
-            })
-            .map(|i| mcc_api::agent::DesiredInstance {
+        let mut instances = Vec::new();
+        for i in rows {
+            if !matches!(
+                i.phase.as_str(),
+                "Scheduled" | "Creating" | "Running" | "Pending"
+            ) {
+                continue;
+            }
+            let spec: ServiceSpec = serde_json::from_str(&i.spec_json)
+                .map_err(|e| Status::internal(format!("parse service spec for {}: {e}", i.id)))?;
+            let resolved =
+                resolve_injections(self.store.clone(), self.secrets_key.as_ref(), &spec.secrets)
+                    .await
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+            let secrets = resolved
+                .into_iter()
+                .map(|s| SecretInjection {
+                    env: s.env,
+                    value: s.value,
+                    allow_hosts: s.allow_hosts,
+                })
+                .collect();
+
+            instances.push(mcc_api::agent::DesiredInstance {
                 instance_id: i.id,
                 stack: i.stack,
                 service: i.service,
                 ordinal: i.ordinal,
                 spec_json: i.spec_json,
-            })
-            .collect();
+                secrets,
+            });
+        }
 
         Ok(Response::new(SyncResponse { instances }))
     }

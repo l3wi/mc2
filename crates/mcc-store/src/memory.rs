@@ -2,7 +2,7 @@
 
 use crate::{
     verify_token, ClusterCounts, ClusterMeta, InstancePhase, InstanceRecord, NodeHeartbeat,
-    NodeJoin, NodeRecord, NodeStatus, StackRecord, Store, StoreError,
+    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, StackRecord, Store, StoreError,
 };
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -19,6 +19,7 @@ struct Inner {
     by_name: HashMap<String, String>,
     stacks: HashMap<String, StackRecord>,
     instances: HashMap<String, InstanceRecord>,
+    secrets: HashMap<String, SecretBlob>,
 }
 
 #[derive(Debug, Default)]
@@ -375,6 +376,59 @@ impl Store for MemoryStore {
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
         Ok(self.inner.read().await.instances.get(instance_id).cloned())
+    }
+
+    async fn put_secret_blob(
+        &self,
+        name: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<SecretMeta, StoreError> {
+        let mut g = self.inner.write().await;
+        let now = Utc::now().to_rfc3339();
+        let created = g
+            .secrets
+            .get(name)
+            .map(|s| s.created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        g.secrets.insert(
+            name.into(),
+            SecretBlob {
+                name: name.into(),
+                nonce: nonce.to_vec(),
+                ciphertext: ciphertext.to_vec(),
+                created_at: created.clone(),
+                updated_at: now.clone(),
+            },
+        );
+        Ok(SecretMeta {
+            name: name.into(),
+            created_at: created,
+            updated_at: now,
+        })
+    }
+
+    async fn get_secret_blob(&self, name: &str) -> Result<Option<SecretBlob>, StoreError> {
+        Ok(self.inner.read().await.secrets.get(name).cloned())
+    }
+
+    async fn list_secret_meta(&self) -> Result<Vec<SecretMeta>, StoreError> {
+        let g = self.inner.read().await;
+        let mut v: Vec<_> = g
+            .secrets
+            .values()
+            .map(|s| SecretMeta {
+                name: s.name.clone(),
+                created_at: s.created_at.clone(),
+                updated_at: s.updated_at.clone(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<bool, StoreError> {
+        Ok(self.inner.write().await.secrets.remove(name).is_some())
     }
 }
 

@@ -75,6 +75,15 @@ message DesiredInstance {
   uint32 ordinal = 4;
   // Opaque JSON/YAML service spec until typed messages land
   string spec_json = 5;
+  // Resolved secret injection material (plaintext values; gRPC only to owning agent).
+  repeated SecretInjection secrets = 6;
+}
+
+// Host-side msb secret injection: guest sees placeholder; value for allowlisted hosts.
+message SecretInjection {
+  string env = 1;
+  string value = 2;
+  repeated string allow_hosts = 3;
 }
 
 message InstanceStatus {

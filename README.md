@@ -51,6 +51,7 @@ just test-integration
 | `mcc agent` | Node worker (join, heartbeat, msb runtime) |
 | `mcc node ls` | List nodes via REST |
 | `mcc apply -f stack.yaml` | Apply desired stack (schedule + run) |
+| `mcc secret set\|ls\|rm` | Cluster secrets (encrypted; values never listed) |
 | `mcc ps` | List instances / phases |
 | `mcc doctor` | Host / msb readiness checks |
 

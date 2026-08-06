@@ -3,17 +3,37 @@
 //! Server logic depends on [`Store`], not on SQLite types.
 //! Default backend: SQLite ([`SqliteStore`]). [`MemoryStore`] remains for unit tests.
 
+mod crypto;
 mod instance;
 mod memory;
 mod node;
 mod sqlite;
 mod token;
 
+pub use crypto::{CryptoError, SecretsKey};
 pub use instance::{InstancePhase, InstanceRecord, StackRecord};
 pub use memory::MemoryStore;
 pub use node::{NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus};
 pub use sqlite::SqliteStore;
 pub use token::{hash_token, verify_token, TokenKind};
+
+/// Metadata for a secret (never includes plaintext).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecretMeta {
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Ciphertext blob stored at rest.
+#[derive(Debug, Clone)]
+pub struct SecretBlob {
+    pub name: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub created_at: String,
+    pub updated_at: String,
+}
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -136,4 +156,19 @@ pub trait Store: Send + Sync {
     ) -> Result<InstanceRecord, StoreError>;
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError>;
+
+    // --- secrets (Phase 5) ---
+
+    async fn put_secret_blob(
+        &self,
+        name: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<SecretMeta, StoreError>;
+
+    async fn get_secret_blob(&self, name: &str) -> Result<Option<SecretBlob>, StoreError>;
+
+    async fn list_secret_meta(&self) -> Result<Vec<SecretMeta>, StoreError>;
+
+    async fn delete_secret(&self, name: &str) -> Result<bool, StoreError>;
 }

@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result};
 use mcc_api::agent::agent_service_server::AgentServiceServer;
-use mcc_server::{router, AppState, Bootstrap};
-use mcc_store::{SqliteStore, Store};
+use mcc_server::{router, AgentSvc, AppState, Bootstrap};
+use mcc_store::{SecretsKey, SqliteStore, Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,10 +56,14 @@ impl TestCluster {
             .await
             .context("open store")?;
 
+        let secrets_key =
+            Arc::new(SecretsKey::load_file(&boot.secrets_key_path).context("load secrets key")?);
+
         let state = AppState {
             store: store.clone() as Arc<dyn Store>,
             data_dir: data_dir.clone(),
             version: env!("CARGO_PKG_VERSION"),
+            secrets_key: secrets_key.clone(),
         };
 
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -86,8 +90,9 @@ impl TestCluster {
                 .await;
         });
 
-        let agent = mcc_server::AgentSvc {
+        let agent = AgentSvc {
             store: store.clone() as Arc<dyn Store>,
+            secrets_key,
         };
         let svc = AgentServiceServer::new(agent);
         let mut rx_grpc = tx.subscribe();

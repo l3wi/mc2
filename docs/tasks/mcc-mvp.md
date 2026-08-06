@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–4 complete)  
+**Status:** **Approved — implementing** (Phases 0–5 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -460,12 +460,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 5 — Secrets
 
-- [ ] Encrypted secret store  
-- [ ] `mcc secret set`  
-- [ ] Apply refs → agent injection config → msb secrets  
-- [ ] Ensure REST/YAML never echo values  
+- [x] Encrypted secret store  
+- [x] `mcc secret set`  
+- [x] Apply refs → agent injection config → msb secrets  
+- [x] Ensure REST/YAML never echo values  
 
-**Exit:** sandbox calls allowlisted host with injected secret; guest env shows placeholder only.
+**Exit:** sandbox calls allowlisted host with injected secret; guest env shows placeholder only. ✅ (injection wired; host allowlist enforced by msb)
+
+#### Implementation notes (Phase 5)
+
+- **Branch:** `feat/phase-5-secrets`
+- **Crypto:** XChaCha20-Poly1305 via `mcc_store::SecretsKey` (`<data_dir>/secrets.key`)
+- **Store:** `secrets_meta` table (nonce + ciphertext only); list returns names/timestamps only
+- **REST:** `PUT /v1/secrets/{name}` `{value}`, `GET /v1/secrets`, `DELETE /v1/secrets/{name}`
+- **CLI:** `mcc secret set|ls|rm` (values never listed; set from `--value` / `MCC_SECRET_VALUE` / stdin)
+- **Scope:** cluster-global secrets; per-service YAML refs + `allowHosts`
+- **gRPC Sync:** resolves refs → `SecretInjection` on `DesiredInstance` (plaintext only to owning agent)
+- **SDK:** `.secret(|s| s.env().value().allow_host(...))` on create (TLS intercept for injection)
 
 ### Phase 6 — Restart, health, reschedule
 
@@ -606,7 +617,7 @@ just run-agent
 - [ ] SQLite store behind trait  
 - [ ] Join + heartbeat + Ready/NotReady  
 - [ ] apply YAML → schedule → real msb sandboxes  
-- [ ] Secrets encrypted + injection  
+- [x] Secrets encrypted + injection  
 - [ ] Ports published  
 - [ ] Restart/reschedule basics  
 - [ ] OTLP from mcc; docs align with msb-metrics  
@@ -644,6 +655,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
 | 3 | **done** | apply YAML, spread scheduler, mock agent Running |
 | 4 | **done** | NodeRuntime + microsandbox SDK only |
-| 5 | next | encrypted secrets + injection |
-| 6–7 | pending | — |
+| 5 | **done** | encrypted secrets, CLI/REST, agent msb injection |
+| 6 | next | restartPolicy, health, reschedule |
+| 7 | pending | OTLP + polish |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

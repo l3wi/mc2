@@ -116,11 +116,29 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
         b = b.network(|n| n.policy(policy));
     }
 
+    // Host-side secret injection (guest sees placeholder only).
+    for sec in &desired.secrets {
+        if sec.allow_hosts.is_empty() {
+            anyhow::bail!("secret env {:?} has empty allow_hosts (refused)", sec.env);
+        }
+        let env = sec.env.clone();
+        let value = sec.value.clone();
+        let hosts = sec.allow_hosts.clone();
+        b = b.secret(move |s| {
+            let mut s = s.env(env).value(value);
+            for h in hosts {
+                s = s.allow_host(h);
+            }
+            s
+        });
+    }
+
     info!(
         name = %desired.runtime_id,
         image = %desired.spec.image,
         cpus,
         memory_mib = mem,
+        secrets = desired.secrets.len(),
         "creating detached microsandbox via SDK (local)"
     );
 
@@ -291,6 +309,7 @@ mod tests {
                 node_name: None,
                 node_selector: BTreeMap::new(),
             },
+            secrets: vec![],
         };
         let p = network_profiles(&d);
         assert!(p.contains(&NetworkProfile::Public));

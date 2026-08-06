@@ -6,6 +6,7 @@ mod bootstrap;
 mod grpc;
 mod http;
 mod scheduler;
+mod secrets;
 mod tls;
 mod watcher;
 
@@ -13,12 +14,13 @@ pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
 pub use grpc::AgentSvc;
 pub use http::router;
+pub use secrets::{decrypt_secret, set_secret};
 pub use tls::{ensure_dev_tls, TlsPaths};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use mcc_api::agent::agent_service_server::AgentServiceServer;
-use mcc_store::{SqliteStore, Store};
+use mcc_store::{SecretsKey, SqliteStore, Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,6 +75,7 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub data_dir: PathBuf,
     pub version: &'static str,
+    pub secrets_key: Arc<SecretsKey>,
 }
 
 /// Run the control plane.
@@ -98,12 +101,17 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
     let boot = Bootstrap {
         data_dir: data_dir.clone(),
-        secrets_key_path,
+        secrets_key_path: secrets_key_path.clone(),
         no_auth: args.no_auth,
     }
     .ensure()
     .await
     .context("bootstrap data directory")?;
+
+    let secrets_key = Arc::new(
+        SecretsKey::load_file(&boot.secrets_key_path)
+            .with_context(|| format!("load secrets key {}", boot.secrets_key_path.display()))?,
+    );
 
     let store = SqliteStore::open(&boot.db_path)
         .await
@@ -152,6 +160,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         store: store.clone() as Arc<dyn Store>,
         data_dir: data_dir.clone(),
         version: env!("CARGO_PKG_VERSION"),
+        secrets_key: secrets_key.clone(),
     };
 
     let app = router(state);
@@ -173,6 +182,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
 
     let agent = AgentSvc {
         store: store as Arc<dyn Store>,
+        secrets_key,
     };
     let svc = AgentServiceServer::new(agent);
 

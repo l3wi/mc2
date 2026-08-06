@@ -2,7 +2,7 @@
 
 use crate::{
     verify_token, ClusterCounts, ClusterMeta, InstanceRecord, NodeHeartbeat, NodeJoin, NodeRecord,
-    StackRecord, Store, StoreError,
+    SecretBlob, SecretMeta, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;
@@ -608,12 +608,98 @@ impl Store for SqliteStore {
         .map_err(|e| StoreError::Other(e.into()))?;
         Ok(row.as_ref().map(Self::map_instance))
     }
+
+    async fn put_secret_blob(
+        &self,
+        name: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<SecretMeta, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let existing = self.get_secret_blob(name).await?;
+        let created = existing
+            .as_ref()
+            .map(|s| s.created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        if existing.is_some() {
+            sqlx::query(
+                r#"UPDATE secrets_meta SET nonce = ?1, ciphertext = ?2, updated_at = ?3 WHERE name = ?4"#,
+            )
+            .bind(nonce)
+            .bind(ciphertext)
+            .bind(&now)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO secrets_meta (name, nonce, ciphertext, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            )
+            .bind(name)
+            .bind(nonce)
+            .bind(ciphertext)
+            .bind(&created)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+        Ok(SecretMeta {
+            name: name.into(),
+            created_at: created,
+            updated_at: now,
+        })
+    }
+
+    async fn get_secret_blob(&self, name: &str) -> Result<Option<SecretBlob>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT name, nonce, ciphertext, created_at, updated_at FROM secrets_meta WHERE name = ?1"#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.map(|r| SecretBlob {
+            name: r.get("name"),
+            nonce: r.get("nonce"),
+            ciphertext: r.get("ciphertext"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn list_secret_meta(&self) -> Result<Vec<SecretMeta>, StoreError> {
+        let rows =
+            sqlx::query(r#"SELECT name, created_at, updated_at FROM secrets_meta ORDER BY name"#)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows
+            .iter()
+            .map(|r| SecretMeta {
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<bool, StoreError> {
+        let res = sqlx::query(r#"DELETE FROM secrets_meta WHERE name = ?1"#)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{hash_token, NodeStatus};
+    use crate::{hash_token, NodeStatus, SecretsKey};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -660,5 +746,22 @@ mod tests {
         let counts = store.cluster_counts().await.unwrap();
         assert_eq!(counts.nodes_total, 1);
         assert_eq!(counts.nodes_ready, 1);
+    }
+
+    #[tokio::test]
+    async fn secret_encrypt_store_roundtrip() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mcc.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.init_cluster("", "").await.unwrap();
+        let key = SecretsKey::from_bytes([9u8; 32]);
+        let (n, c) = key.encrypt(b"p@ss").unwrap();
+        store.put_secret_blob("DB_PASS", &n, &c).await.unwrap();
+        let blob = store.get_secret_blob("DB_PASS").await.unwrap().unwrap();
+        assert_eq!(key.decrypt(&blob.nonce, &blob.ciphertext).unwrap(), b"p@ss");
+        let list = store.list_secret_meta().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "DB_PASS");
+        assert!(store.delete_secret("DB_PASS").await.unwrap());
     }
 }

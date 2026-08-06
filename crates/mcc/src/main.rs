@@ -36,10 +36,48 @@ enum Commands {
     Node(NodeCmd),
     /// List instances (desired sandboxes)
     Ps(OperatorArgs),
+    /// Cluster secrets (encrypted at rest; values never listed)
+    Secret(SecretCmd),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
     /// Show cluster / binary version info
     Version,
+}
+
+#[derive(Debug, Parser)]
+struct SecretCmd {
+    #[command(subcommand)]
+    command: SecretCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretCommands {
+    /// Create or replace a secret value
+    Set(SecretSetArgs),
+    /// List secret names (values never shown)
+    #[command(name = "ls", alias = "list")]
+    Ls(OperatorArgs),
+    /// Delete a secret
+    #[command(name = "rm", alias = "delete")]
+    Rm(SecretRmArgs),
+}
+
+#[derive(Debug, Parser)]
+struct SecretSetArgs {
+    /// Secret name (cluster-global)
+    name: String,
+    /// Secret value (prefer env MCC_SECRET_VALUE or stdin for scripts)
+    #[arg(long, env = "MCC_SECRET_VALUE")]
+    value: Option<String>,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct SecretRmArgs {
+    name: String,
+    #[command(flatten)]
+    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -104,6 +142,11 @@ async fn main() -> Result<()> {
             command: NodeCommands::Ls(args),
         }) => node_ls(args).await?,
         Commands::Ps(args) => ps_cmd(args).await?,
+        Commands::Secret(SecretCmd { command }) => match command {
+            SecretCommands::Set(a) => secret_set(a).await?,
+            SecretCommands::Ls(a) => secret_ls(a).await?,
+            SecretCommands::Rm(a) => secret_rm(a).await?,
+        },
         Commands::Doctor(args) => doctor_cmd(args)?,
         Commands::Version => {
             println!("mcc {} — MicroCommandControl", env!("CARGO_PKG_VERSION"));
@@ -166,6 +209,105 @@ fn operator_post(
         req = req.bearer_auth(t);
     }
     req
+}
+
+async fn secret_set(args: SecretSetArgs) -> Result<()> {
+    let value = match args.value {
+        Some(v) => v,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read secret value from stdin")?;
+            buf.trim_end().to_string()
+        }
+    };
+    if value.is_empty() {
+        bail!("secret value is empty (pass --value or stdin)");
+    }
+    let url = format!(
+        "{}/v1/secrets/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.name)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.put(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req
+        .json(&serde_json::json!({ "value": value }))
+        .send()
+        .await
+        .with_context(|| format!("PUT {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("secret set failed: {status} {body}");
+    }
+    // Body is metadata only (no value)
+    println!("{body}");
+    Ok(())
+}
+
+async fn secret_ls(args: OperatorArgs) -> Result<()> {
+    let url = format!("{}/v1/secrets", args.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, args.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("secret ls failed: {status} {body}");
+    }
+    let list: Vec<mcc_store::SecretMeta> =
+        serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    if list.is_empty() {
+        println!("No secrets.");
+        return Ok(());
+    }
+    println!("{:<32} UPDATED", "NAME");
+    for s in list {
+        println!("{:<32} {}", s.name, s.updated_at);
+    }
+    Ok(())
+}
+
+async fn secret_rm(args: SecretRmArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/secrets/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.name)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.delete(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
+    let status = res.status();
+    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
+        println!("deleted {}", args.name);
+        return Ok(());
+    }
+    let body = res.text().await.unwrap_or_default();
+    bail!("secret rm failed: {status} {body}");
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    // Secret names are identifiers; keep path-safe.
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u8)
+            }
+        })
+        .collect()
 }
 
 async fn apply_cmd(args: ApplyArgs) -> Result<()> {
