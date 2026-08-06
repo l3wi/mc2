@@ -59,18 +59,52 @@ impl Store for MemoryStore {
 
     async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError> {
         let g = self.inner.read().await;
-        Ok(g.meta
-            .as_ref()
-            .map(|m| verify_token(token, &m.api_token_hash))
-            .unwrap_or(false))
+        let Some(meta) = &g.meta else {
+            return Ok(false);
+        };
+        if meta.api_token_hash.is_empty() {
+            return Ok(true);
+        }
+        if token.is_empty() {
+            return Ok(false);
+        }
+        Ok(verify_token(token, &meta.api_token_hash))
     }
 
     async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError> {
         let g = self.inner.read().await;
-        Ok(g.meta
+        let Some(meta) = &g.meta else {
+            return Ok(false);
+        };
+        if meta.join_token_hash.is_empty() {
+            return Ok(true);
+        }
+        if token.is_empty() {
+            return Ok(false);
+        }
+        Ok(verify_token(token, &meta.join_token_hash))
+    }
+
+    async fn api_auth_required(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .meta
             .as_ref()
-            .map(|m| verify_token(token, &m.join_token_hash))
-            .unwrap_or(false))
+            .map(|m| !m.api_token_hash.is_empty())
+            .unwrap_or(true))
+    }
+
+    async fn join_auth_required(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .meta
+            .as_ref()
+            .map(|m| !m.join_token_hash.is_empty())
+            .unwrap_or(true))
     }
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {

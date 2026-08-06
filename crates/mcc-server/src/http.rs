@@ -203,6 +203,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_cluster_status_without_token() {
+        let store = MemoryStore::new();
+        store.init_cluster("", "").await.unwrap();
+        let app = router(test_state(store));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn list_nodes_returns_joined() {
         let store = MemoryStore::new();
         store

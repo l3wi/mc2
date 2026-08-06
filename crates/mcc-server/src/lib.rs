@@ -57,6 +57,11 @@ pub struct ServerArgs {
     #[arg(long)]
     pub init_only: bool,
 
+    /// Initialize without API/join tokens. REST and agent join work without
+    /// credentials (lab only). Only applies on first bootstrap of a data dir.
+    #[arg(long, env = "MCC_NO_AUTH", default_value_t = false)]
+    pub no_auth: bool,
+
     /// Log bootstrap result and exit without listening (tests / CI)
     #[arg(long, hide = true)]
     pub dry_run: bool,
@@ -94,6 +99,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let boot = Bootstrap {
         data_dir: data_dir.clone(),
         secrets_key_path,
+        no_auth: args.no_auth,
     }
     .ensure()
     .await
@@ -115,6 +121,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         );
         eprintln!("Data dir: {}", data_dir.display());
         eprintln!("=========================================================================");
+    } else if args.no_auth {
+        if store.api_auth_required().await.unwrap_or(true) {
+            info!("MCC_NO_AUTH/--no-auth ignored: cluster already has API auth configured");
+        } else {
+            info!(db = %boot.db_path.display(), "open cluster (no API/join tokens)");
+        }
     } else {
         info!(db = %boot.db_path.display(), "cluster already initialized");
     }
@@ -253,6 +265,7 @@ mod tests {
             grpc_plain: true,
             heartbeat_grace_secs: 45,
             init_only: false,
+            no_auth: false,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

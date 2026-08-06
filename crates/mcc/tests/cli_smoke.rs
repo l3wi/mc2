@@ -35,9 +35,16 @@ fn help_lists_core_commands() {
 }
 
 #[test]
-fn apply_requires_token() {
+fn apply_without_token_reaches_server_or_connection_error() {
+    // Token is optional; without a server we get a connection error, not a local "missing token".
     let out = mcc()
-        .args(["apply", "-f", "examples/stacks/demo.yaml"])
+        .args([
+            "apply",
+            "-f",
+            "examples/stacks/smoke.yaml",
+            "--api",
+            "http://127.0.0.1:1",
+        ])
         .output()
         .expect("run");
     assert!(!out.status.success());
@@ -47,8 +54,8 @@ fn apply_requires_token() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        err.contains("MCC_API_TOKEN") || err.contains("token"),
-        "unexpected error: {err}"
+        !err.contains("missing --token"),
+        "should not require token client-side: {err}"
     );
 }
 

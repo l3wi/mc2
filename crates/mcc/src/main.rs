@@ -144,18 +144,37 @@ fn doctor_cmd(args: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
+fn operator_get(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(t) = token.filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    req
+}
+
+fn operator_post(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.post(url);
+    if let Some(t) = token.filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    req
+}
+
 async fn apply_cmd(args: ApplyArgs) -> Result<()> {
-    let token = args
-        .op
-        .token
-        .context("missing --token / MCC_API_TOKEN (operator API token from server bootstrap)")?;
+    // Token optional when server was bootstrapped with --no-auth.
     let yaml =
         std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
     let url = format!("{}/v1/stacks:apply", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = client
-        .post(&url)
-        .bearer_auth(&token)
+    let res = operator_post(&client, &url, args.op.token.as_deref())
         .json(&serde_json::json!({ "yaml": yaml }))
         .send()
         .await
@@ -170,12 +189,9 @@ async fn apply_cmd(args: ApplyArgs) -> Result<()> {
 }
 
 async fn ps_cmd(args: OperatorArgs) -> Result<()> {
-    let token = args.token.context("missing --token / MCC_API_TOKEN")?;
     let url = format!("{}/v1/instances", args.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = client
-        .get(&url)
-        .bearer_auth(&token)
+    let res = operator_get(&client, &url, args.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -209,14 +225,9 @@ async fn ps_cmd(args: OperatorArgs) -> Result<()> {
 }
 
 async fn node_ls(args: OperatorArgs) -> Result<()> {
-    let token = args
-        .token
-        .context("missing --token / MCC_API_TOKEN (operator API token from server bootstrap)")?;
     let url = format!("{}/v1/nodes", args.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = client
-        .get(&url)
-        .bearer_auth(&token)
+    let res = operator_get(&client, &url, args.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;

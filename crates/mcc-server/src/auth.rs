@@ -1,16 +1,16 @@
-//! Bearer token auth for operator REST API.
+//! Bearer token auth for operator REST API (optional when no API token configured).
 
 use crate::AppState;
 use axum::{
-    extract::{FromRequestParts, Request},
+    extract::FromRequestParts,
     http::{header, request::Parts, StatusCode},
-    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
 
-/// Extracted and verified API bearer token (opaque presence).
+/// Extracted operator identity. When the cluster has no API token configured,
+/// requests are allowed without a bearer.
 #[derive(Debug, Clone)]
 pub struct AuthUser;
 
@@ -21,34 +21,31 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = extract_bearer(&parts.headers).ok_or_else(unauthorized)?;
+        let required = match state.store.api_auth_required().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "api_auth_required");
+                return Err(internal());
+            }
+        };
+
+        if !required {
+            // Open cluster: no bearer required.
+            return Ok(AuthUser);
+        }
+
+        let Some(token) = extract_bearer(&parts.headers) else {
+            return Err(unauthorized());
+        };
 
         match state.store.verify_api_token(&token).await {
             Ok(true) => Ok(AuthUser),
             Ok(false) => Err(unauthorized()),
             Err(e) => {
                 tracing::error!(error = %e, "token verification failed");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "internal error" })),
-                )
-                    .into_response())
+                Err(internal())
             }
         }
-    }
-}
-
-/// Middleware alternative if we need layer-style auth later.
-#[allow(dead_code)]
-pub async fn require_auth(state: AppState, req: Request, next: Next) -> Response {
-    let token = match extract_bearer(req.headers()) {
-        Some(t) => t,
-        None => return unauthorized(),
-    };
-    match state.store.verify_api_token(&token).await {
-        Ok(true) => next.run(req).await,
-        Ok(false) => unauthorized(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -67,7 +64,18 @@ fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "unauthorized", "message": "missing or invalid bearer token" })),
+        Json(json!({
+            "error": "unauthorized",
+            "message": "missing or invalid bearer token"
+        })),
+    )
+        .into_response()
+}
+
+fn internal() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal error" })),
     )
         .into_response()
 }

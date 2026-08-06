@@ -63,8 +63,20 @@ pub trait Store: Send + Sync {
         join_token_hash: &str,
     ) -> Result<ClusterMeta, StoreError>;
 
+    /// Operator REST: if no API token was configured (empty hash), returns true
+    /// for any caller (including missing bearer). Otherwise checks the bearer.
     async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError>;
+
+    /// Agent join: if no join token was configured (empty hash), returns true
+    /// even when `token` is empty. Otherwise checks the join token.
     async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError>;
+
+    /// True when the cluster requires an operator API bearer token.
+    async fn api_auth_required(&self) -> Result<bool, StoreError>;
+
+    /// True when the cluster requires a join token to register agents.
+    async fn join_auth_required(&self) -> Result<bool, StoreError>;
+
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError>;
 
     async fn upsert_node_join(&self, join: NodeJoin) -> Result<NodeRecord, StoreError>;

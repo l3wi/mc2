@@ -42,6 +42,7 @@ impl TestCluster {
         let boot = Bootstrap {
             data_dir: data_dir.clone(),
             secrets_key_path,
+            no_auth: false,
         }
         .ensure()
         .await

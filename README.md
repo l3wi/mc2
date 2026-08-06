@@ -14,28 +14,26 @@ Requirements: Rust (1.80+), [just](https://github.com/casey/just).
 just build
 DATA=/tmp/mcc-dev
 
-# Terminal 1 — control plane (prints API + join tokens once)
-./target/debug/mcc server --data-dir "$DATA" --bind 127.0.0.1:7443 --grpc-bind 127.0.0.1:7444
+# Terminal 1 — control plane
+# Lab (no tokens): --no-auth
+# Default: prints API + join tokens once on first bootstrap
+./target/debug/mcc server --data-dir "$DATA" --bind 127.0.0.1:7443 --grpc-bind 127.0.0.1:7444 --grpc-plain --no-auth
 
 # Terminal 2 — agent (embeds microsandbox SDK; needs KVM / Apple Silicon HVF)
 ./target/debug/mcc agent \
-  --server https://127.0.0.1:7444 \
-  --tls-ca "$DATA/tls/ca.pem" \
-  --token "<join-token>" \
+  --server http://127.0.0.1:7444 \
   --name "$(hostname)"
+# With auth: add --token "<join-token>" and --tls-ca when using HTTPS
 
-# Terminal 3 — operator
-export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"
+# Terminal 3 — operator (token only if server was not --no-auth)
+export MCC_API=http://127.0.0.1:7443
+# export MCC_API_TOKEN="<api-token>"   # when auth is enabled
 ./target/debug/mcc node ls
-# Fast smoke (alpine ~3–4 MB) or demo (alpine + busybox httpd on :8080)
 ./target/debug/mcc apply -f examples/stacks/smoke.yaml
-# ./target/debug/mcc apply -f examples/stacks/demo.yaml
 ./target/debug/mcc ps
-curl -s -H "Authorization: Bearer $MCC_API_TOKEN" "$MCC_API/v1/status"
+curl -s "$MCC_API/v1/status"
 # after demo is Running: curl -s http://127.0.0.1:8080/
 ```
-
-Plain gRPC (no TLS) for local tests: add `--grpc-plain` on the server and use `--server http://127.0.0.1:7444` on the agent.
 
 ```bash
 just check              # fmt + clippy + full test suite (regression gate)

@@ -41,6 +41,8 @@ pub struct BootstrapResult {
 pub struct Bootstrap {
     pub data_dir: PathBuf,
     pub secrets_key_path: PathBuf,
+    /// When true, initialize without API/join tokens (open lab cluster).
+    pub no_auth: bool,
 }
 
 impl Bootstrap {
@@ -55,17 +57,30 @@ impl Bootstrap {
         let store = SqliteStore::open(&db_path).await?;
 
         let fresh_credentials = if store.get_cluster_meta().await?.is_none() {
-            let api_token = generate_token("mccat");
-            let join_token = generate_token("mccjt");
-            store
-                .init_cluster(&hash_token(&api_token), &hash_token(&join_token))
-                .await
-                .context("init cluster meta")?;
-            info!("initialized new cluster in {}", self.data_dir.display());
-            Some(FreshCredentials {
-                api_token,
-                join_token,
-            })
+            if self.no_auth {
+                // Empty hashes ⇒ auth not required (see Store::verify_*).
+                store
+                    .init_cluster("", "")
+                    .await
+                    .context("init open cluster meta")?;
+                info!(
+                    "initialized open cluster (no auth) in {}",
+                    self.data_dir.display()
+                );
+                None
+            } else {
+                let api_token = generate_token("mccat");
+                let join_token = generate_token("mccjt");
+                store
+                    .init_cluster(&hash_token(&api_token), &hash_token(&join_token))
+                    .await
+                    .context("init cluster meta")?;
+                info!("initialized new cluster in {}", self.data_dir.display());
+                Some(FreshCredentials {
+                    api_token,
+                    join_token,
+                })
+            }
         } else {
             None
         };
@@ -129,6 +144,7 @@ mod tests {
         let r1 = Bootstrap {
             data_dir: data.clone(),
             secrets_key_path: key.clone(),
+            no_auth: false,
         }
         .ensure()
         .await
@@ -138,10 +154,31 @@ mod tests {
         let r2 = Bootstrap {
             data_dir: data,
             secrets_key_path: key,
+            no_auth: false,
         }
         .ensure()
         .await
         .unwrap();
         assert!(r2.fresh_credentials.is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_no_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().to_path_buf();
+        let key = data.join("secrets.key");
+        let r = Bootstrap {
+            data_dir: data.clone(),
+            secrets_key_path: key,
+            no_auth: true,
+        }
+        .ensure()
+        .await
+        .unwrap();
+        assert!(r.fresh_credentials.is_none());
+        let store = SqliteStore::open(data.join("mcc.db")).await.unwrap();
+        assert!(!store.api_auth_required().await.unwrap());
+        assert!(store.verify_api_token("").await.unwrap());
+        assert!(store.verify_join_token("").await.unwrap());
     }
 }

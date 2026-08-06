@@ -144,6 +144,12 @@ impl Store for SqliteStore {
         let Some(meta) = self.get_cluster_meta().await? else {
             return Ok(false);
         };
+        if meta.api_token_hash.is_empty() {
+            return Ok(true);
+        }
+        if token.is_empty() {
+            return Ok(false);
+        }
         Ok(verify_token(token, &meta.api_token_hash))
     }
 
@@ -151,7 +157,29 @@ impl Store for SqliteStore {
         let Some(meta) = self.get_cluster_meta().await? else {
             return Ok(false);
         };
+        if meta.join_token_hash.is_empty() {
+            return Ok(true);
+        }
+        if token.is_empty() {
+            return Ok(false);
+        }
         Ok(verify_token(token, &meta.join_token_hash))
+    }
+
+    async fn api_auth_required(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .get_cluster_meta()
+            .await?
+            .map(|m| !m.api_token_hash.is_empty())
+            .unwrap_or(true))
+    }
+
+    async fn join_auth_required(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .get_cluster_meta()
+            .await?
+            .map(|m| !m.join_token_hash.is_empty())
+            .unwrap_or(true))
     }
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {

@@ -89,10 +89,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         .server
         .clone()
         .context("missing --server / MCC_SERVER (e.g. https://127.0.0.1:7444)")?;
-    let join_token = args
-        .token
-        .clone()
-        .context("missing --token / MCC_JOIN_TOKEN")?;
+    // Join token optional when server was bootstrapped with --no-auth.
+    let join_token = args.token.clone().unwrap_or_default();
 
     let mut client = connect(&server, args.tls_ca.as_ref(), args.insecure)
         .await
