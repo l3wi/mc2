@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–6 complete)  
+**Status:** **Approved — MVP phases 0–7 complete**  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -499,14 +499,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 7 — OTLP + polish
 
-- [ ] OTLP metrics from server + agent  
-- [ ] Example collector config (msb + mcc)  
-- [ ] Ingress type stub in schema + clear error if used  
-- [ ] `mcc doctor`  
-- [ ] Release workflow for three targets  
-- [ ] End-to-end docs: quickstart (Linux + macOS notes)  
+- [x] OTLP metrics from server + agent  
+- [x] Example collector config (msb + mcc)  
+- [x] Ingress type stub in schema + clear error if used  
+- [x] `mcc doctor`  
+- [x] Release workflow for three targets  
+- [x] End-to-end docs: quickstart (Linux + macOS notes)  
 
 **Exit:** MVP acceptance criteria §2 all met.
+
+#### Implementation notes (Phase 7)
+
+- **Branch:** `feat/phase-7-otlp-polish` · **dev** at Phases 0–6 tip  
+- **Crate:** `mcc-metrics` — OTLP/gRPC via `MCC_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`  
+- **Series:** `mcc.server.*` / `mcc.agent.*` gauges+counters; sandbox series remain msb-metrics  
+- **Example:** `examples/otel/collector-config.yaml`  
+- **Release:** `.github/workflows/release.yml` → `mcc-linux-amd64`, `mcc-linux-arm64` (cross), `mcc-darwin-arm64`  
+- **Docs:** [docs/guides/quickstart.md](../guides/quickstart.md)
 
 ---
 
@@ -630,8 +639,8 @@ just run-agent
 - [x] Secrets encrypted + injection  
 - [ ] Ports published  
 - [x] Restart/reschedule basics  
-- [ ] OTLP from mcc; docs align with msb-metrics  
-- [ ] linux-amd64, linux-arm64, darwin-arm64 release path  
+- [x] OTLP from mcc; docs align with msb-metrics  
+- [x] linux-amd64, linux-arm64, darwin-arm64 release path  
 - [ ] Ingress stub only  
 - [ ] This task file updated with “Implementation notes” as phases complete  
 
@@ -667,5 +676,5 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 4 | **done** | NodeRuntime + microsandbox SDK only |
 | 5 | **done** | encrypted secrets, CLI/REST, agent msb injection; secrets smoke (set→Sync) |
 | 6 | **done** | restartPolicy, exec health, NotReady reschedule, volume sticky |
-| 7 | next | OTLP + polish |
+| 7 | **done** | OTLP metrics, collector example, doctor, release, quickstart |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

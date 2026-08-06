@@ -74,6 +74,8 @@ pub async fn reschedule_not_ready(store: Arc<dyn Store>) -> Result<(u32, u32)> {
     }
 
     let scheduled = run_scheduler(store).await.context("run_scheduler")?;
+    mcc_metrics::record_reschedule_unbinds(u64::from(unbound));
+    mcc_metrics::record_schedule_binds(u64::from(scheduled));
     if unbound > 0 || scheduled > 0 {
         info!(unbound, scheduled, "reschedule pass complete");
     } else {

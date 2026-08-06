@@ -4,15 +4,16 @@ Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.mi
 
 MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
-> **Status:** Phases 0–4 done (including real microsandbox via `msb` CLI). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
+> **Status:** MVP phases 0–7 complete. See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
 ## Quick start (dev)
 
-Requirements: Rust (1.80+), [just](https://github.com/casey/just).
+Requirements: Rust **1.91+**, [just](https://github.com/casey/just). Full walkthrough: [docs/guides/quickstart.md](docs/guides/quickstart.md).
 
 ```bash
 just build
 DATA=/tmp/mcc-dev
+./target/debug/mcc doctor
 
 # Terminal 1 — control plane
 # Lab (no tokens): --no-auth
@@ -35,13 +36,20 @@ curl -s "$MCC_API/v1/status"
 # after demo is Running: curl -s http://127.0.0.1:8080/
 ```
 
+Optional OTLP (server + agent):
+
+```bash
+export MCC_OTLP_ENDPOINT=http://127.0.0.1:4317
+# collector example: examples/otel/collector-config.yaml
+```
+
 ```bash
 just check              # fmt + clippy + full test suite (regression gate)
 just test-unit
 just test-integration
 ```
 
-**Testing:** clean, directed unit tests + integration tests to stop regressions — [docs/guides/testing.md](docs/guides/testing.md).
+**Testing:** [docs/guides/testing.md](docs/guides/testing.md) · **Quickstart:** [docs/guides/quickstart.md](docs/guides/quickstart.md)
 
 ## Binary modes
 

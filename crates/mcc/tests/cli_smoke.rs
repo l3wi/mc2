@@ -22,6 +22,15 @@ fn version_prints_name() {
     assert!(stdout.contains("mcc"), "{stdout}");
     assert!(stdout.contains("MicroCommandControl"), "{stdout}");
     assert!(stdout.contains("mcc/v1"), "{stdout}");
+    assert!(stdout.contains("otlp"), "{stdout}");
+}
+
+#[test]
+fn doctor_runs() {
+    let out = mcc().arg("doctor").output().expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mcc doctor"), "{stdout}");
+    assert!(stdout.contains("agent runtime"), "{stdout}");
 }
 
 #[test]

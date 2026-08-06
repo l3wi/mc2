@@ -147,29 +147,69 @@ async fn main() -> Result<()> {
             SecretCommands::Ls(a) => secret_ls(a).await?,
             SecretCommands::Rm(a) => secret_rm(a).await?,
         },
-        Commands::Doctor(args) => doctor_cmd(args)?,
+        Commands::Doctor(args) => {
+            let code = doctor_cmd(args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::Version => {
             println!("mcc {} — MicroCommandControl", env!("CARGO_PKG_VERSION"));
             println!("api schema: {}", mcc_api::API_VERSION);
+            if let Some(ep) = mcc_metrics::otlp_endpoint_from_env() {
+                println!("otlp endpoint: {ep}");
+            } else {
+                println!(
+                    "otlp endpoint: (unset — MCC_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT)"
+                );
+            }
         }
     }
 
+    mcc_metrics::shutdown();
     Ok(())
 }
 
-fn doctor_cmd(args: DoctorArgs) -> Result<()> {
+/// Returns process exit code (0 = ok for server/dev; 1 = agent hypervisor missing).
+fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
+    let mut issues = 0u32;
     println!("mcc doctor — host checks");
+    println!("  version: {}", env!("CARGO_PKG_VERSION"));
+    println!("  api: {}", mcc_api::API_VERSION);
     println!("  os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+
     #[cfg(target_os = "linux")]
     {
         let kvm = std::path::Path::new("/dev/kvm").exists();
-        println!("  /dev/kvm: {}", if kvm { "yes" } else { "MISSING" });
+        if kvm {
+            println!("  /dev/kvm: yes");
+        } else {
+            println!("  /dev/kvm: MISSING (required for agent microVMs on Linux)");
+            issues += 1;
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        println!("  hypervisor: Apple Silicon HVF expected (agent machine)");
+        if std::env::consts::ARCH == "aarch64" {
+            println!("  hypervisor: Apple Silicon HVF expected (agent machine)");
+        } else {
+            println!("  hypervisor: unsupported arch on macOS (Apple Silicon only)");
+            issues += 1;
+        }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        println!("  platform: unsupported for agent (Linux KVM or macOS arm64)");
+        issues += 1;
+    }
+
     println!("  agent runtime: microsandbox Rust SDK only (embedded)");
+    if let Some(ep) = mcc_metrics::otlp_endpoint_from_env() {
+        println!("  otlp: {ep}");
+    } else {
+        println!("  otlp: unset (optional; MCC_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT)");
+    }
+
     if args.msb {
         match std::process::Command::new("msb").arg("version").output() {
             Ok(o) if o.status.success() => {
@@ -184,7 +224,14 @@ fn doctor_cmd(args: DoctorArgs) -> Result<()> {
             Err(e) => println!("  msb CLI: not on PATH ({e}) — optional"),
         }
     }
-    Ok(())
+
+    if issues == 0 {
+        println!("doctor: ok");
+        Ok(0)
+    } else {
+        println!("doctor: {issues} issue(s) — server-only hosts can ignore hypervisor warnings");
+        Ok(1)
+    }
 }
 
 fn operator_get(

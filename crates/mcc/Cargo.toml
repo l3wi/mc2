@@ -16,6 +16,7 @@ mcc-server = { workspace = true }
 mcc-agent = { workspace = true }
 mcc-api = { workspace = true }
 mcc-store = { workspace = true }
+mcc-metrics = { workspace = true }
 # SecretMeta type for CLI list parsing
 anyhow = { workspace = true }
 clap = { workspace = true }

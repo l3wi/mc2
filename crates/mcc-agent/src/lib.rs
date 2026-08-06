@@ -91,6 +91,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         "MicroCommandControl agent starting"
     );
 
+    let _otlp = mcc_metrics::init("mcc-agent").context("init OTLP metrics")?;
+
     if args.dry_run {
         info!("dry_run: not connecting");
         return Ok(());
@@ -171,6 +173,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     .await
                 {
                     Ok(resp) => {
+                        mcc_metrics::record_heartbeat();
                         if !resp.into_inner().ok {
                             warn!("heartbeat returned ok=false");
                         }
@@ -178,7 +181,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     Err(e) => warn!(error = %e, "heartbeat failed"),
                 }
 
-                if let Err(e) = reconcile(
+                match reconcile(
                     &mut client,
                     &join_resp.node_id,
                     &join_resp.node_token,
@@ -188,7 +191,11 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                 )
                 .await
                 {
-                    warn!(error = %e, "reconcile failed");
+                    Ok(()) => mcc_metrics::record_reconcile(true),
+                    Err(e) => {
+                        mcc_metrics::record_reconcile(false);
+                        warn!(error = %e, "reconcile failed");
+                    }
                 }
             }
         }

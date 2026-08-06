@@ -84,6 +84,32 @@ pub struct AppState {
     pub secrets_key: Arc<SecretsKey>,
 }
 
+/// Periodically export cluster gauges (when OTLP is enabled).
+async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Ok(counts) = store.cluster_counts().await else {
+            continue;
+        };
+        let Ok(instances) = store.list_instances().await else {
+            continue;
+        };
+        let mut by_phase: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for i in instances {
+            *by_phase.entry(i.phase).or_default() += 1;
+        }
+        let phase_counts: Vec<(String, u64)> = by_phase.into_iter().collect();
+        mcc_metrics::set_cluster_gauges(
+            counts.nodes_total as u64,
+            counts.nodes_ready as u64,
+            &phase_counts,
+        );
+    }
+}
+
 /// Run the control plane.
 pub async fn run(args: ServerArgs) -> Result<()> {
     let data_dir = expand_data_dir(&args.data_dir);
@@ -104,6 +130,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         api = mcc_api::API_VERSION,
         "MicroCommandControl server starting"
     );
+
+    let _otlp = mcc_metrics::init("mcc-server").context("init OTLP metrics")?;
 
     let boot = Bootstrap {
         data_dir: data_dir.clone(),
@@ -194,6 +222,10 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let store_sched = store.clone() as Arc<dyn Store>;
     tokio::spawn(async move {
         reschedule::schedule_loop(store_sched, reschedule_every).await;
+    });
+    let store_metrics = store.clone() as Arc<dyn Store>;
+    tokio::spawn(async move {
+        metrics_loop(store_metrics, Duration::from_secs(15)).await;
     });
 
     let agent = AgentSvc {

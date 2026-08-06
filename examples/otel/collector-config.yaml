@@ -1,0 +1,58 @@
+# OpenTelemetry Collector example for MCC + microsandbox (msb-metrics).
+#
+# MCC (server/agent) exports control-plane metrics when:
+#   export MCC_OTLP_ENDPOINT=http://127.0.0.1:4317
+#   # or OTEL_EXPORTER_OTLP_ENDPOINT
+#
+# Sandbox CPU/mem/net stay on msb-metrics / msb — point that sidecar at the
+# same collector if you want one pipeline.
+#
+# Run (example):
+#   otelcol --config examples/otel/collector-config.yaml
+#
+# Or with Docker:
+#   docker run --rm -p 4317:4317 -p 4318:4318 \
+#     -v "$PWD/examples/otel/collector-config.yaml:/etc/otelcol/config.yaml" \
+#     otel/opentelemetry-collector:latest
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+  # Attribute service.name: mcc-server | mcc-agent | msb-metrics
+  resource:
+    attributes:
+      - key: collector
+        value: mcc-lab
+        action: upsert
+
+exporters:
+  # Lab: print metrics
+  debug:
+    verbosity: basic
+  # Optional: Prometheus scrape endpoint for Grafana
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: mcc_lab
+  # Optional: remote OTLP backend
+  # otlp:
+  #   endpoint: otlp.example.com:4317
+  #   tls:
+  #     insecure: false
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [debug, prometheus]
+  telemetry:
+    logs:
+      level: info

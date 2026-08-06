@@ -59,6 +59,8 @@ pub async fn apply_stack(
         pending,
         "stack applied"
     );
+    mcc_metrics::record_apply();
+    mcc_metrics::record_schedule_binds(u64::from(scheduled));
 
     Ok(ApplyResult {
         stack: doc.metadata.name.clone(),
