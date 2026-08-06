@@ -1,5 +1,9 @@
 # Fast smoke stack — small OCI image (alpine ~3–4 MB compressed).
 # Apply: mcc apply -f examples/stacks/smoke.yaml --token <api-token>
+#
+# Secrets smoke (lab):
+#   mcc secret set SMOKE_TOKEN --value 'lab-only-token'
+#   mcc apply -f examples/stacks/smoke-secrets.yaml
 apiVersion: mcc/v1
 kind: Stack
 metadata:
@@ -22,3 +26,4 @@ services:
     command: ["sleep", "infinity"]
     labels:
       app: smoke
+

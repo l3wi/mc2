@@ -81,6 +81,13 @@ cargo test -p mcc --test cli_smoke
 
 Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not boot real microVMs in CI; exercise control-plane + gRPC with reported status. Real microsandbox runs are lab-only.
 
+### Secrets smoke (CI vs lab)
+
+| Path | What it proves |
+| ---- | -------------- |
+| `tests/tests/secrets.rs` | `mcc secret set` → stack apply with refs → agent **Sync** returns `SecretInjection` (env/value/allowHosts) mapped via `desired_from_sync` (same path before SDK create). Missing secret / empty `allowHosts` → Sync `FailedPrecondition`. |
+| Lab | `mcc secret set SMOKE_TOKEN --value …` then `mcc apply -f examples/stacks/smoke-secrets.yaml` on a node with hypervisor; guest env shows msb placeholder, value injects only to allowlisted hosts. |
+
 ---
 
 ## Adding tests with each phase
@@ -90,7 +97,7 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not 
 | 2 Agent join | token/node field validation | join → node Ready in DB; REST list nodes |
 | 3 Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
 | 4 msb runtime | naming, profile mapping | unit only in CI; full SDK lab-only |
-| 5 Secrets | encrypt/decrypt roundtrip | set secret → not echoed on REST; agent gets material |
+| 5 Secrets | encrypt/decrypt roundtrip | set → apply → agent Sync injection; missing/empty allowHosts fail closed |
 | 6 Reschedule | policy pure functions | multi-node harness with mock agents |
 
 ---

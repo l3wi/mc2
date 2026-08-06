@@ -94,6 +94,7 @@ pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcc_api::agent::SecretInjection;
 
     #[test]
     fn start_parts_default() {
@@ -114,5 +115,44 @@ mod tests {
             node_selector: Default::default(),
         };
         assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
+    }
+
+    #[test]
+    fn desired_from_sync_maps_secret_injections() {
+        let spec = ServiceSpec {
+            image: "alpine:3.20".into(),
+            replicas: 1,
+            resources: Default::default(),
+            ports: vec![],
+            network: Default::default(),
+            env: Default::default(),
+            secrets: vec![],
+            volumes: vec![],
+            restart_policy: "on-failure".into(),
+            health: None,
+            labels: Default::default(),
+            command: Some(vec!["sleep".into(), "infinity".into()]),
+            node_name: None,
+            node_selector: Default::default(),
+        };
+        let inst = DesiredInstance {
+            instance_id: "i1".into(),
+            stack: "smoke-secrets".into(),
+            service: "keep".into(),
+            ordinal: 0,
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            secrets: vec![SecretInjection {
+                env: "API_TOKEN".into(),
+                value: "plaintext-for-agent".into(),
+                allow_hosts: vec!["api.example.com".into()],
+            }],
+        };
+        let work = desired_from_sync(&[inst]).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].runtime_id, "smoke-secrets-keep-0");
+        assert_eq!(work[0].secrets.len(), 1);
+        assert_eq!(work[0].secrets[0].env, "API_TOKEN");
+        assert_eq!(work[0].secrets[0].value, "plaintext-for-agent");
+        assert_eq!(work[0].secrets[0].allow_hosts, vec!["api.example.com"]);
     }
 }

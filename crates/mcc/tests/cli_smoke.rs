@@ -32,6 +32,17 @@ fn help_lists_core_commands() {
     assert!(stdout.contains("server"));
     assert!(stdout.contains("agent"));
     assert!(stdout.contains("apply"));
+    assert!(stdout.contains("secret"));
+}
+
+#[test]
+fn secret_help_lists_set_ls_rm() {
+    let out = mcc().args(["secret", "--help"]).output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("set"), "{stdout}");
+    assert!(stdout.contains("ls"), "{stdout}");
+    assert!(stdout.contains("rm"), "{stdout}");
 }
 
 #[test]

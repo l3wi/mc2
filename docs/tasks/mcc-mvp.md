@@ -655,7 +655,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
 | 3 | **done** | apply YAML, spread scheduler, mock agent Running |
 | 4 | **done** | NodeRuntime + microsandbox SDK only |
-| 5 | **done** | encrypted secrets, CLI/REST, agent msb injection |
+| 5 | **done** | encrypted secrets, CLI/REST, agent msb injection; secrets smoke (set→Sync) |
 | 6 | next | restartPolicy, health, reschedule |
 | 7 | pending | OTLP + polish |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |
