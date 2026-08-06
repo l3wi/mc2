@@ -6,6 +6,7 @@ members = [
     "crates/mcc-agent",
     "crates/mcc-api",
     "crates/mcc-store",
+    "crates/mcc-runtime",
     "tests",
 ]
 
@@ -22,6 +23,7 @@ mcc-api = { path = "crates/mcc-api" }
 mcc-store = { path = "crates/mcc-store" }
 mcc-server = { path = "crates/mcc-server" }
 mcc-agent = { path = "crates/mcc-agent" }
+mcc-runtime = { path = "crates/mcc-runtime" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

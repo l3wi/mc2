@@ -1239,6 +1239,7 @@ dependencies = [
  "clap",
  "http",
  "mcc-api",
+ "mcc-runtime",
  "num_cpus",
  "tokio",
  "tonic",
@@ -1256,6 +1257,22 @@ dependencies = [
  "serde_yaml",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "mcc-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "mcc-api",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1308,6 +1325,7 @@ dependencies = [
  "anyhow",
  "axum 0.8.9",
  "mcc-api",
+ "mcc-runtime",
  "mcc-server",
  "mcc-store",
  "reqwest",

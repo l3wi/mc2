@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 mcc-api = { workspace = true }
+mcc-runtime = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }

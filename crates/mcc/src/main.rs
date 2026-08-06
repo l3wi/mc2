@@ -36,8 +36,17 @@ enum Commands {
     Node(NodeCmd),
     /// List instances (desired sandboxes)
     Ps(OperatorArgs),
+    /// Check host readiness (hypervisor / msb / paths)
+    Doctor(DoctorArgs),
     /// Show cluster / binary version info
     Version,
+}
+
+#[derive(Debug, Parser)]
+struct DoctorArgs {
+    /// Also try `msb version`
+    #[arg(long, default_value_t = true)]
+    msb: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -95,12 +104,45 @@ async fn main() -> Result<()> {
             command: NodeCommands::Ls(args),
         }) => node_ls(args).await?,
         Commands::Ps(args) => ps_cmd(args).await?,
+        Commands::Doctor(args) => doctor_cmd(args)?,
         Commands::Version => {
             println!("mcc {} — MicroCommandControl", env!("CARGO_PKG_VERSION"));
             println!("api schema: {}", mcc_api::API_VERSION);
         }
     }
 
+    Ok(())
+}
+
+fn doctor_cmd(args: DoctorArgs) -> Result<()> {
+    println!("mcc doctor — host checks");
+    println!("  os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    #[cfg(target_os = "linux")]
+    {
+        let kvm = std::path::Path::new("/dev/kvm").exists();
+        println!("  /dev/kvm: {}", if kvm { "yes" } else { "MISSING" });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        println!("  hypervisor: Apple Silicon HVF expected (agent machine)");
+    }
+    if args.msb {
+        match std::process::Command::new("msb").arg("version").output() {
+            Ok(o) if o.status.success() => {
+                let v = String::from_utf8_lossy(&o.stdout);
+                let e = String::from_utf8_lossy(&o.stderr);
+                println!(
+                    "  msb: ok — {}",
+                    v.trim().lines().next().unwrap_or(e.trim())
+                );
+            }
+            Ok(o) => println!("  msb: failed ({})", o.status),
+            Err(e) => {
+                println!("  msb: not found ({e}) — install microsandbox CLI for real microVMs")
+            }
+        }
+    }
+    println!("  agent runtime flag: --runtime auto|mock|msb (MCC_RUNTIME)");
     Ok(())
 }
 

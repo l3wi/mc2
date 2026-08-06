@@ -62,7 +62,7 @@ async fn apply_schedules_and_agent_marks_running() {
     assert_eq!(body["scheduled"], 2);
     assert_eq!(body["pending"], 0);
 
-    // Agent sync + mock report Running
+    // Simulate agent mock runtime: Sync + ReportStatus Running
     let sync = agent
         .sync(SyncRequest {
             node_id: join.node_id.clone(),
@@ -76,11 +76,14 @@ async fn apply_schedules_and_agent_marks_running() {
     let reports: Vec<InstanceStatus> = sync
         .instances
         .iter()
-        .map(|d| InstanceStatus {
-            instance_id: d.instance_id.clone(),
-            phase: "Running".into(),
-            message: "mock".into(),
-            runtime_id: format!("mock://{}", d.instance_id),
+        .map(|d| {
+            let rid = mcc_runtime::sandbox_name(&d.stack, &d.service, d.ordinal);
+            InstanceStatus {
+                instance_id: d.instance_id.clone(),
+                phase: "Running".into(),
+                message: "mock".into(),
+                runtime_id: format!("mock://{rid}"),
+            }
         })
         .collect();
     agent

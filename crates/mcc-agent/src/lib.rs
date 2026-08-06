@@ -1,7 +1,7 @@
 //! MicroCommandControl node agent.
 //!
 //! Phase 2: join + heartbeat over gRPC.
-//! Phase 3+: sync desired instances; Phase 4: microsandbox runtime.
+//! Phase 3–4: sync desired instances and drive NodeRuntime (mock or msb).
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -9,8 +9,10 @@ use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
-use std::collections::HashMap;
+use mcc_runtime::{desired_from_sync, select_runtime, NodeRuntime, RuntimeKind, SandboxPhase};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{info, warn};
@@ -38,7 +40,7 @@ pub struct AgentArgs {
     #[arg(long, env = "MCC_TLS_INSECURE")]
     pub insecure: bool,
 
-    /// Heartbeat interval seconds
+    /// Heartbeat / reconcile interval seconds
     #[arg(long, default_value_t = 10, env = "MCC_HEARTBEAT_INTERVAL_SECS")]
     pub heartbeat_interval_secs: u64,
 
@@ -54,6 +56,18 @@ pub struct AgentArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
+    /// Runtime backend: auto | mock | msb (default auto)
+    #[arg(long, default_value = "auto", env = "MCC_RUNTIME")]
+    pub runtime: String,
+
+    /// Project dir for msb CLI Sandboxfile (default: ~/.mcc/agent/<node>/msb)
+    #[arg(long, env = "MCC_MSB_PROJECT")]
+    pub msb_project: Option<PathBuf>,
+
+    /// Path to msb binary (default: msb on PATH)
+    #[arg(long, env = "MCC_MSB_BIN")]
+    pub msb_bin: Option<PathBuf>,
+
     /// Log and exit without connecting
     #[arg(long, hide = true)]
     pub dry_run: bool,
@@ -67,10 +81,24 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         .or_else(hostname)
         .unwrap_or_else(|| "unknown".into());
 
+    let runtime_kind = RuntimeKind::parse(&args.runtime)
+        .with_context(|| format!("invalid --runtime {}", args.runtime))?;
+
+    let project = args.msb_project.clone().unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join(".mcc").join("agent").join(&name).join("msb")
+    });
+
+    let runtime: Arc<dyn NodeRuntime> =
+        Arc::from(select_runtime(runtime_kind, project, args.msb_bin.clone())?);
+
     info!(
         node = %name,
         server = ?args.server,
         has_token = args.token.is_some(),
+        runtime = runtime.kind().as_str(),
         api = mcc_api::API_VERSION,
         "MicroCommandControl agent starting"
     );
@@ -116,6 +144,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         cpus,
         memory_mib,
         arch = %arch,
+        runtime = runtime.kind().as_str(),
         "joined control plane"
     );
 
@@ -123,10 +152,19 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Immediate sync after join so apply right after agent start still works.
-    if let Err(e) = sync_and_mock_run(&mut client, &join_resp.node_id, &join_resp.node_token).await
+    // Track runtime ids we created so we can GC on scale-down.
+    let mut owned: HashSet<String> = HashSet::new();
+
+    if let Err(e) = reconcile(
+        &mut client,
+        &join_resp.node_id,
+        &join_resp.node_token,
+        runtime.as_ref(),
+        &mut owned,
+    )
+    .await
     {
-        warn!(error = %e, "initial sync failed");
+        warn!(error = %e, "initial reconcile failed");
     }
 
     loop {
@@ -146,23 +184,23 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     .await
                 {
                     Ok(resp) => {
-                        if resp.into_inner().ok {
-                            tracing::debug!(node_id = %join_resp.node_id, "heartbeat ok");
-                        } else {
+                        if !resp.into_inner().ok {
                             warn!("heartbeat returned ok=false");
                         }
                     }
                     Err(e) => warn!(error = %e, "heartbeat failed"),
                 }
 
-                if let Err(e) = sync_and_mock_run(
+                if let Err(e) = reconcile(
                     &mut client,
                     &join_resp.node_id,
                     &join_resp.node_token,
+                    runtime.as_ref(),
+                    &mut owned,
                 )
                 .await
                 {
-                    warn!(error = %e, "sync failed");
+                    warn!(error = %e, "reconcile failed");
                 }
             }
         }
@@ -171,11 +209,13 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
-/// Pull desired instances and report them Running with a mock runtime id (Phase 3; no msb yet).
-async fn sync_and_mock_run(
+/// Pull desired set, ensure sandboxes running, remove extras, report phases.
+async fn reconcile(
     client: &mut AgentServiceClient<Channel>,
     node_id: &str,
     node_token: &str,
+    runtime: &dyn NodeRuntime,
+    owned: &mut HashSet<String>,
 ) -> Result<()> {
     let sync = client
         .sync(SyncRequest {
@@ -186,30 +226,64 @@ async fn sync_and_mock_run(
         .context("Sync RPC")?
         .into_inner();
 
-    if sync.instances.is_empty() {
-        return Ok(());
+    let desired = desired_from_sync(&sync.instances)?;
+    let desired_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
+
+    // Scale down / GC
+    let stale: Vec<String> = owned.difference(&desired_ids).cloned().collect();
+    for rid in stale {
+        if let Err(e) = runtime.ensure_removed(&rid).await {
+            warn!(runtime_id = %rid, error = %e, "ensure_removed failed");
+        }
+        owned.remove(&rid);
     }
 
-    let reports: Vec<InstanceStatus> = sync
-        .instances
-        .into_iter()
-        .map(|d| {
-            let runtime_id = format!("mock://{}/{}/{}", d.stack, d.service, d.ordinal);
-            info!(
-                instance_id = %d.instance_id,
-                stack = %d.stack,
-                service = %d.service,
-                ordinal = d.ordinal,
-                "mock runtime: instance Running"
-            );
-            InstanceStatus {
-                instance_id: d.instance_id,
-                phase: "Running".into(),
-                message: "phase3 mock runtime".into(),
-                runtime_id,
+    let mut reports: Vec<InstanceStatus> = Vec::new();
+
+    for d in &desired {
+        match runtime.ensure_running(d).await {
+            Ok(st) => {
+                owned.insert(d.runtime_id.clone());
+                let phase = match st.phase {
+                    SandboxPhase::Running => "Running",
+                    SandboxPhase::Creating => "Creating",
+                    SandboxPhase::Failed => "Failed",
+                    SandboxPhase::Stopped => "Stopped",
+                    SandboxPhase::Pending | SandboxPhase::Unknown => "Creating",
+                };
+                info!(
+                    instance_id = %d.instance_id,
+                    runtime_id = %st.runtime_id,
+                    phase,
+                    backend = runtime.kind().as_str(),
+                    "runtime reconciled"
+                );
+                reports.push(InstanceStatus {
+                    instance_id: d.instance_id.clone(),
+                    phase: phase.into(),
+                    message: st.message.unwrap_or_default(),
+                    runtime_id: st.runtime_id,
+                });
             }
-        })
-        .collect();
+            Err(e) => {
+                warn!(
+                    instance_id = %d.instance_id,
+                    error = %e,
+                    "ensure_running failed"
+                );
+                reports.push(InstanceStatus {
+                    instance_id: d.instance_id.clone(),
+                    phase: "Failed".into(),
+                    message: e.to_string(),
+                    runtime_id: d.runtime_id.clone(),
+                });
+            }
+        }
+    }
+
+    if reports.is_empty() {
+        return Ok(());
+    }
 
     let ok = client
         .report_status(ReportStatusRequest {
@@ -240,8 +314,6 @@ async fn connect(
                 .with_context(|| format!("read TLS CA {}", ca_path.display()))?;
             tls = tls.ca_certificate(Certificate::from_pem(pem));
         } else if insecure {
-            // tonic 0.12: accept invalid certs via dangerous config is limited;
-            // require --tls-ca for lab self-signed unless insecure with system roots fails.
             bail!(
                 "https requires --tls-ca <ca.pem> for MCC lab certs (see server data dir tls/ca.pem). \
                  Or use --server http://HOST:PORT with server --grpc-plain"
@@ -259,7 +331,6 @@ async fn connect(
 }
 
 fn tls_domain(server: &str) -> String {
-    // https://host:port -> host
     let rest = server
         .strip_prefix("https://")
         .or_else(|| server.strip_prefix("http://"))
@@ -294,7 +365,6 @@ fn hostname() -> Option<String> {
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| {
-            // macOS often has no /etc/hostname
             std::process::Command::new("hostname")
                 .output()
                 .ok()
@@ -344,6 +414,9 @@ mod tests {
             cpus: None,
             memory_mib: None,
             labels: vec![],
+            runtime: "mock".into(),
+            msb_project: None,
+            msb_bin: None,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

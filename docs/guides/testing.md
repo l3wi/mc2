@@ -89,7 +89,7 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Mock ru
 | ----- | ----------- | ------------------ |
 | 2 Agent join | token/node field validation | join → node Ready in DB; REST list nodes |
 | 3 Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
-| 4 msb runtime | N/A | mock runtime in CI; real msb ignored |
+| 4 msb runtime | naming, Sandboxfile shape | mock lifecycle in CI; real msb lab-only (`--runtime msb`) |
 | 5 Secrets | encrypt/decrypt roundtrip | set secret → not echoed on REST; agent gets material |
 | 6 Reschedule | policy pure functions | multi-node harness with mock agents |
 

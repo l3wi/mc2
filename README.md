@@ -4,7 +4,7 @@ Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.mi
 
 MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
-> **Status:** Phases 0–3 done (server, agents, apply + mock schedule). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
+> **Status:** Phases 0–4 done (including real microsandbox via `msb` CLI). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
 ## Quick start (dev)
 
@@ -17,12 +17,15 @@ DATA=/tmp/mcc-dev
 # Terminal 1 — control plane (prints API + join tokens once)
 ./target/debug/mcc server --data-dir "$DATA" --bind 127.0.0.1:7443 --grpc-bind 127.0.0.1:7444
 
-# Terminal 2 — agent (TLS lab CA from data dir)
+# Terminal 2 — agent (real microVMs if `msb` is on PATH; else mock)
 ./target/debug/mcc agent \
   --server https://127.0.0.1:7444 \
   --tls-ca "$DATA/tls/ca.pem" \
   --token "<join-token>" \
-  --name "$(hostname)"
+  --name "$(hostname)" \
+  --runtime auto
+# --runtime mock   # CI / no hypervisor
+# --runtime msb    # force msb CLI
 
 # Terminal 3 — operator
 export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"
@@ -47,10 +50,11 @@ just test-integration
 | Command | Role |
 | ------- | ---- |
 | `mcc server` | Control plane (SQLite, REST, gRPC) |
-| `mcc agent` | Node worker (join + heartbeat; msb later) |
+| `mcc agent` | Node worker (join, heartbeat, msb runtime) |
 | `mcc node ls` | List nodes via REST |
-| `mcc apply -f stack.yaml` | Apply desired stack (schedule + mock run) |
+| `mcc apply -f stack.yaml` | Apply desired stack (schedule + run) |
 | `mcc ps` | List instances / phases |
+| `mcc doctor` | Host / msb readiness checks |
 
 One dual-mode binary for operators and nodes.
 

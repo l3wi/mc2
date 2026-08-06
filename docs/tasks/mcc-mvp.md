@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–3 complete)  
+**Status:** **Approved — implementing** (Phases 0–4 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -440,13 +440,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 4 — Microsandbox runtime
 
-- [ ] `MicrosandboxRuntime` embed (or msb CLI fallback)  
-- [ ] Create/stop/remove real sandboxes from service spec  
-- [ ] Ports, resources, env, network profiles  
-- [ ] Labels; deterministic names  
-- [ ] Reattach after agent restart  
+- [x] `MicrosandboxRuntime` embed (or msb CLI fallback) — **CLI path (`MsbCliRuntime`)**; SDK embed deferred (heavy / edition 2024)  
+- [x] Create/stop/remove real sandboxes from service spec  
+- [x] Ports, resources, env, network profiles  
+- [x] Labels; deterministic names  
+- [x] Reattach after agent restart (detached `msb run -d` + Sandboxfile project)
 
-**Exit:** real microVM runs; published port works on node.
+**Exit:** real microVM runs; published port works on node. ✅ (via `msb` CLI; CI uses mock)
+
+#### Implementation notes (Phase 4)
+
+- **Branch:** `feat/phase-4-msb-runtime`
+- **Crate:** `mcc-runtime` — `NodeRuntime` trait, `MockRuntime`, `MsbCliRuntime`
+- **Names:** `{stack}-{service}-{ordinal}` → msb sandbox name
+- **Project:** `~/.mcc/agent/<node>/msb/` Sandboxfile managed by agent
+- **Agent:** `--runtime auto|mock|msb` (`MCC_RUNTIME`); reconcile = Sync → ensure_running / ensure_removed → ReportStatus
+- **CLI:** `mcc doctor` checks msb / platform
+- **CI:** mock runtime only (no KVM required)
 
 ### Phase 5 — Secrets
 
@@ -633,6 +643,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
 | 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
 | 3 | **done** | apply YAML, spread scheduler, mock agent Running |
-| 4 | next | real microsandbox runtime |
-| 5–7 | pending | — |
+| 4 | **done** | NodeRuntime + msb CLI microVMs; mock for CI |
+| 5 | next | encrypted secrets + injection |
+| 6–7 | pending | — |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |
