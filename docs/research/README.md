@@ -2,7 +2,7 @@
 
 Local research notes for **MCC** (**MicroCommandControl**) — a self-hosted orchestration layer aimed at home lab → production, similar in spirit to K3s / microK8s but for microsandbox microVMs rather than containers.
 
-**MVP plan:** [docs/tasks/mcc-mvp.md](../tasks/mcc-mvp.md) (implementing — Phases 0–1 done)  
+**MVP plan:** [docs/tasks/mcc-mvp.md](../tasks/mcc-mvp.md) (implementing — Phases 0–2 done)  
 **Repo shape:** MCC code repo only — docs *app/site* stays in a separate project (D12).
 
 | Document | Purpose |

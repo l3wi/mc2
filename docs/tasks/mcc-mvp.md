@@ -1,6 +1,6 @@
 # MCC MVP — MicroCommandControl
 
-**Status:** **Approved — implementing** (Phases 0–1 complete)  
+**Status:** **Approved — implementing** (Phases 0–2 complete)  
 **Date:** 2026-08-06  
 **Name:** **MCC** = **MicroCommandControl**  
 **Goal:** Self-hosted, K3s-shaped command & control for [microsandbox](https://docs.microsandbox.dev) microVMs — home lab first, expandable later.
@@ -400,12 +400,23 @@ MVP is **sliced** so each phase is demoable. Prefer working end-to-end thin vert
 
 ### Phase 2 — Agent join + heartbeat
 
-- [ ] gRPC service + TLS (dev: generated self-signed CA in data dir)  
-- [ ] Join flow + node persistence  
-- [ ] Heartbeat + NotReady detection  
-- [ ] `mcc agent` flags; `mcc node ls` via REST  
+- [x] gRPC service + TLS (dev: generated self-signed CA in data dir)  
+- [x] Join flow + node persistence  
+- [x] Heartbeat + NotReady detection  
+- [x] `mcc agent` flags; `mcc node ls` via REST  
 
-**Exit:** two terminals — server + agent; node shows Ready.
+**Exit:** two terminals — server + agent; node shows Ready. ✅
+
+#### Implementation notes (Phase 2)
+
+- **Branch:** `feat/phase-2-agent-join`
+- **gRPC:** tonic `mcc.agent.v1.AgentService` (Join, Heartbeat; Sync/ReportStatus stubs)
+- **TLS:** default on — rcgen CA + server cert in `<data_dir>/tls/`; agents use `--tls-ca`; `--grpc-plain` for h2c/tests
+- **Auth:** join token → long-lived `mccnt_*` node token (hashed); re-join by name rotates token
+- **Store:** `upsert_node_join`, `heartbeat_node`, `list_nodes`, `mark_stale_nodes` (grace default 45s, watcher 5s)
+- **REST:** `GET /v1/nodes` (bearer); status counts ready/total
+- **CLI:** `mcc node ls --api … --token …` (env `MCC_API`, `MCC_API_TOKEN`)
+- **Tests:** unit (memory/sqlite stale); integration `tests/tests/agent_join.rs`; process e2e verified
 
 ### Phase 3 — Apply stack + schedule (no msb yet)
 
@@ -609,6 +620,7 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | ----- | ------ | ----- |
 | 0 | **done** | Workspace + dual-mode CLI + justfile + CI |
 | 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
-| 2 | next | gRPC join + heartbeat + `mcc node ls` |
-| 3–7 | pending | — |
+| 2 | **done** | gRPC join/heartbeat, TLS lab certs, NotReady watcher, `mcc node ls` |
+| 3 | next | apply YAML + schedule + mock runtime |
+| 4–7 | pending | — |
 | testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

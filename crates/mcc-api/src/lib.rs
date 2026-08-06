@@ -1,9 +1,13 @@
 //! Shared API surface for MicroCommandControl.
 //!
-//! Phase 0: version constants + core object placeholders.
-//! Phase 1+: REST DTOs, Phase 2+: prost/tonic generated agent API.
+//! Includes REST DTOs and generated gRPC types for the agent protocol.
 
 use serde::{Deserialize, Serialize};
+
+/// Generated `mcc.agent.v1` protobuf + tonic service traits.
+pub mod agent {
+    tonic::include_proto!("mcc.agent.v1");
+}
 
 /// Stack / API schema version string used in YAML `apiVersion`.
 pub const API_VERSION: &str = "mcc/v1";
@@ -42,6 +46,20 @@ impl ClusterStatus {
             message: Some("bootstrap stub".into()),
         }
     }
+}
+
+/// Operator-visible node (no credentials).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeView {
+    pub id: String,
+    pub name: String,
+    pub arch: String,
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub status: String,
+    pub last_heartbeat: Option<String>,
+    pub labels: serde_json::Value,
+    pub created_at: String,
 }
 
 #[cfg(test)]

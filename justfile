@@ -45,7 +45,7 @@ check:
     just lint
     just test
 
-# Run server (default: listen on 127.0.0.1:7443, data dir ~/.mcc)
+# Run server (REST :7443, gRPC TLS :7444, data dir ~/.mcc)
 run-server *args:
     cargo run -p mcc -- server {{args}}
 
@@ -53,7 +53,7 @@ run-server *args:
 init-server *args:
     cargo run -p mcc -- server --init-only {{args}}
 
-# Run agent stub (Phase 2: join/heartbeat)
+# Run agent (requires --server and --token; use --tls-ca for https)
 run-agent *args:
     cargo run -p mcc -- agent {{args}}
 

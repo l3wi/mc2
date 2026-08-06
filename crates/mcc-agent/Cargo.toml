@@ -11,8 +11,11 @@ rust-version.workspace = true
 mcc-api = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }
+tonic = { version = "0.12", features = ["transport", "tls", "tls-roots"] }
+http = "1"
+num_cpus = "1"
 
 [lib]
 name = "mcc_agent"

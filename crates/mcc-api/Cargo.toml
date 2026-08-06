@@ -1,6 +1,6 @@
 [package]
 name = "mcc-api"
-description = "Shared API types and constants for MicroCommandControl"
+description = "Shared API types, constants, and gRPC stubs for MicroCommandControl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+prost-types = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [lib]
 name = "mcc_api"

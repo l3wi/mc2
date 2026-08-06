@@ -1,12 +1,12 @@
 //! Shared harness for MicroCommandControl **integration** tests.
 //!
 //! Unit tests live next to production code (`crates/*/src/**`).
-//! Integration tests live in this package’s `tests/` directory and use this
-//! harness to exercise real SQLite + HTTP (and later gRPC/agent) boundaries.
+//! Integration tests live in this package’s `tests/` directory.
 //!
 //! See [docs/guides/testing.md](../docs/guides/testing.md).
 
 use anyhow::{Context, Result};
+use mcc_api::agent::agent_service_server::AgentServiceServer;
 use mcc_server::{router, AppState, Bootstrap};
 use mcc_store::{SqliteStore, Store};
 use std::net::SocketAddr;
@@ -15,23 +15,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
+use tonic::transport::Server as GrpcServer;
 
-/// Ephemeral control plane: temp data dir, real SQLite, real axum listener.
+/// Ephemeral control plane: temp data dir, real SQLite, REST + plain gRPC.
 pub struct TestCluster {
-    /// Kept alive so the temp directory is not deleted while the server runs.
     _dir: TempDir,
     pub data_dir: PathBuf,
     pub base_url: String,
+    pub grpc_url: String,
     pub addr: SocketAddr,
+    pub grpc_addr: SocketAddr,
     pub api_token: String,
     pub join_token: String,
     pub store: Arc<SqliteStore>,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    join: Option<JoinHandle<Result<(), std::io::Error>>>,
+    shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    joins: Vec<JoinHandle<()>>,
 }
 
 impl TestCluster {
-    /// Bootstrap a new cluster and serve REST on `127.0.0.1:0`.
+    /// Bootstrap a new cluster; serve REST and plain gRPC on ephemeral ports.
     pub async fn start() -> Result<Self> {
         let dir = tempfile::tempdir().context("tempdir")?;
         let data_dir = dir.path().to_path_buf();
@@ -59,39 +61,63 @@ impl TestCluster {
             version: env!("CARGO_PKG_VERSION"),
         };
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .context("bind")?;
-        let addr = listener.local_addr().context("local_addr")?;
+            .context("bind rest")?;
+        let addr = rest_listener.local_addr().context("rest local_addr")?;
         let base_url = format!("http://{addr}");
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind grpc")?;
+        let grpc_addr = grpc_listener.local_addr().context("grpc local_addr")?;
+        let grpc_url = format!("http://{grpc_addr}");
+
+        let (tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
         let app = router(state);
-        let join = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = rx.await;
+        let mut rx_rest = tx.subscribe();
+        let rest_join = tokio::spawn(async move {
+            let _ = axum::serve(rest_listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx_rest.recv().await;
                 })
-                .await
+                .await;
+        });
+
+        let agent = mcc_server::AgentSvc {
+            store: store.clone() as Arc<dyn Store>,
+        };
+        let svc = AgentServiceServer::new(agent);
+        let mut rx_grpc = tx.subscribe();
+        let grpc_join = tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+            let _ = GrpcServer::builder()
+                .add_service(svc)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = rx_grpc.recv().await;
+                })
+                .await;
         });
 
         let cluster = Self {
             _dir: dir,
             data_dir,
             base_url: base_url.clone(),
+            grpc_url,
             addr,
+            grpc_addr,
             api_token: creds.api_token,
             join_token: creds.join_token,
             store,
             shutdown: Some(tx),
-            join: Some(join),
+            joins: vec![rest_join, grpc_join],
         };
 
         cluster.wait_healthy().await?;
         Ok(cluster)
     }
 
-    /// Poll `GET /health` until the server responds or timeout.
     pub async fn wait_healthy(&self) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -143,8 +169,7 @@ impl Drop for TestCluster {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(join) = self.join.take() {
-            // Best-effort: do not block drop on async runtime shutdown in all contexts.
+        for join in self.joins.drain(..) {
             join.abort();
         }
     }

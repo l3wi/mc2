@@ -4,30 +4,38 @@ Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.mi
 
 MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
-> **Status:** Phases 0–1 done (server + SQLite + REST). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
+> **Status:** Phases 0–2 done (server, agents, nodes). See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
 ## Quick start (dev)
 
 Requirements: Rust (1.80+), [just](https://github.com/casey/just).
 
 ```bash
-just build          # produces target/debug/mcc
-./target/debug/mcc --help
-./target/debug/mcc version
+just build
+DATA=/tmp/mcc-dev
 
-# First run prints API + join tokens once (save them)
-just run-server -- --data-dir /tmp/mcc-dev --bind 127.0.0.1:7443
+# Terminal 1 — control plane (prints API + join tokens once)
+./target/debug/mcc server --data-dir "$DATA" --bind 127.0.0.1:7443 --grpc-bind 127.0.0.1:7444
 
-# In another shell:
-curl -s http://127.0.0.1:7443/health
-curl -s -H "Authorization: Bearer <api-token>" http://127.0.0.1:7443/v1/status
+# Terminal 2 — agent (TLS lab CA from data dir)
+./target/debug/mcc agent \
+  --server https://127.0.0.1:7444 \
+  --tls-ca "$DATA/tls/ca.pem" \
+  --token "<join-token>" \
+  --name "$(hostname)"
+
+# Terminal 3 — operator
+export MCC_API=http://127.0.0.1:7443 MCC_API_TOKEN="<api-token>"
+./target/debug/mcc node ls
+curl -s -H "Authorization: Bearer $MCC_API_TOKEN" "$MCC_API/v1/status"
 ```
+
+Plain gRPC (no TLS) for local tests: add `--grpc-plain` on the server and use `--server http://127.0.0.1:7444` on the agent.
 
 ```bash
 just check              # fmt + clippy + full test suite (regression gate)
-just test-unit          # directed unit tests in crates/
-just test-integration   # tests/ harness + CLI smoke
-just init-server -- --data-dir /tmp/mcc-dev   # tokens only, no listen
+just test-unit
+just test-integration
 ```
 
 **Testing:** clean, directed unit tests + integration tests to stop regressions — [docs/guides/testing.md](docs/guides/testing.md).
@@ -36,8 +44,9 @@ just init-server -- --data-dir /tmp/mcc-dev   # tokens only, no listen
 
 | Command | Role |
 | ------- | ---- |
-| `mcc server` | Control plane (SQLite, REST) — **Phase 1** |
-| `mcc agent` | Node worker (join, heartbeat, microsandbox) — **Phase 2+** |
+| `mcc server` | Control plane (SQLite, REST, gRPC) |
+| `mcc agent` | Node worker (join + heartbeat; msb later) |
+| `mcc node ls` | List nodes via REST |
 | `mcc apply -f stack.yaml` | Apply desired stack — **Phase 3+** |
 
 One dual-mode binary for operators and nodes.
