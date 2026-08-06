@@ -518,13 +518,17 @@ just run-agent
 
 ## 12. Testing strategy
 
-| Level | What |
-| ----- | ---- |
-| Unit | Scheduler filters/scoring; YAML parse; secret encrypt/decrypt |
-| Store | SQLite migrations + CRUD |
-| Integration | Server + agent with **mock runtime** (no KVM in CI) |
-| Manual / lab | Real msb on Linux KVM + macOS Apple Silicon |
-| Optional CI | Linux nested-virt only if available; otherwise label `msb` tests ignored |
+**Policy:** use clean, directed **unit tests** and **integration tests** to ensure consistency and stop regressions. See [docs/guides/testing.md](../guides/testing.md).
+
+| Level | What | Location |
+| ----- | ---- | -------- |
+| Unit | Scheduler filters/scoring; YAML parse; secret encrypt/decrypt; token hash | `crates/*/src` `#[cfg(test)]` |
+| Store | SQLite migrations + CRUD + reopen | unit + `tests/tests/store_persistence.rs` |
+| Integration | Server HTTP/auth; later agent join; mock runtime (no KVM in CI) | `tests/` (`mcc-tests`), `crates/mcc/tests/` |
+| Manual / lab | Real msb on Linux KVM + macOS Apple Silicon | outside CI |
+| Optional CI | Linux nested-virt only if available; otherwise label `msb` tests ignored | — |
+
+**Harness:** `mcc_tests::TestCluster` (temp data dir, real SQLite, real TCP). **Commands:** `just test`, `just test-unit`, `just test-integration`, `just check`.
 
 ---
 
@@ -607,3 +611,4 @@ Implementation in progress. Update this file’s phase checklists and Implementa
 | 1 | **done** | SQLite store, bootstrap tokens, axum `/health` + `/v1/status` |
 | 2 | next | gRPC join + heartbeat + `mcc node ls` |
 | 3–7 | pending | — |
+| testing | **done** | `tests/` harness + CLI smoke; [docs/guides/testing.md](../guides/testing.md) |

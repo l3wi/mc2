@@ -24,9 +24,13 @@ curl -s -H "Authorization: Bearer <api-token>" http://127.0.0.1:7443/v1/status
 ```
 
 ```bash
-just check          # fmt + clippy + test
+just check              # fmt + clippy + full test suite (regression gate)
+just test-unit          # directed unit tests in crates/
+just test-integration   # tests/ harness + CLI smoke
 just init-server -- --data-dir /tmp/mcc-dev   # tokens only, no listen
 ```
+
+**Testing:** clean, directed unit tests + integration tests to stop regressions — [docs/guides/testing.md](docs/guides/testing.md).
 
 ## Binary modes
 

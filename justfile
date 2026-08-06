@@ -14,9 +14,18 @@ build:
 release:
     cargo build -p mcc --release
 
-# Unit tests (workspace)
+# Full workspace tests (unit + integration)
 test:
     cargo test --workspace
+
+# Directed unit tests only (library/bin crates under crates/)
+test-unit:
+    cargo test --workspace --exclude mcc-tests
+
+# Integration: harness package + CLI black-box tests
+test-integration:
+    cargo test -p mcc-tests
+    cargo test -p mcc --test cli_smoke
 
 # Format check
 fmt:
@@ -30,7 +39,7 @@ fmt-fix:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# fmt + clippy + test
+# fmt + clippy + full test suite (regression gate)
 check:
     just fmt
     just lint

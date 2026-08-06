@@ -1,0 +1,28 @@
+[package]
+name = "mcc-tests"
+description = "Integration tests and shared harness for MicroCommandControl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mcc-api = { workspace = true }
+mcc-server = { workspace = true }
+mcc-store = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+axum = "0.8"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }
+
+[lib]
+name = "mcc_tests"
+path = "src/lib.rs"
+
+# Integration test binaries (black-box across crates / process boundaries).
+# Unit tests stay next to production code under crates/*/src.

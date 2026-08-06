@@ -4,7 +4,8 @@ mod auth;
 mod bootstrap;
 mod http;
 
-pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult};
+pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
+pub use http::router;
 
 use anyhow::{Context, Result};
 use clap::Parser;
