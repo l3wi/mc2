@@ -32,7 +32,7 @@ Volumes still require an explicit top-level declaration and absolute mount
 paths. Present values are never rewritten — a wrong `apiVersion` still fails
 server-side validation loudly. Note that filling re-serializes the document,
 so YAML comments in partial files are dropped; complete files pass through
-verbatim.
+verbatim. Full key reference: [stack.yaml guide](../docs/guides/stack-yaml.md).
 
 ## Ready-to-use
 

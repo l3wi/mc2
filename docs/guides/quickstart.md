@@ -152,3 +152,4 @@ MC2 exports **control-plane / agent** metrics (`mc2.server.*`, `mc2.agent.*`). S
 ## Next reading
 
 - [Testing](./testing.md)
+- [Stack YAML reference](./stack-yaml.md)
