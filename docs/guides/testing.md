@@ -105,6 +105,20 @@ cargo test -p mc2-agent --lib ingress_files
 cargo test -p mc2-runtime --lib ingress_render
 ```
 
+### Volumes smoke (CI vs lab)
+
+| Path | What it proves |
+| ---- | -------------- |
+| `mc2-api` stack tests | YAML: declared `dir` volumes accept; undeclared mounts, non-`dir` kinds, invalid names, `--` in names, relative/duplicate mounts → reject |
+| `mc2-runtime` `naming` + `spec_hash` | `volume_name` namespace/collision rules; `volume_mount_plan` order; mount change forces recreate |
+| `tests/tests/volumes.rs` | Apply → instance scheduled (user-facing names persisted) → agent Sync → `desired_from_sync` → `volume_mount_plan` resolves `mc2-<stack>--<volume>`; 400 for undeclared volume |
+| Lab | Marker file under `/data` survives sandbox recreate; instance stays on its node; volume dir remains after stack removal — [examples/06-persistent-volumes/README.md](../../examples/06-persistent-volumes/README.md) |
+
+```bash
+cargo test -p mc2-tests --test volumes
+cargo test -p mc2-api --lib stack
+```
+
 ---
 
 ## Where to add tests
@@ -113,10 +127,11 @@ cargo test -p mc2-runtime --lib ingress_render
 | ---- | ----------- | ------------------ |
 | Agent join | token/node field validation | join → node Ready in DB; REST list nodes |
 | Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
-| msb runtime | naming, profile mapping | unit only in CI; full SDK lab-only |
+| msb runtime | naming, profile mapping, volume mount plan | unit only in CI; full SDK lab-only |
 | Secrets | encrypt/decrypt roundtrip | set → apply → agent Sync injection; missing/empty allowHosts fail closed |
 | Reschedule | restartPolicy matrix; sticky/never | two-node NotReady → rebind (`tests/tests/reschedule.rs`); sticky volumes stay |
 | Ingress | render, plan, file ready-gate + TCP probe | `tests/tests/ingress.rs` apply/Sync/REST lifecycle |
+| Volumes | validation matrix; naming/mount plan; recreate hash | `tests/tests/volumes.rs` apply/Sync contract; marker persistence lab-only |
 
 ---
 

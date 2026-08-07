@@ -227,7 +227,7 @@ async fn apply_sync_catalog_routes_map_to_host_ports() {
         backend_ordinal: r.backend_ordinal,
     }
     .to_ready("127.0.0.1");
-    let traefik = render_traefik_dynamic(&[ready.clone()]);
+    let traefik = render_traefik_dynamic(std::slice::from_ref(&ready));
     assert!(
         traefik.contains("http://127.0.0.1:18080"),
         "traefik must target host port: {traefik}"

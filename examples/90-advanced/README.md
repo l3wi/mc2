@@ -7,7 +7,7 @@ copy-and-run examples.
 | Scenario | Status |
 |---|---|
 | [Observability](./observability/) | UNDER DEVELOPMENT — collector config exists; no complete verification path |
-| [Persistent volumes](./persistent-volumes/) | UNDER DEVELOPMENT — needs persistence and node-stickiness walkthrough |
+| [Persistent volumes](../06-persistent-volumes/) | Ready — see the numbered example; deletion, migration, snapshots, quotas, and remote storage remain future work |
 | [Two-node failover](./two-node-failover/) | UNDER DEVELOPMENT — needs two-worker setup and failure verification |
 | [Lifecycle changes](./lifecycle/) | UNDER DEVELOPMENT — needs a documented update, scale, and cleanup flow |
 | [Demo reference](./demo-reference.yaml) | Reference configuration only; not part of the beginner path |

@@ -34,20 +34,18 @@ pub fn build_fabric_desired(
 
     let mut allows = Vec::new();
     for a in &spec.allow {
-        let backend = by_service
-            .get(&a.to)
-            .and_then(|list| {
-                // Prefer lowest ordinal that is bound and not Failed/Stopped.
-                list.iter()
-                    .copied()
-                    .find(|i| {
-                        i.node_id.is_some()
-                            && i.phase != "Failed"
-                            && i.phase != "Stopped"
-                            && i.phase != "Pending"
-                    })
-                    .or_else(|| list.first().copied())
-            });
+        let backend = by_service.get(&a.to).and_then(|list| {
+            // Prefer lowest ordinal that is bound and not Failed/Stopped.
+            list.iter()
+                .copied()
+                .find(|i| {
+                    i.node_id.is_some()
+                        && i.phase != "Failed"
+                        && i.phase != "Stopped"
+                        && i.phase != "Pending"
+                })
+                .or_else(|| list.first().copied())
+        });
 
         let (backend_instance_id, backend_node_id, backend_ordinal, backend_local) = match backend {
             Some(b) => {

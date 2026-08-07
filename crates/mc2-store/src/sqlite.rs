@@ -1,9 +1,9 @@
 //! SQLite-backed store (default production backend).
 
 use crate::{
-    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstanceFabricRecord,
-    InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, SecretBlob, SecretMeta,
-    SshAuthorizedKey, StackRecord, Store, StoreError,
+    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
+    InstanceFabricRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord,
+    SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;

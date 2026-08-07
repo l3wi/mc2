@@ -170,6 +170,9 @@ apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: sticky
+volumes:
+  data:
+    kind: dir
 services:
   db:
     image: alpine:3.20

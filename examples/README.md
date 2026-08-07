@@ -10,6 +10,7 @@ The examples are arranged by user-facing scenario. Start with
 - [Service fabric](./service-fabric/) — connect two same-node services with `expose` and `allow`.
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.
+- [Persistent volumes](./06-persistent-volumes/) — mount a node-local named volume that survives sandbox recreate.
 
 ## Advanced
 

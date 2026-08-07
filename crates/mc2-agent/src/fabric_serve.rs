@@ -115,8 +115,7 @@ impl FabricTable {
             }
             idx.insert(desired.instance_id.clone(), map);
         }
-        self.exposes
-            .insert(desired.instance_id.clone(), bindings);
+        self.exposes.insert(desired.instance_id.clone(), bindings);
         Ok(())
     }
 
@@ -151,9 +150,14 @@ impl FabricTable {
         let mut edge_results: Vec<FabricEdgeStatus> = Vec::new();
         let mut kept: Vec<ActiveSplice> = Vec::new();
 
-        let prev = self.splices.remove(&desired.instance_id).unwrap_or_default();
-        let mut prev_by_key: HashMap<String, ActiveSplice> =
-            prev.into_iter().map(|s| (s.config_key.clone(), s)).collect();
+        let prev = self
+            .splices
+            .remove(&desired.instance_id)
+            .unwrap_or_default();
+        let mut prev_by_key: HashMap<String, ActiveSplice> = prev
+            .into_iter()
+            .map(|s| (s.config_key.clone(), s))
+            .collect();
 
         for allow in &desired.fabric.allows {
             match self.plan_edge(allow).await {
@@ -245,9 +249,9 @@ impl FabricTable {
 
     /// Host publish ports for this instance's fabric exposes (if prepared).
     pub fn expose_host_ports(&self, instance_id: &str) -> Option<Vec<u16>> {
-        self.exposes.get(instance_id).map(|v| {
-            v.iter().map(|b| b.host_port).collect()
-        })
+        self.exposes
+            .get(instance_id)
+            .map(|v| v.iter().map(|b| b.host_port).collect())
     }
 
     /// Drop splices/hosts for one instance (before force-recreate).
@@ -373,7 +377,10 @@ impl FabricTable {
                 });
             }
         };
-        let listen_port = listener.local_addr().map(|a| a.port()).unwrap_or(allow.port);
+        let listen_port = listener
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(allow.port);
         let backend = backend_host_port;
         let to_label = allow.to_service.clone();
         let handle = tokio::spawn(async move {
@@ -428,7 +435,9 @@ impl FabricTable {
             .iter()
             .filter(|a| {
                 observed.edges.iter().any(|e| {
-                    e.to_service == a.to_service && e.port == u32::from(a.port) && e.phase == "Ready"
+                    e.to_service == a.to_service
+                        && e.port == u32::from(a.port)
+                        && e.phase == "Ready"
                 })
             })
             .map(|a| (a.fqdn.clone(), a.short_name.clone()))

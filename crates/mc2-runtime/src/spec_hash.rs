@@ -145,4 +145,21 @@ mod tests {
         a.fabric = b.fabric.clone();
         assert_eq!(desired_recreate_hash(&a), desired_recreate_hash(&b));
     }
+
+    #[test]
+    fn volume_mount_change_forces_recreate() {
+        let mut a = bare("alpine:3.20");
+        let mut b = bare("alpine:3.20");
+        b.spec.volumes.push(mc2_api::VolumeMount {
+            name: "data".into(),
+            mount: "/data".into(),
+        });
+        assert_ne!(desired_recreate_hash(&a), desired_recreate_hash(&b));
+        a.spec.volumes = b.spec.volumes.clone();
+        assert_eq!(desired_recreate_hash(&a), desired_recreate_hash(&b));
+
+        // Mount path change also forces recreate.
+        b.spec.volumes[0].mount = "/srv/data".into();
+        assert_ne!(desired_recreate_hash(&a), desired_recreate_hash(&b));
+    }
 }

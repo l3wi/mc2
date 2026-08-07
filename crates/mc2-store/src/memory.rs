@@ -2,8 +2,8 @@
 
 use crate::{
     ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
-    InstanceFabricRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin,
-    NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store,
+    InstanceFabricRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat,
+    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store,
     StoreError,
 };
 use async_trait::async_trait;

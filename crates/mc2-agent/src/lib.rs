@@ -16,7 +16,7 @@ mod ssh_serve;
 use fabric_serve::FabricTable;
 use ingress_files::{warn_ingress_dir_unset, IngressFileWriter};
 use mc2_runtime::{
-    backoff_secs, default_runtime, desired_from_sync, desired_recreate_hash, NodeRuntime,
+    backoff_secs, desired_from_sync, desired_recreate_hash, MicrosandboxRuntime, NodeRuntime,
     RestartPolicy, SandboxPhase,
 };
 use ssh_serve::SshServeTable;
@@ -81,6 +81,11 @@ pub struct AgentArgs {
     #[arg(long, env = "MC2_INGRESS_CONFIG_DIR")]
     pub ingress_config_dir: Option<PathBuf>,
 
+    /// Named-volume root on durable node storage (default ~/.microsandbox/volumes).
+    /// Volumes persist across sandbox recreation and are retained on stack removal.
+    #[arg(long, env = "MC2_VOLUME_DIR")]
+    pub volume_dir: Option<PathBuf>,
+
     /// Log and exit without connecting
     #[arg(long, hide = true)]
     pub dry_run: bool,
@@ -94,7 +99,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         .or_else(hostname)
         .unwrap_or_else(|| "unknown".into());
 
-    let runtime: Arc<dyn NodeRuntime> = Arc::new(default_runtime());
+    let runtime: Arc<dyn NodeRuntime> = Arc::new(MicrosandboxRuntime::new(args.volume_dir.clone()));
 
     info!(
         node = %name,
@@ -795,6 +800,7 @@ mod tests {
             memory_mib: None,
             labels: vec![],
             ingress_config_dir: None,
+            volume_dir: None,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

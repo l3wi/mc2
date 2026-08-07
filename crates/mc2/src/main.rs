@@ -246,7 +246,10 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Version => {
-            println!("mc2 {} — MC2 (MicroCommandControl)", env!("CARGO_PKG_VERSION"));
+            println!(
+                "mc2 {} — MC2 (MicroCommandControl)",
+                env!("CARGO_PKG_VERSION")
+            );
             println!("api schema: {}", mc2_api::API_VERSION);
             if let Some(ep) = mc2_metrics::otlp_endpoint_from_env() {
                 println!("otlp endpoint: {ep}");

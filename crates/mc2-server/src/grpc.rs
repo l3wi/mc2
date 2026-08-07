@@ -138,10 +138,8 @@ impl AgentService for AgentSvc {
             .list_stacks()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let stacks_yaml: Vec<(String, String)> = stacks
-            .into_iter()
-            .map(|s| (s.name, s.raw_yaml))
-            .collect();
+        let stacks_yaml: Vec<(String, String)> =
+            stacks.into_iter().map(|s| (s.name, s.raw_yaml)).collect();
         let ingress_routes =
             build_ingress_routes_for_node(&req.node_id, &stacks_yaml, &all_instances);
 

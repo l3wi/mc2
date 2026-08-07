@@ -15,35 +15,58 @@ use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, PortRange, Protocol, Rule,
 };
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
-/// Real microVM backend via the **microsandbox** crate (local libkrun only).
-#[derive(Debug, Default)]
-pub struct MicrosandboxRuntime;
-
 /// Ensure process-wide default is LocalBackend once per agent process.
 static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// Real microVM backend via the **microsandbox** crate (local libkrun only).
+#[derive(Debug)]
+pub struct MicrosandboxRuntime {
+    /// Named-volume root override (agent `--volume-dir`). `None` = msb default
+    /// (`~/.microsandbox/volumes`). Applied process-wide on first backend init.
+    volume_dir: Option<PathBuf>,
+}
+
 impl MicrosandboxRuntime {
-    pub fn new() -> Self {
-        Self
+    pub fn new(volume_dir: Option<PathBuf>) -> Self {
+        Self { volume_dir }
     }
 }
 
-async fn ensure_local_backend() -> Result<()> {
+async fn ensure_local_backend(volume_dir: Option<&Path>) -> Result<()> {
     if LOCAL_BACKEND_INSTALLED.load(Ordering::SeqCst) {
         return Ok(());
     }
     // Install local even if MSB_API_KEY / cloud profile would otherwise win.
-    let local = LocalBackend::new()
-        .await
-        .context("LocalBackend::new (open microsandbox local DB)")?;
+    let local = match volume_dir {
+        Some(dir) => LocalBackend::builder()
+            .volumes_dir(resolve_volume_dir(dir)?)
+            .build()
+            .await
+            .with_context(|| format!("LocalBackend builder with volumes_dir={dir:?}"))?,
+        None => LocalBackend::new()
+            .await
+            .context("LocalBackend::new (open microsandbox local DB)")?,
+    };
     set_default_backend(local);
     LOCAL_BACKEND_INSTALLED.store(true, Ordering::SeqCst);
-    info!("microsandbox: forced LocalBackend (ignores MSB_API_KEY / cloud profiles)");
+    info!(
+        volume_dir = volume_dir.map(|p| p.display().to_string()),
+        "microsandbox: forced LocalBackend (ignores MSB_API_KEY / cloud profiles)"
+    );
     Ok(())
+}
+
+/// Create the override volume root and resolve symlinks (e.g. macOS
+/// `/tmp` → `/private/tmp`): msb refuses to follow symlinks when mounting,
+/// so the backend must receive a canonical path.
+fn resolve_volume_dir(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create volume dir {}", dir.display()))?;
+    std::fs::canonicalize(dir).with_context(|| format!("canonicalize volume dir {}", dir.display()))
 }
 
 fn map_status(s: MsbStatus) -> SandboxPhase {
@@ -103,8 +126,8 @@ fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
     policy
 }
 
-async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
-    ensure_local_backend().await?;
+async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) -> Result<()> {
+    ensure_local_backend(volume_dir).await?;
 
     let cpus = desired.spec.resources.cpus.clamp(1, 255) as u8;
     let mem = desired.spec.resources.memory_mib.min(u32::MAX as u64) as u32;
@@ -132,6 +155,14 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
         .label("mc2.service", &desired.service)
         .label("mc2.ordinal", desired.ordinal.to_string());
 
+    // Node-local named directory volumes: create-or-reuse under the backend
+    // volumes dir; data survives sandbox removal (msb retains named volumes).
+    let mounts = crate::volume_mount_plan(desired);
+    for (guest, msb_name) in mounts {
+        b = b.volume(guest, move |m| {
+            m.named_with(msb_name, |v| v.ensure_exists().directory())
+        });
+    }
     for p in &desired.spec.ports {
         let bind = IpAddr::from_str(&p.bind).unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
         if p.protocol.eq_ignore_ascii_case("udp") {
@@ -172,7 +203,7 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
         cpus,
         memory_mib = mem,
         secrets = desired.secrets.len(),
-        "creating detached microsandbox via SDK (local)"
+        volumes = desired.spec.volumes.len(),
     );
 
     b.create_detached()
@@ -181,8 +212,8 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
     Ok(())
 }
 
-async fn observe(name: &str) -> Result<Option<MsbStatus>> {
-    ensure_local_backend().await?;
+async fn observe(name: &str, volume_dir: Option<&Path>) -> Result<Option<MsbStatus>> {
+    ensure_local_backend(volume_dir).await?;
     match Sandbox::get(name).await {
         Ok(handle) => Ok(Some(handle.status_snapshot())),
         Err(e) => {
@@ -195,12 +226,12 @@ async fn observe(name: &str) -> Result<Option<MsbStatus>> {
 #[async_trait]
 impl NodeRuntime for MicrosandboxRuntime {
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus> {
-        ensure_local_backend().await?;
+        ensure_local_backend(self.volume_dir.as_deref()).await?;
         let name = desired.runtime_id.as_str();
 
         let policy = RestartPolicy::parse(&desired.spec.restart_policy);
 
-        match observe(name).await? {
+        match observe(name, self.volume_dir.as_deref()).await? {
             Some(st) => {
                 let phase = map_status(st);
                 match phase {
@@ -233,7 +264,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                         RestartAction::Recreate => {
                             warn!(%name, ?policy, "recreating sandbox per restartPolicy");
                             let _ = Sandbox::remove(name).await;
-                            create_detached(desired).await?;
+                            create_detached(desired, self.volume_dir.as_deref()).await?;
                         }
                         RestartAction::Start => {
                             info!(%name, ?other, "starting existing sandbox (detached)");
@@ -249,7 +280,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                                     }
                                     warn!(%name, error = %e, "start_detached failed; recreating");
                                     let _ = Sandbox::remove(name).await;
-                                    create_detached(desired).await?;
+                                    create_detached(desired, self.volume_dir.as_deref()).await?;
                                 }
                             }
                         }
@@ -257,11 +288,11 @@ impl NodeRuntime for MicrosandboxRuntime {
                 }
             }
             None => {
-                create_detached(desired).await?;
+                create_detached(desired, self.volume_dir.as_deref()).await?;
             }
         }
 
-        let phase = match observe(name).await? {
+        let phase = match observe(name, self.volume_dir.as_deref()).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Creating,
         };
@@ -274,7 +305,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn ensure_removed(&self, runtime_id: &str) -> Result<()> {
-        ensure_local_backend().await?;
+        ensure_local_backend(self.volume_dir.as_deref()).await?;
         let name = runtime_id;
         info!(%name, "stopping/removing microsandbox via SDK");
 
@@ -306,8 +337,8 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn status(&self, runtime_id: &str) -> Result<SandboxStatus> {
-        ensure_local_backend().await?;
-        let phase = match observe(runtime_id).await? {
+        ensure_local_backend(self.volume_dir.as_deref()).await?;
+        let phase = match observe(runtime_id, self.volume_dir.as_deref()).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Stopped,
         };
@@ -319,7 +350,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn list(&self) -> Result<Vec<String>> {
-        ensure_local_backend().await?;
+        ensure_local_backend(self.volume_dir.as_deref()).await?;
         let page = Sandbox::list().await.context("Sandbox::list")?;
         Ok(page
             .sandboxes
@@ -329,7 +360,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32> {
-        ensure_local_backend().await?;
+        ensure_local_backend(self.volume_dir.as_deref()).await?;
         if argv.is_empty() {
             anyhow::bail!("exec_command: empty argv");
         }

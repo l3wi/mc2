@@ -10,7 +10,7 @@ mod spec;
 mod spec_hash;
 
 pub use msb_sdk::MicrosandboxRuntime;
-pub use naming::sandbox_name;
+pub use naming::{sandbox_name, volume_mount_plan, volume_name};
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod fabric;
 pub use fabric::{
@@ -55,9 +55,4 @@ pub struct SandboxStatus {
     pub runtime_id: String,
     pub phase: SandboxPhase,
     pub message: Option<String>,
-}
-
-/// Construct the only supported runtime: embedded microsandbox SDK.
-pub fn default_runtime() -> MicrosandboxRuntime {
-    MicrosandboxRuntime::new()
 }

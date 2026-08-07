@@ -204,4 +204,56 @@ mod tests {
         assert_eq!(work[0].secrets[0].value, "plaintext-for-agent");
         assert_eq!(work[0].secrets[0].allow_hosts, vec!["api.example.com"]);
     }
+
+    #[test]
+    fn volume_mount_plan_maps_spec_order() {
+        let spec = ServiceSpec {
+            image: "alpine:3.20".into(),
+            replicas: 1,
+            resources: Default::default(),
+            ports: vec![],
+            network: Default::default(),
+            env: Default::default(),
+            secrets: vec![],
+            volumes: vec![
+                mc2_api::VolumeMount {
+                    name: "data".into(),
+                    mount: "/data".into(),
+                },
+                mc2_api::VolumeMount {
+                    name: "cache".into(),
+                    mount: "/var/cache".into(),
+                },
+            ],
+            restart_policy: "on-failure".into(),
+            health: None,
+            labels: Default::default(),
+            command: Some(vec!["sleep".into(), "infinity".into()]),
+            node_name: None,
+            node_selector: Default::default(),
+            ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
+        };
+        let inst = DesiredInstance {
+            instance_id: "i1".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            ordinal: 0,
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            secrets: vec![],
+            ssh: None,
+            fabric: None,
+        };
+        let work = desired_from_sync(&[inst]).unwrap();
+        let plan = crate::volume_mount_plan(&work[0]);
+        assert_eq!(
+            plan,
+            vec![
+                ("/data".to_string(), "mc2-demo--data".to_string()),
+                ("/var/cache".to_string(), "mc2-demo--cache".to_string()),
+            ]
+        );
+    }
 }

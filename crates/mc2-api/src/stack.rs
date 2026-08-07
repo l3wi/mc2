@@ -321,6 +321,13 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
     if doc.services.is_empty() {
         return Err("services must not be empty".into());
     }
+    if doc.metadata.name.contains("--") {
+        return Err(format!(
+            "invalid stack name {:?}: must not contain '--' (volume namespace separator)",
+            doc.metadata.name
+        ));
+    }
+    validate_volumes(doc)?;
     if let Some(ref ing) = doc.ingress {
         validate_ingress(doc, ing)?;
     }
@@ -420,13 +427,68 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_ingress(doc: &StackDocument, ing: &IngressSpec) -> Result<(), String> {
-    if ing.rules.is_empty() {
-        if ing.tcp.is_empty() {
-            return Err(
-                "ingress.rules or ingress.tcp must not be empty when ingress is set".into(),
-            );
+/// Node-local persistent volumes (v1): declared `dir` volumes, absolute unique
+/// mounts, names safe for the msb volume namespace `mc2-{stack}--{volume}`.
+fn validate_volumes(doc: &StackDocument) -> Result<(), String> {
+    for (name, vol) in &doc.volumes {
+        if !valid_volume_name(name) {
+            return Err(format!(
+                "invalid volume name {name:?}: must match [a-z0-9][a-z0-9._-]* and must not contain '--'"
+            ));
         }
+        let kind = vol.kind.trim().to_ascii_lowercase();
+        if kind != "dir" {
+            return Err(format!(
+                "volume {name}: unsupported kind {:?} (only dir is supported in v1)",
+                vol.kind
+            ));
+        }
+    }
+    for (name, svc) in &doc.services {
+        let mut mount_paths = std::collections::BTreeSet::new();
+        for m in &svc.volumes {
+            if m.name.trim().is_empty() {
+                return Err(format!("service {name}: volume mount name is required"));
+            }
+            if !doc.volumes.contains_key(&m.name) {
+                return Err(format!(
+                    "service {name}: volume {:?} is not defined under stack volumes",
+                    m.name
+                ));
+            }
+            if !m.mount.starts_with('/') {
+                return Err(format!(
+                    "service {name}: volume mount path must be absolute (got {:?})",
+                    m.mount
+                ));
+            }
+            if !mount_paths.insert(m.mount.clone()) {
+                return Err(format!(
+                    "service {name}: duplicate volume mount path {:?}",
+                    m.mount
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Volume name charset for the msb named-volume namespace; `--` is reserved
+/// as the stack/volume separator.
+fn valid_volume_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("--")
+}
+
+fn validate_ingress(doc: &StackDocument, ing: &IngressSpec) -> Result<(), String> {
+    if ing.rules.is_empty() && ing.tcp.is_empty() {
+        return Err("ingress.rules or ingress.tcp must not be empty when ingress is set".into());
     }
     for (ti, route) in ing.tcp.iter().enumerate() {
         if route.name.trim().is_empty() || route.entry_point.trim().is_empty() {
@@ -726,5 +788,108 @@ services:
 "#;
         let err = parse_stack_yaml(yaml).unwrap_err();
         assert!(err.contains("not defined"), "{err}");
+    }
+
+    /// Volume stack helper: injects `volumes_yaml` at top level and
+    /// `mounts_yaml` under the single service.
+    fn volume_stack(volumes_yaml: &str, mounts_yaml: &str) -> String {
+        format!(
+            r#"
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: demo
+volumes:
+{volumes_yaml}
+services:
+  web:
+    image: alpine:3.20
+    volumes:
+{mounts_yaml}
+"#
+        )
+    }
+
+    #[test]
+    fn valid_volume_stack_accepted() {
+        let doc = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir",
+            "      - name: data\n        mount: /data",
+        ))
+        .unwrap();
+        assert_eq!(doc.services["web"].volumes[0].mount, "/data");
+        assert_eq!(doc.volumes["data"].kind, "dir");
+    }
+
+    #[test]
+    fn volume_mount_without_declaration_rejected() {
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir",
+            "      - name: missing\n        mount: /data",
+        ))
+        .unwrap_err();
+        assert!(err.contains("not defined under stack volumes"), "{err}");
+    }
+
+    #[test]
+    fn volume_kind_other_than_dir_rejected() {
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: disk",
+            "      - name: data\n        mount: /data",
+        ))
+        .unwrap_err();
+        assert!(err.contains("unsupported kind"), "{err}");
+    }
+
+    #[test]
+    fn volume_name_empty_or_invalid_rejected() {
+        for bad in [
+            "  \"\":\n    kind: dir",
+            "  Data!:\n    kind: dir",
+            "  -data:\n    kind: dir",
+        ] {
+            let err = parse_stack_yaml(&volume_stack(bad, "      []")).unwrap_err();
+            assert!(err.contains("invalid volume name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn volume_name_double_dash_rejected() {
+        let err =
+            parse_stack_yaml(&volume_stack("  da--ta:\n    kind: dir", "      []")).unwrap_err();
+        assert!(err.contains("invalid volume name"), "{err}");
+
+        // Stack names must not collide with the `--` separator either.
+        let yaml = r#"
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: my--stack
+services:
+  web:
+    image: alpine:3.20
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("must not contain '--'"), "{err}");
+    }
+
+    #[test]
+    fn relative_mount_path_rejected() {
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir",
+            "      - name: data\n        mount: data/files",
+        ))
+        .unwrap_err();
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_mount_path_per_service_rejected() {
+        let err = parse_stack_yaml(&volume_stack(
+            "  a:\n    kind: dir\n  b:\n    kind: dir",
+            "      - name: a\n        mount: /data\n      - name: b\n        mount: /data",
+        ))
+        .unwrap_err();
+        assert!(err.contains("duplicate volume mount path"), "{err}");
     }
 }

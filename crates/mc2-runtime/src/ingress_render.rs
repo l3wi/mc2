@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(r.guest_port, 8000);
         assert_eq!(r.backend_port, 18080);
         assert_eq!(r.backend_host, "127.0.0.1");
-        let y = render_traefik_dynamic(&[r.clone()]);
+        let y = render_traefik_dynamic(std::slice::from_ref(&r));
         assert!(y.contains("entryPoints:"), "{y}");
         assert!(y.contains("- web"), "{y}");
         assert!(!y.contains("websecure"), "{y}");
