@@ -3,7 +3,7 @@
 #
 # Example:
 #   mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
-#   traefik --configFile=examples/ingress/traefik.static.yml
+#   traefik --configFile=examples/http-ingress/traefik.static.yml
 #
 # Adjust ACME email / disable TLS entrypoint for pure lab HTTP.
 
@@ -12,9 +12,11 @@ entryPoints:
     address: ":8088"
   websecure:
     address: ":8443"
+  ssh:
+    address: ":2200"
 
 # Optional ACME (public hosts only). For lab, prefer HTTP-only routers
-# (set ingress.tls.enabled: false in stack YAML) or use Caddy tls internal.
+# (set ingress.tls.enabled: false in stack YAML for pure lab HTTP).
 certificatesResolvers:
   le:
     acme:

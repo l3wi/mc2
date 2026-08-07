@@ -50,7 +50,7 @@ mkdir -p "$DATA"
 # Terminal 3 — operator
 export MC2_API=http://127.0.0.1:7443
 ./target/debug/mc2 node ls
-./target/debug/mc2 apply -f examples/stacks/smoke.yaml
+./target/debug/mc2 apply -f examples/01-hello-service/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/status" | jq .
 ```
@@ -59,7 +59,7 @@ curl -s "$MC2_API/v1/status" | jq .
 
 ```bash
 ./target/debug/mc2 secret set SMOKE_TOKEN --value 'lab-only'
-./target/debug/mc2 apply -f examples/stacks/smoke-secrets.yaml
+./target/debug/mc2 apply -f examples/02-secrets/stack.yaml
 ```
 
 ### Service fabric (same-node east–west)
@@ -67,7 +67,7 @@ curl -s "$MC2_API/v1/status" | jq .
 Compose-like multi-service connectivity without a flat pod network. Stack declares `expose` (internal listeners) and client `allow` edges; the agent L4-splices and injects DNS (`db.<stack>.svc.mc2`).
 
 ```bash
-./target/debug/mc2 apply -f examples/stacks/smoke-fabric.yaml
+./target/debug/mc2 apply -f examples/03-service-fabric/stack.yaml
 ./target/debug/mc2 ps
 # Fabric status (agent-reported):
 curl -s "$MC2_API/v1/instances/<client-instance-id>/fabric" | jq .
@@ -78,22 +78,22 @@ cargo run -p mc2-runtime --example msb_shell -- smoke-fabric-client-0 \
 # expect: FABRIC_OK
 ```
 
-### Ingress (same-node HTTP via Traefik/Caddy files)
+### Ingress (same-node HTTP via Traefik files)
 
-North–south HTTP: declare `ports:` + stack `ingress:`; the agent writes Traefik/Caddy files when `--ingress-config-dir` is set. Operator guide: [examples/ingress/README.md](../../examples/ingress/README.md).
+North–south HTTP: declare `ports:` + stack `ingress:`; the agent writes Traefik files when `--ingress-config-dir` is set. Operator guide: [examples/04-http-ingress/README.md](../../examples/04-http-ingress/README.md).
 
 ```bash
 mkdir -p /tmp/mc2-ingress
 # Restart agent with:
 #   --ingress-config-dir /tmp/mc2-ingress
 
-./target/debug/mc2 apply -f examples/stacks/smoke-ingress.yaml
+./target/debug/mc2 apply -f examples/04-http-ingress/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/ingress" | jq .
 # After instance Running and host port live:
 cat /tmp/mc2-ingress/catalog.json | jq .
 curl -s http://127.0.0.1:18080/ | head   # direct backend
-# Point Traefik file provider or Caddy at /tmp/mc2-ingress — see examples/ingress/
+# Point Traefik file provider at /tmp/mc2-ingress — see examples/04-http-ingress/
 ```
 
 **Defaults:** deny east–west until `allow`; same-stack + same-node only; no multi-node fabric yet.
@@ -105,7 +105,7 @@ Omit `--no-auth` on first bootstrap. Save the printed **API token** and **join t
 ```bash
 export MC2_API=http://127.0.0.1:7443
 export MC2_API_KEY='mc2at_…'
-./target/debug/mc2 apply -f examples/stacks/demo.yaml
+./target/debug/mc2 apply -f examples/90-advanced/demo-reference.yaml
 
 # Agent
 ./target/debug/mc2 agent \
@@ -128,13 +128,13 @@ Default gRPC uses lab TLS under `<data-dir>/tls/`. Use `--grpc-plain` only for l
 
 ```bash
 # Terminal: collector (example)
-# otelcol --config examples/otel/collector-config.yaml
+# otelcol --config examples/90-advanced/observability/collector-config.yaml
 
 export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 # restart server + agent so they pick up the endpoint
 ```
 
-MC2 exports **control-plane / agent** metrics (`mc2.server.*`, `mc2.agent.*`). Sandbox CPU/mem/net remain on **msb-metrics** — configure that sidecar to the same collector for a unified view. See [examples/otel/collector-config.yaml](../../examples/otel/collector-config.yaml).
+MC2 exports **control-plane / agent** metrics (`mc2.server.*`, `mc2.agent.*`). Sandbox CPU/mem/net remain on **msb-metrics** — configure that sidecar to the same collector for a unified view. See [the advanced observability example](../../examples/90-advanced/observability/).
 
 ## Platform notes
 

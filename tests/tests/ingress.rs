@@ -1,13 +1,13 @@
 //! Integration / smoke: Ingress catalog plan (routes ↔ host ports) + lifecycle.
 //!
-//! CI does not boot microVMs or Traefik/Caddy. These tests exercise the same
+//! CI does not boot microVMs or Traefik. These tests exercise the same
 //! control-plane path: apply stack → Sync `ingress_routes` → REST `/v1/ingress`,
 //! plus re-apply / report-status lifecycle. File ready-gate + TCP probe coverage
 //! lives in `mc2-agent` unit tests (`ingress_files`).
 
 use mc2_api::agent::agent_service_client::AgentServiceClient;
 use mc2_api::agent::{Capacity, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest};
-use mc2_runtime::{render_caddyfile, render_traefik_dynamic, DesiredIngressRoute};
+use mc2_runtime::{render_traefik_dynamic, DesiredIngressRoute};
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 use std::collections::HashMap;
@@ -38,7 +38,6 @@ ingress:
   tls:
     enabled: true
     certResolver: le
-    caddyTls: internal
   rules:
     - host: smoke-ingress.local
       paths:
@@ -65,7 +64,6 @@ services:
 ingress:
   tls:
     enabled: false
-    caddyTls: off
   rules:
     - host: smoke-ingress.local
       paths:
@@ -172,7 +170,12 @@ async fn apply_sync_catalog_routes_map_to_host_ports() {
         .send()
         .await
         .unwrap();
-    assert_eq!(apply.status(), StatusCode::OK, "{}", apply.text().await.unwrap());
+    assert_eq!(
+        apply.status(),
+        StatusCode::OK,
+        "{}",
+        apply.text().await.unwrap()
+    );
     let body: serde_json::Value = apply.json().await.unwrap();
     assert_eq!(body["stack"], "smoke-ingress");
     assert_eq!(body["scheduled"], 1);
@@ -202,7 +205,6 @@ async fn apply_sync_catalog_routes_map_to_host_ports() {
     assert_eq!(r.bind, "127.0.0.1");
     assert!(r.tls_enabled);
     assert_eq!(r.cert_resolver, "le");
-    assert_eq!(r.caddy_tls, "internal");
     assert_eq!(r.backend_instance_id, sync.instances[0].instance_id);
     assert!(!r.id.is_empty());
 
@@ -219,26 +221,18 @@ async fn apply_sync_catalog_routes_map_to_host_ports() {
         bind: r.bind.clone(),
         tls_enabled: r.tls_enabled,
         cert_resolver: r.cert_resolver.clone(),
-        caddy_tls: r.caddy_tls.clone(),
+        tcp: r.tcp,
+        entry_point: r.entry_point.clone(),
         backend_instance_id: r.backend_instance_id.clone(),
         backend_ordinal: r.backend_ordinal,
     }
     .to_ready("127.0.0.1");
     let traefik = render_traefik_dynamic(&[ready.clone()]);
-    let caddy = render_caddyfile(&[ready]);
     assert!(
         traefik.contains("http://127.0.0.1:18080"),
         "traefik must target host port: {traefik}"
     );
-    assert!(
-        traefik.contains("Host(`smoke-ingress.local`)"),
-        "{traefik}"
-    );
-    assert!(
-        caddy.contains("reverse_proxy 127.0.0.1:18080"),
-        "{caddy}"
-    );
-    assert!(caddy.contains("smoke-ingress.local"), "{caddy}");
+    assert!(traefik.contains("Host(`smoke-ingress.local`)"), "{traefik}");
 
     let (st, ingress) = cluster
         .get_json("/v1/ingress", Some(&cluster.api_token))
@@ -402,7 +396,6 @@ async fn ingress_lifecycle_update_remove_and_multi_path() {
     assert_eq!(sync2.ingress_routes[0].path, "/v2");
     assert_eq!(sync2.ingress_routes[0].host_port, 19090);
     assert!(!sync2.ingress_routes[0].tls_enabled);
-    assert_eq!(sync2.ingress_routes[0].caddy_tls, "off");
 
     let (st, ingress) = cluster
         .get_json("/v1/ingress", Some(&cluster.api_token))
@@ -471,7 +464,10 @@ async fn ingress_lifecycle_update_remove_and_multi_path() {
     assert!(ports.contains(&18080), "{ports:?}");
     assert!(ports.contains(&18081), "{ports:?}");
     let guests: Vec<u32> = sync4.ingress_routes.iter().map(|r| r.guest_port).collect();
-    assert!(guests.contains(&8000) && guests.contains(&8001), "{guests:?}");
+    assert!(
+        guests.contains(&8000) && guests.contains(&8001),
+        "{guests:?}"
+    );
 
     // 5) Report Stopped — plan still lists backend, but agent file gate (unit tests)
     //    would drop ready; CP still returns desired routes.

@@ -225,10 +225,8 @@ async fn list_ingress(
             Json(json!({ "error": e.to_string() })),
         )
     })?;
-    let stacks_yaml: Vec<(String, String)> = stacks
-        .into_iter()
-        .map(|s| (s.name, s.raw_yaml))
-        .collect();
+    let stacks_yaml: Vec<(String, String)> =
+        stacks.into_iter().map(|s| (s.name, s.raw_yaml)).collect();
 
     // Union of routes for every node that has instances (dedupe by route id).
     let mut by_id: std::collections::BTreeMap<String, serde_json::Value> =
@@ -255,7 +253,6 @@ async fn list_ingress(
                     "bind": r.bind,
                     "tlsEnabled": r.tls_enabled,
                     "certResolver": r.cert_resolver,
-                    "caddyTls": r.caddy_tls,
                     "backendInstanceId": r.backend_instance_id,
                     "backendOrdinal": r.backend_ordinal,
                     "nodeId": node_id,
@@ -665,10 +662,7 @@ services:
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            v["error"].as_str().unwrap_or("").contains("expose"),
-            "{v}"
-        );
+        assert!(v["error"].as_str().unwrap_or("").contains("expose"), "{v}");
     }
 
     #[tokio::test]

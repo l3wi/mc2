@@ -1,8 +1,8 @@
 # Same-node Ingress smoke: publish ports: + stack ingress: → agent file catalog.
 # Agent: mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
-# Proxy: see examples/ingress/README.md
+# Proxy: see examples/04-http-ingress/README.md
 #
-# Apply: mc2 apply -f examples/stacks/smoke-ingress.yaml
+# Apply: mc2 apply -f examples/04-http-ingress/stack.yaml
 apiVersion: mc2/v1
 kind: Stack
 metadata:
@@ -34,8 +34,6 @@ ingress:
     enabled: true
     # Traefik static config must define this resolver (or set enabled: false for :80 only)
     certResolver: le
-    # Caddy: internal CA for lab (no public DNS)
-    caddyTls: internal
   rules:
     - host: smoke-ingress.local
       paths:

@@ -162,7 +162,7 @@ message FabricEdgeStatus {
   string message = 4;
 }
 
-// One HTTP route for BYO Traefik/Caddy file export (same-node, loopback backend).
+// One HTTP or TCP route for BYO Traefik file export (same-node, loopback backend).
 message IngressRouteDesired {
   string id = 1;                 // stable route id
   string stack = 2;
@@ -175,7 +175,8 @@ message IngressRouteDesired {
   string bind = 9;               // 127.0.0.1
   bool tls_enabled = 10;
   string cert_resolver = 11;
-  string caddy_tls = 12;         // auto | internal | off
-  string backend_instance_id = 13;
-  uint32 backend_ordinal = 14;
+  bool tcp = 12;                  // TCP route; backend is a raw address:port
+  string entry_point = 13;       // Traefik entrypoint for TCP routes
+  string backend_instance_id = 14;
+  uint32 backend_ordinal = 15;
 }

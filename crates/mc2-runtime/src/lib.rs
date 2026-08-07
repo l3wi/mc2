@@ -21,7 +21,7 @@ pub mod ingress {
     pub use crate::ingress_render::*;
 }
 pub use ingress_render::{
-    make_route_id, normalize_path, render_caddyfile, render_catalog_json, render_traefik_dynamic,
+    make_route_id, normalize_path, render_catalog_json, render_traefik_dynamic,
     DesiredIngressRoute, ReadyIngressRoute,
 };
 pub use spec::{desired_from_sync, DesiredSandbox, DesiredSsh, InjectedSecret, SandboxPhase};

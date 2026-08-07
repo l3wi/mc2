@@ -1,0 +1,26 @@
+# Minimal first-success example: a deterministic HTTP response.
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: hello
+  labels:
+    env: lab
+    purpose: smoke
+
+services:
+  web:
+    image: python:3.12-alpine
+    replicas: 1
+    resources:
+      cpus: 1
+      memoryMiB: 128
+    network:
+      profiles: [public]
+    restartPolicy: on-failure
+    ports:
+      - host: 18080
+        guest: 8000
+        protocol: tcp
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && printf 'MC2_OK\\n' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
+    labels:
+      app: hello

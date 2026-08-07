@@ -1,0 +1,21 @@
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: ssh-ingress
+services:
+  web:
+    image: alpine:3.20
+    resources:
+      cpus: 1
+      memoryMiB: 128
+    command: ["sleep", "infinity"]
+    ssh:
+      enabled: true
+      bind: 127.0.0.1
+      port: 2222
+      authorizedKeys: [developer]
+ingress:
+  tcp:
+    - name: web-ssh
+      entryPoint: ssh
+      service: web

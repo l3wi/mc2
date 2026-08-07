@@ -1,5 +1,5 @@
 # Example stack for MicroCommandControl (small alpine image for quick pulls).
-# Apply: mc2 apply -f examples/stacks/demo.yaml --token <api-token>
+# Apply: mc2 apply -f examples/advanced/demo-reference.yaml --token <api-token>
 #
 # alpine's busybox httpd serves files from / (demo page is the filesystem listing).
 apiVersion: mc2/v1
@@ -42,11 +42,10 @@ services:
       app: web
 
 # volumes: {}
-# Optional north–south HTTP via BYO Traefik/Caddy (agent --ingress-config-dir):
+# Optional north–south HTTP via BYO Traefik (agent --ingress-config-dir):
 # ingress:
 #   tls:
 #     enabled: true
-#     caddyTls: internal
 #   rules:
 #     - host: demo.local
 #       paths:

@@ -28,17 +28,17 @@ DATA=/tmp/mc2-dev
 export MC2_API=http://127.0.0.1:7443
 # export MC2_API_KEY="<api-token>"   # when auth is enabled
 ./target/debug/mc2 node ls
-./target/debug/mc2 apply -f examples/stacks/smoke.yaml
+./target/debug/mc2 apply -f examples/01-hello-service/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/status"
-# after demo is Running: curl -s http://127.0.0.1:8080/
+# after hello is Running: curl -s http://127.0.0.1:18080/
 ```
 
 Optional OTLP (server + agent):
 
 ```bash
 export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
-# collector example: examples/otel/collector-config.yaml
+# advanced collector example: examples/90-advanced/observability/collector-config.yaml
 ```
 
 ```bash
@@ -62,9 +62,11 @@ just test-integration
 | `mc2 doctor` | Host / msb readiness checks |
 | `mc2 ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (agent serves via microsandbox SDK) |
 
-**Service fabric (same-node):** stack YAML `expose` + client `allow` → agent L4 splice + guest DNS (`db.<stack>.svc.mc2`). Default deny east–west; multi-node deferred. See [examples/stacks/smoke-fabric.yaml](examples/stacks/smoke-fabric.yaml).
+**Service fabric (same-node):** stack YAML `expose` + client `allow` → agent L4 splice + guest DNS (`db.<stack>.svc.mc2`). Default deny east–west; multi-node deferred. See [examples/03-service-fabric/](examples/03-service-fabric/).
 
-**Ingress (same-node):** stack `ingress:` + `ports:` → agent writes Traefik/Caddy file catalog (`--ingress-config-dir`). BYO proxy for TLS/L7. See [examples/ingress/](examples/ingress/) and [examples/stacks/smoke-ingress.yaml](examples/stacks/smoke-ingress.yaml).
+**Ingress (same-node):** stack `ingress:` + `ports:` → agent writes a Traefik file-provider catalog (`--ingress-config-dir`). See [examples/04-http-ingress/](examples/04-http-ingress/).
+
+**Examples:** start with [examples/01-hello-service/](examples/01-hello-service/); incomplete workflows are marked under [examples/90-advanced/](examples/90-advanced/).
 
 One dual-mode binary for operators and nodes.
 

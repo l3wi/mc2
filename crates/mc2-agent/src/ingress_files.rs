@@ -1,11 +1,8 @@
-//! Write Ingress catalog files for BYO Traefik/Caddy (D7).
+//! Write Traefik Ingress catalog files (D7).
 
 use anyhow::{Context, Result};
 use mc2_api::agent::IngressRouteDesired;
-use mc2_runtime::{
-    render_caddyfile, render_catalog_json, render_traefik_dynamic, DesiredIngressRoute,
-    SandboxPhase,
-};
+use mc2_runtime::{render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, SandboxPhase};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -58,7 +55,8 @@ impl IngressFileWriter {
                 },
                 tls_enabled: r.tls_enabled,
                 cert_resolver: r.cert_resolver.clone(),
-                caddy_tls: r.caddy_tls.clone(),
+                tcp: r.tcp,
+                entry_point: r.entry_point.clone(),
                 backend_instance_id: r.backend_instance_id.clone(),
                 backend_ordinal: r.backend_ordinal,
             };
@@ -89,14 +87,10 @@ impl IngressFileWriter {
         pending.sort_by(|a, b| a.id.cmp(&b.id));
 
         let traefik = render_traefik_dynamic(&ready);
-        let caddy = render_caddyfile(&ready);
         let generated_at = iso_now();
         let catalog = render_catalog_json(&self.node_name, &generated_at, &ready, &pending);
 
-        let fingerprint = format!(
-            "{:x}",
-            simple_hash(&format!("{traefik}\n---\n{caddy}\n---\n{catalog}"))
-        );
+        let fingerprint = format!("{:x}", simple_hash(&format!("{traefik}\n---\n{catalog}")));
 
         if self.last_fingerprint.as_ref() == Some(&fingerprint) {
             return Ok(IngressRenderStatus {
@@ -108,15 +102,12 @@ impl IngressFileWriter {
 
         std::fs::create_dir_all(self.dir.join("traefik"))
             .with_context(|| format!("mkdir {}", self.dir.join("traefik").display()))?;
-        std::fs::create_dir_all(self.dir.join("caddy"))
-            .with_context(|| format!("mkdir {}", self.dir.join("caddy").display()))?;
 
         atomic_write(&self.dir.join("catalog.json"), catalog.as_bytes())?;
         atomic_write(
             &self.dir.join("traefik").join("dynamic.yml"),
             traefik.as_bytes(),
         )?;
-        atomic_write(&self.dir.join("caddy").join("Caddyfile"), caddy.as_bytes())?;
 
         self.last_fingerprint = Some(fingerprint);
         info!(
@@ -132,7 +123,6 @@ impl IngressFileWriter {
             wrote: true,
         })
     }
-
 }
 
 #[derive(Debug, Default)]
@@ -144,8 +134,7 @@ pub struct IngressRenderStatus {
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("mkdir {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     let tmp = parent.join(format!(
         ".{}.tmp",
         path.file_name()
@@ -221,7 +210,8 @@ mod tests {
             bind: "127.0.0.1".into(),
             tls_enabled: false,
             cert_resolver: String::new(),
-            caddy_tls: "off".into(),
+            tcp: false,
+            entry_point: String::new(),
             backend_instance_id: instance_id.into(),
             backend_ordinal: 0,
         }
@@ -251,7 +241,6 @@ mod tests {
         assert!(st.wrote);
 
         let traefik = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
-        let caddy = std::fs::read_to_string(dir.path().join("caddy/Caddyfile")).unwrap();
         let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
 
         assert!(
@@ -259,10 +248,6 @@ mod tests {
             "{traefik}"
         );
         assert!(traefik.contains("Host(`app.local`)"), "{traefik}");
-        assert!(
-            caddy.contains(&format!("reverse_proxy 127.0.0.1:{port}")),
-            "{caddy}"
-        );
         assert!(catalog.contains("\"ready\": true"), "{catalog}");
         assert!(catalog.contains("app.local"), "{catalog}");
         assert!(catalog.contains(&port.to_string()), "{catalog}");
@@ -355,14 +340,11 @@ mod tests {
             .reconcile(&[route(port, "demo-web-0")], &phases)
             .await
             .unwrap();
-        assert!(dir.path().join("caddy/Caddyfile").exists());
 
         // Empty Sync routes (stack ingress deleted).
         let st = writer.reconcile(&[], &phases).await.unwrap();
         assert_eq!(st.ready, 0);
         assert!(st.wrote);
-        let caddy = std::fs::read_to_string(dir.path().join("caddy/Caddyfile")).unwrap();
-        assert!(!caddy.contains("reverse_proxy"), "{caddy}");
         let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&catalog).unwrap();
         assert_eq!(v["routes"].as_array().unwrap().len(), 0);

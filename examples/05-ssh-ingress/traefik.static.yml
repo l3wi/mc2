@@ -1,0 +1,10 @@
+# Traefik static configuration for the SSH TCP ingress example.
+
+entryPoints:
+  ssh:
+    address: ":2200"
+
+providers:
+  file:
+    directory: /tmp/mc2-ssh-ingress/traefik
+    watch: true

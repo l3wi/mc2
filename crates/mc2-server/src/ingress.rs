@@ -54,13 +54,6 @@ fn routes_from_ingress(
 ) -> Vec<IngressRouteDesired> {
     let tls_enabled = ing.tls.enabled;
     let cert_resolver = ing.tls.cert_resolver.clone().unwrap_or_default();
-    let caddy_tls = ing.tls.caddy_tls.clone().unwrap_or_else(|| {
-        if tls_enabled {
-            "auto".into()
-        } else {
-            "off".into()
-        }
-    });
 
     let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
     for i in instances {
@@ -118,11 +111,51 @@ fn routes_from_ingress(
                 bind: ps.bind.clone(),
                 tls_enabled,
                 cert_resolver: cert_resolver.clone(),
-                caddy_tls: caddy_tls.clone(),
+                tcp: false,
+                entry_point: String::new(),
                 backend_instance_id,
                 backend_ordinal,
             });
         }
+    }
+    for tcp in &ing.tcp {
+        let Some(svc) = services.get(&tcp.service) else {
+            continue;
+        };
+        let Some(ssh) = svc.ssh.as_ref().filter(|ssh| ssh.enabled && ssh.port > 0) else {
+            continue;
+        };
+        let backend = by_service.get(&tcp.service).and_then(|list| {
+            list.iter()
+                .copied()
+                .find(|i| i.phase == "Running")
+                .or_else(|| {
+                    list.iter().copied().find(|i| {
+                        i.phase != "Failed" && i.phase != "Stopped" && i.phase != "Pending"
+                    })
+                })
+                .or_else(|| list.first().copied())
+        });
+        let (backend_instance_id, backend_ordinal) = backend
+            .map(|b| (b.id.clone(), b.ordinal))
+            .unwrap_or_default();
+        routes.push(IngressRouteDesired {
+            id: format!("{stack}-tcp-{}-{}", tcp.name, tcp.service),
+            stack: stack.into(),
+            host: String::new(),
+            path: String::new(),
+            path_type: String::new(),
+            service: tcp.service.clone(),
+            guest_port: 0,
+            host_port: u32::from(ssh.port),
+            bind: ssh.bind.clone(),
+            tls_enabled: false,
+            cert_resolver: String::new(),
+            tcp: true,
+            entry_point: tcp.entry_point.clone(),
+            backend_instance_id,
+            backend_ordinal,
+        });
     }
     routes
 }
@@ -168,7 +201,6 @@ mod tests {
             tls: IngressTlsSpec {
                 enabled: true,
                 cert_resolver: Some("le".into()),
-                caddy_tls: Some("internal".into()),
             },
             rules: vec![IngressRule {
                 host: "demo.local".into(),
@@ -179,6 +211,7 @@ mod tests {
                     port: 8000,
                 }],
             }],
+            tcp: vec![],
         };
 
         let instances = vec![
@@ -232,7 +265,6 @@ services:
 ingress:
   tls:
     enabled: false
-    caddyTls: off
   rules:
     - host: {host}
       paths:
@@ -258,8 +290,7 @@ ingress:
             spec_json: "{}".into(),
             updated_at: String::new(),
         }];
-        let routes =
-            build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
+        let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
         assert!(routes.is_empty(), "no instances on n1");
     }
 
@@ -278,8 +309,7 @@ ingress:
             spec_json: "{}".into(),
             updated_at: String::new(),
         }];
-        let routes =
-            build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
+        let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].guest_port, 8000);
         assert_eq!(routes[0].host_port, 18080);

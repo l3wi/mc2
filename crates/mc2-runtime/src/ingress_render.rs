@@ -1,9 +1,8 @@
-//! Pure Ingress catalog → Traefik dynamic YAML + Caddyfile (D7).
+//! Pure Ingress catalog → Traefik dynamic YAML (D7).
 //!
 //! No I/O except callers writing the strings. Unit-tested without a hypervisor.
 
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// One route ready for proxy config (backend already selected + probed).
@@ -23,7 +22,8 @@ pub struct ReadyIngressRoute {
     pub ordinal: u32,
     pub tls_enabled: bool,
     pub cert_resolver: String,
-    pub caddy_tls: String,
+    pub tcp: bool,
+    pub entry_point: String,
 }
 
 /// Debug catalog written next to proxy files.
@@ -64,7 +64,6 @@ pub struct CatalogBackend {
 pub struct CatalogTls {
     pub enabled: bool,
     pub cert_resolver: String,
-    pub caddy_tls: String,
 }
 
 /// Normalize path for proxy rules (`""` → `/`).
@@ -91,8 +90,13 @@ pub fn render_traefik_dynamic(routes: &[ReadyIngressRoute]) -> String {
         return "# Managed by MC2 — no ready Ingress routes\nhttp: {}\n".into();
     }
 
-    let mut out = String::from("# Managed by MC2 — do not edit; agent overwrites.\nhttp:\n  routers:\n");
-    for r in routes {
+    let http_routes: Vec<_> = routes.iter().filter(|r| !r.tcp).collect();
+    let tcp_routes: Vec<_> = routes.iter().filter(|r| r.tcp).collect();
+    let mut out = String::from("# Managed by MC2 — do not edit; agent overwrites.\n");
+    if !http_routes.is_empty() {
+        out.push_str("http:\n  routers:\n");
+    }
+    for r in &http_routes {
         let key = route_key(&r.id);
         let path = normalize_path(&r.path);
         let rule = traefik_rule(&r.host, &path, &r.path_type);
@@ -112,14 +116,34 @@ pub fn render_traefik_dynamic(routes: &[ReadyIngressRoute]) -> String {
             let _ = writeln!(out, "      service: {key}");
         }
     }
-    out.push_str("  services:\n");
-    for r in routes {
+    if http_routes.is_empty() && tcp_routes.is_empty() {
+        out.push_str("http: {}\n");
+    } else if !http_routes.is_empty() {
+        out.push_str("  services:\n");
+    }
+    for r in routes.iter().filter(|r| !r.tcp) {
         let key = route_key(&r.id);
         let url = format!("http://{}:{}", r.backend_host, r.backend_port);
         let _ = writeln!(out, "    {key}:");
         let _ = writeln!(out, "      loadBalancer:");
         let _ = writeln!(out, "        servers:");
         let _ = writeln!(out, "          - url: \"{url}\"");
+    }
+    if !tcp_routes.is_empty() {
+        out.push_str("tcp:\n  routers:\n");
+        for r in &tcp_routes {
+            let key = route_key(&r.id);
+            let _ = writeln!(out, "    {key}:\n      entryPoints:\n        - {}\n      rule: HostSNI(`*`)\n      service: {key}", r.entry_point);
+        }
+        out.push_str("  services:\n");
+        for r in tcp_routes {
+            let key = route_key(&r.id);
+            let _ = writeln!(
+                out,
+                "    {key}:\n      loadBalancer:\n        servers:\n          - address: {}:{}",
+                r.backend_host, r.backend_port
+            );
+        }
     }
     out
 }
@@ -136,89 +160,6 @@ fn traefik_rule(host: &str, path: &str, path_type: &str) -> String {
         format!("Host(`{host_esc}`) && PathPrefix(`{path_esc}`)")
     }
 }
-
-/// Build a Caddyfile for ready routes (grouped by host).
-pub fn render_caddyfile(routes: &[ReadyIngressRoute]) -> String {
-    if routes.is_empty() {
-        return "# Managed by MC2 — no ready Ingress routes\n".into();
-    }
-
-    let mut by_host: BTreeMap<String, Vec<&ReadyIngressRoute>> = BTreeMap::new();
-    for r in routes {
-        by_host.entry(r.host.clone()).or_default().push(r);
-    }
-
-    let mut out = String::from("# Managed by MC2 — do not edit; agent overwrites.\n");
-    for (host, mut list) in by_host {
-        // Longer paths first so more specific handle blocks win.
-        list.sort_by(|a, b| {
-            normalize_path(&b.path)
-                .len()
-                .cmp(&normalize_path(&a.path).len())
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        let tls_line = caddy_tls_line(list.first().copied());
-        let _ = writeln!(out, "{host} {{");
-        if let Some(line) = tls_line {
-            let _ = writeln!(out, "\t{line}");
-        }
-
-        let multi = list.len() > 1
-            || list
-                .iter()
-                .any(|r| normalize_path(&r.path) != "/" || r.path_type.eq_ignore_ascii_case("exact"));
-
-        if !multi {
-            let r = list[0];
-            let _ = writeln!(
-                out,
-                "\treverse_proxy {}:{}",
-                r.backend_host, r.backend_port
-            );
-        } else {
-            for r in &list {
-                let path = normalize_path(&r.path);
-                if r.path_type.eq_ignore_ascii_case("exact") {
-                    let _ = writeln!(out, "\thandle {path} {{");
-                } else if path == "/" {
-                    let _ = writeln!(out, "\thandle {{");
-                } else {
-                    // Prefix match
-                    let prefix = if path.ends_with('/') {
-                        path.clone()
-                    } else {
-                        format!("{path}*")
-                    };
-                    let _ = writeln!(out, "\thandle {prefix} {{");
-                }
-                let _ = writeln!(
-                    out,
-                    "\t\treverse_proxy {}:{}",
-                    r.backend_host, r.backend_port
-                );
-                let _ = writeln!(out, "\t}}");
-            }
-        }
-        out.push_str("}\n\n");
-    }
-    out
-}
-
-fn caddy_tls_line(r: Option<&ReadyIngressRoute>) -> Option<String> {
-    let r = r?;
-    if !r.tls_enabled {
-        return Some("tls off".into());
-    }
-    let mode = r.caddy_tls.trim().to_ascii_lowercase();
-    match mode.as_str() {
-        "" | "auto" => None, // Caddy auto HTTPS
-        "internal" => Some("tls internal".into()),
-        "off" => Some("tls off".into()),
-        other => Some(format!("tls {other}")),
-    }
-}
-
 /// Build `catalog.json` body (pretty JSON).
 pub fn render_catalog_json(
     node_name: &str,
@@ -261,7 +202,6 @@ fn catalog_route(r: &ReadyIngressRoute, ready: bool) -> CatalogRoute {
         tls: CatalogTls {
             enabled: r.tls_enabled,
             cert_resolver: r.cert_resolver.clone(),
-            caddy_tls: r.caddy_tls.clone(),
         },
     }
 }
@@ -280,7 +220,8 @@ pub struct DesiredIngressRoute {
     pub bind: String,
     pub tls_enabled: bool,
     pub cert_resolver: String,
-    pub caddy_tls: String,
+    pub tcp: bool,
+    pub entry_point: String,
     pub backend_instance_id: String,
     pub backend_ordinal: u32,
 }
@@ -301,13 +242,20 @@ impl DesiredIngressRoute {
             ordinal: self.backend_ordinal,
             tls_enabled: self.tls_enabled,
             cert_resolver: self.cert_resolver.clone(),
-            caddy_tls: self.caddy_tls.clone(),
+            tcp: self.tcp,
+            entry_point: self.entry_point.clone(),
         }
     }
 }
 
 /// Stable id for a route (stack + host + path + service + guest port).
-pub fn make_route_id(stack: &str, host: &str, path: &str, service: &str, guest_port: u16) -> String {
+pub fn make_route_id(
+    stack: &str,
+    host: &str,
+    path: &str,
+    service: &str,
+    guest_port: u16,
+) -> String {
     mc2_api::make_ingress_route_id(stack, host, path, service, guest_port)
 }
 
@@ -330,7 +278,8 @@ mod tests {
             ordinal: 0,
             tls_enabled: true,
             cert_resolver: "le".into(),
-            caddy_tls: "internal".into(),
+            tcp: false,
+            entry_point: String::new(),
         }
     }
 
@@ -350,26 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn caddy_renders_site() {
-        let c = render_caddyfile(&[sample_route()]);
-        assert!(c.contains("demo.local {"), "{c}");
-        assert!(c.contains("tls internal"), "{c}");
-        assert!(c.contains("reverse_proxy 127.0.0.1:8080"), "{c}");
-    }
-
-    #[test]
-    fn caddy_path_prefix() {
-        let mut api = sample_route();
-        api.id = "demo-demo.local-/api-web-8000".into();
-        api.path = "/api".into();
-        api.backend_port = 8081;
-        let root = sample_route();
-        let c = render_caddyfile(&[api, root]);
-        assert!(c.contains("handle /api*"), "{c}");
-        assert!(c.contains("handle {"), "{c}");
-    }
-
-    #[test]
     fn catalog_json_ready_flag() {
         let ready = vec![sample_route()];
         let mut pending = sample_route();
@@ -386,9 +315,7 @@ mod tests {
         // Ready gate: only ready routes appear as upstreams.
         let pending = sample_route();
         let y = render_traefik_dynamic(&[]);
-        let c = render_caddyfile(&[]);
         assert!(y.contains("http: {}"), "{y}");
-        assert!(!c.contains("reverse_proxy"), "{c}");
         let j = render_catalog_json("n", "t", &[], &[pending]);
         assert!(j.contains("\"ready\": false"));
         assert!(j.contains("8080")); // backend port still recorded as pending
@@ -420,7 +347,8 @@ mod tests {
             bind: "127.0.0.1".into(),
             tls_enabled: false,
             cert_resolver: String::new(),
-            caddy_tls: "off".into(),
+            tcp: false,
+            entry_point: String::new(),
             backend_instance_id: "s-web-0".into(),
             backend_ordinal: 0,
         };
@@ -432,25 +360,6 @@ mod tests {
         assert!(y.contains("entryPoints:"), "{y}");
         assert!(y.contains("- web"), "{y}");
         assert!(!y.contains("websecure"), "{y}");
-        let c = render_caddyfile(&[r]);
-        assert!(c.contains("tls off"), "{c}");
-        assert!(c.contains("reverse_proxy 127.0.0.1:18080"), "{c}");
-    }
-
-    #[test]
-    fn multi_host_routes_separate_caddy_sites() {
-        let mut a = sample_route();
-        a.host = "a.local".into();
-        a.id = "a".into();
-        let mut b = sample_route();
-        b.host = "b.local".into();
-        b.id = "b".into();
-        b.backend_port = 9090;
-        let c = render_caddyfile(&[a, b]);
-        assert!(c.contains("a.local {"), "{c}");
-        assert!(c.contains("b.local {"), "{c}");
-        assert!(c.contains(":8080"), "{c}");
-        assert!(c.contains(":9090"), "{c}");
     }
 
     #[test]

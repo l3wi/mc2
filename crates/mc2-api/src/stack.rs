@@ -16,12 +16,12 @@ pub struct StackDocument {
     /// Logical network membership only (not a free mesh). See D13.
     #[serde(default)]
     pub networks: BTreeMap<String, StackNetworkSpec>,
-    /// North–south HTTP(S) routes (file catalog → Traefik/Caddy). D7.
+    /// North–south HTTP(S) routes (file catalog → Traefik). D7.
     #[serde(default)]
     pub ingress: Option<IngressSpec>,
 }
 
-/// Stack-level Ingress (BYO Traefik/Caddy via agent file export).
+/// Stack-level Ingress (BYO Traefik via agent file export).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IngressSpec {
@@ -29,6 +29,17 @@ pub struct IngressSpec {
     pub tls: IngressTlsSpec,
     #[serde(default)]
     pub rules: Vec<IngressRule>,
+    /// Traefik TCP routes, currently intended for host-side SSH endpoints.
+    #[serde(default)]
+    pub tcp: Vec<IngressTcpRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngressTcpRoute {
+    pub name: String,
+    pub entry_point: String,
+    pub service: String,
 }
 
 /// TLS intent only — certs/ACME live in the proxy.
@@ -40,9 +51,6 @@ pub struct IngressTlsSpec {
     /// Traefik certificate resolver name (static config).
     #[serde(default)]
     pub cert_resolver: Option<String>,
-    /// Caddy TLS mode: `auto` | `internal` | `off`.
-    #[serde(default)]
-    pub caddy_tls: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,10 +380,7 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
                 ));
             }
             if !expose_ports.insert(ex.port) {
-                return Err(format!(
-                    "service {name}: duplicate expose.port {}",
-                    ex.port
-                ));
+                return Err(format!("service {name}: duplicate expose.port {}", ex.port));
             }
         }
         for a in &svc.allow {
@@ -416,16 +421,35 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
 }
 
 fn validate_ingress(doc: &StackDocument, ing: &IngressSpec) -> Result<(), String> {
-    if let Some(ref mode) = ing.tls.caddy_tls {
-        let m = mode.trim().to_ascii_lowercase();
-        if !matches!(m.as_str(), "auto" | "internal" | "off") {
-            return Err(format!(
-                "ingress.tls.caddyTls must be auto|internal|off (got {mode:?})"
-            ));
+    if ing.rules.is_empty() {
+        if ing.tcp.is_empty() {
+            return Err(
+                "ingress.rules or ingress.tcp must not be empty when ingress is set".into(),
+            );
         }
     }
-    if ing.rules.is_empty() {
-        return Err("ingress.rules must not be empty when ingress is set".into());
+    for (ti, route) in ing.tcp.iter().enumerate() {
+        if route.name.trim().is_empty() || route.entry_point.trim().is_empty() {
+            return Err(format!("ingress.tcp[{ti}] requires name and entryPoint"));
+        }
+        let Some(service) = doc.services.get(&route.service) else {
+            return Err(format!(
+                "ingress.tcp[{ti}]: service {:?} is not in this stack",
+                route.service
+            ));
+        };
+        let Some(ssh) = service.ssh.as_ref().filter(|ssh| ssh.enabled) else {
+            return Err(format!(
+                "ingress.tcp[{ti}]: service {:?} must have SSH enabled",
+                route.service
+            ));
+        };
+        if ssh.port == 0 {
+            return Err(format!(
+                "ingress.tcp[{ti}]: service {:?} SSH port must be fixed (not 0)",
+                route.service
+            ));
+        }
     }
     for (ri, rule) in ing.rules.iter().enumerate() {
         if rule.host.trim().is_empty() {
@@ -562,7 +586,6 @@ ingress:
   tls:
     enabled: true
     certResolver: le
-    caddyTls: internal
   rules:
     - host: demo.local
       paths:

@@ -1,6 +1,6 @@
 # Same-node mediated fabric (D13): echo server + client via db.shop.svc.mc2 DNS.
 #
-#   mc2 apply -f examples/stacks/smoke-fabric.yaml
+#   mc2 apply -f examples/service-fabric/stack.yaml
 #
 # After both Running: from the `client` sandbox (or via mc2 exec when available),
 #   wget -qO- http://echo.smoke-fabric.svc.mc2:8080/

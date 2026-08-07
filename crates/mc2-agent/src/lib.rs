@@ -77,7 +77,7 @@ pub struct AgentArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// Directory for Ingress catalog files (Traefik + Caddy). Same-node BYO proxy.
+    /// Directory for Traefik Ingress catalog files. Same-node BYO proxy.
     #[arg(long, env = "MC2_INGRESS_CONFIG_DIR")]
     pub ingress_config_dir: Option<PathBuf>,
 
@@ -515,7 +515,7 @@ async fn reconcile(
     ssh_table.close_missing(&keep_ids).await;
     fabric_table.close_missing(&keep_ids).await;
 
-    // Ingress file catalog (same-node BYO Traefik/Caddy).
+    // Ingress file catalog (same-node BYO Traefik).
     let mut phases: HashMap<String, String> = HashMap::new();
     for r in &reports {
         phases.insert(r.instance_id.clone(), r.phase.clone());

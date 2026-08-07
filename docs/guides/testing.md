@@ -86,18 +86,18 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not 
 | Path | What it proves |
 | ---- | -------------- |
 | `tests/tests/secrets.rs` | `mc2 secret set` → stack apply with refs → agent **Sync** returns `SecretInjection` (env/value/allowHosts) mapped via `desired_from_sync` (same path before SDK create). Missing secret / empty `allowHosts` → Sync `FailedPrecondition`. |
-| Lab | `mc2 secret set SMOKE_TOKEN --value …` then `mc2 apply -f examples/stacks/smoke-secrets.yaml` on a node with hypervisor; guest env shows msb placeholder, value injects only to allowlisted hosts. |
+| Lab | `mc2 secret set SMOKE_TOKEN --value …` then `mc2 apply -f examples/02-secrets/stack.yaml` on a node with hypervisor; guest env shows msb placeholder, value injects only to allowlisted hosts. |
 
 ### Ingress smoke (CI vs lab)
 
 | Path | What it proves |
 | ---- | -------------- |
 | `mc2-api` stack tests | YAML: `ports:` + `ingress:` accept; missing ports / non-loopback bind / empty rules → reject |
-| `mc2-runtime` `ingress_render` | Catalog → Traefik/Caddy strings; guest/host port mapping; pending not in proxy; multi-host; host port change |
+| `mc2-runtime` `ingress_render` | Catalog → Traefik strings; guest/host port mapping; pending not in proxy; multi-host; host port change |
 | `mc2-server` `ingress` | Per-node plan: guest→host port, multi-path, skip other nodes, no ingress → empty |
 | `mc2-agent` `ingress_files` | **Ready gate:** Running + TCP accept → files with upstream; dead port / not Running → empty proxy; lifecycle port change, stop, route removed, fingerprint skip |
 | `tests/tests/ingress.rs` | Apply → Sync `ingress_routes` (host/guest ports + host) → `GET /v1/ingress`; 400 validation; lifecycle update path/port, remove ingress, multi-path; no routes until scheduled |
-| Lab | `mc2 apply -f examples/stacks/smoke-ingress.yaml` with `--ingress-config-dir`; optional Traefik/Caddy — [examples/ingress/README.md](../../examples/ingress/README.md) |
+| Lab | `mc2 apply -f examples/04-http-ingress/stack.yaml` with `--ingress-config-dir`; Traefik — [examples/04-http-ingress/README.md](../../examples/04-http-ingress/README.md) |
 
 ```bash
 cargo test -p mc2-tests --test ingress
