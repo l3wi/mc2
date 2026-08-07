@@ -3,6 +3,7 @@
 //! Always uses the **local** backend. Host `MSB_API_KEY` / cloud profiles must not
 //! hijack MCC agent sandboxes.
 
+use crate::fabric::fabric_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
 use crate::{DesiredSandbox, NodeRuntime, SandboxPhase, SandboxStatus};
@@ -10,6 +11,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
 use microsandbox::{set_default_backend, LocalBackend, NetworkPolicy, NetworkProfile, Sandbox};
+use microsandbox_network::policy::{
+    Action, Destination, DestinationGroup, Direction, PortRange, Protocol, Rule,
+};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +74,35 @@ fn network_profiles(desired: &DesiredSandbox) -> Vec<NetworkProfile> {
     out
 }
 
+/// Build msb network policy: base profiles + **narrow** Host TCP ports for fabric
+/// allows. Does **not** add `NetworkProfile::Host` or `Private` for fabric (D13/Q2).
+fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
+    let profiles = network_profiles(desired);
+    let mut policy = NetworkPolicy::from_profiles(profiles);
+    let fabric_ports = fabric_host_allow_ports(&desired.fabric);
+    // Prepend so first-match-wins before broader profile rules.
+    for port in fabric_ports.into_iter().rev() {
+        policy.rules.insert(
+            0,
+            Rule {
+                direction: Direction::Egress,
+                destination: Destination::Group(DestinationGroup::Host),
+                protocols: vec![Protocol::Tcp],
+                ports: vec![PortRange::single(port)],
+                action: Action::Allow,
+            },
+        );
+    }
+    if !desired.fabric.allows.is_empty() {
+        debug!(
+            runtime_id = %desired.runtime_id,
+            allows = desired.fabric.allows.len(),
+            "fabric: installed narrow Host:tcp:port egress rules (not Host profile)"
+        );
+    }
+    policy
+}
+
 async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
     ensure_local_backend().await?;
 
@@ -112,8 +145,7 @@ async fn create_detached(desired: &DesiredSandbox) -> Result<()> {
     if disable {
         b = b.disable_network();
     } else {
-        let profiles = network_profiles(desired);
-        let policy = NetworkPolicy::from_profiles(profiles);
+        let policy = build_network_policy(desired);
         b = b.network(|n| n.policy(policy));
     }
 
@@ -353,12 +385,80 @@ mod tests {
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
+                expose: vec![],
+                allow: vec![],
+                networks: vec![],
             },
             secrets: vec![],
             ssh: Default::default(),
+            fabric: Default::default(),
         };
         let p = network_profiles(&d);
         assert!(p.contains(&NetworkProfile::Public));
         assert!(p.contains(&NetworkProfile::Host));
+    }
+
+    #[test]
+    fn fabric_adds_narrow_host_port_not_profile() {
+        use crate::fabric::{DesiredFabric, FabricAllowDesired};
+        let mut d = DesiredSandbox {
+            instance_id: "i".into(),
+            stack: "shop".into(),
+            service: "web".into(),
+            ordinal: 0,
+            runtime_id: "shop-web-0".into(),
+            spec: ServiceSpec {
+                image: "alpine".into(),
+                replicas: 1,
+                resources: ResourceSpec {
+                    cpus: 1,
+                    memory_mib: 256,
+                },
+                ports: vec![],
+                network: mcc_api::stack::NetworkSpec {
+                    profiles: vec!["public".into()],
+                },
+                env: BTreeMap::new(),
+                secrets: vec![],
+                volumes: vec![],
+                restart_policy: "on-failure".into(),
+                health: None,
+                labels: BTreeMap::new(),
+                command: None,
+                node_name: None,
+                node_selector: BTreeMap::new(),
+                ssh: None,
+                expose: vec![],
+                allow: vec![],
+                networks: vec![],
+            },
+            secrets: vec![],
+            ssh: Default::default(),
+            fabric: DesiredFabric {
+                exposes: vec![],
+                allows: vec![FabricAllowDesired {
+                    to_service: "db".into(),
+                    port: 5432,
+                    protocol: "tcp".into(),
+                    fqdn: "db.shop.svc.mcc".into(),
+                    short_name: "db".into(),
+                    backend_instance_id: "x".into(),
+                    backend_node_id: "n".into(),
+                    backend_local: true,
+                    backend_ordinal: 0,
+                }],
+            },
+        };
+        let policy = build_network_policy(&d);
+        // Narrow Host:5432 rule present; profile set is still Public-only (no Host profile).
+        let profiles = network_profiles(&d);
+        assert!(!profiles.contains(&NetworkProfile::Host));
+        assert!(!profiles.contains(&NetworkProfile::Private));
+        assert!(policy.rules.iter().any(|r| {
+            r.action == Action::Allow
+                && matches!(r.destination, Destination::Group(DestinationGroup::Host))
+                && r.ports.iter().any(|p| p.start == 5432 && p.end == 5432)
+        }));
+        d.fabric = Default::default();
     }
 }

@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
 # Official microsandbox Rust SDK (libkrun embed). `ssh` = in-process host SSH serve.
 microsandbox = { version = "0.6.8", features = ["ssh"] }
+# Policy Rule / Destination types for narrow fabric Host:port allows (D13).
+microsandbox-network = "0.6.8"
 
 [dev-dependencies]
 tempfile = "3"

@@ -9,12 +9,14 @@ use std::collections::HashMap;
 ///
 /// `service_load`: count of same-service instances per node_id.
 /// `residual`: residual CPU/memory after existing load.
+/// `all_instances`: full inventory for fabric co-location (allow-target affinity).
 pub fn pick_node(
     _instance: &InstanceRecord,
     spec: &ServiceSpec,
     nodes: &[NodeRecord],
     service_load: &HashMap<String, u32>,
     residual: &HashMap<String, (u32, u64)>,
+    all_instances: &[InstanceRecord],
 ) -> Option<String> {
     let ready: Vec<&NodeRecord> = nodes
         .iter()
@@ -46,14 +48,45 @@ pub fn pick_node(
         return None;
     }
 
-    // Spread: fewest instances of this service on the node; tie-break by name.
+    let fabric_affinity = fabric_affinity_scores(spec, all_instances);
+
+    // Spread: fewest same-service instances; then higher fabric affinity; then name.
     candidates.sort_by(|a, b| {
         let la = service_load.get(&a.id).copied().unwrap_or(0);
         let lb = service_load.get(&b.id).copied().unwrap_or(0);
-        la.cmp(&lb).then_with(|| a.name.cmp(&b.name))
+        let fa = fabric_affinity.get(&a.id).copied().unwrap_or(0);
+        let fb = fabric_affinity.get(&b.id).copied().unwrap_or(0);
+        la.cmp(&lb)
+            .then_with(|| fb.cmp(&fa))
+            .then_with(|| a.name.cmp(&b.name))
     });
 
     candidates.first().map(|n| n.id.clone())
+}
+
+/// Count allow-target service instances per node (same-node fabric preference).
+fn fabric_affinity_scores(
+    spec: &ServiceSpec,
+    all_instances: &[InstanceRecord],
+) -> HashMap<String, u32> {
+    let targets: std::collections::BTreeSet<&str> =
+        spec.allow.iter().map(|a| a.to.as_str()).collect();
+    if targets.is_empty() {
+        return HashMap::new();
+    }
+    let mut m = HashMap::new();
+    for inst in all_instances {
+        if !targets.contains(inst.service.as_str()) {
+            continue;
+        }
+        if inst.phase == "Failed" || inst.phase == "Stopped" || inst.phase == "Pending" {
+            continue;
+        }
+        if let Some(ref nid) = inst.node_id {
+            *m.entry(nid.clone()).or_insert(0) += 1;
+        }
+    }
+    m
 }
 
 fn matches_selector(
@@ -196,6 +229,9 @@ mod tests {
             node_name: Some("linux".into()),
             node_selector: BTreeMap::new(),
             ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
         };
         let id = pick_node(
             &pending("web"),
@@ -203,6 +239,7 @@ mod tests {
             &nodes,
             &HashMap::new(),
             &residual_capacity(&nodes, &[]),
+            &[],
         )
         .unwrap();
         assert_eq!(id, "b");
@@ -212,7 +249,8 @@ mod tests {
             &spec,
             &nodes,
             &HashMap::new(),
-            &residual_capacity(&nodes, &[])
+            &residual_capacity(&nodes, &[]),
+            &[],
         )
         .is_none());
     }
@@ -241,6 +279,9 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
         };
         assert!(!may_reschedule_on_node_loss(&sticky));
         sticky.volumes.clear();
@@ -274,6 +315,9 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
         };
         let id = pick_node(
             &pending("web"),
@@ -281,8 +325,63 @@ mod tests {
             &nodes,
             &load,
             &residual_capacity(&nodes, &[]),
+            &[],
         )
         .unwrap();
         assert_eq!(id, "b");
+    }
+
+    #[test]
+    fn fabric_affinity_prefers_node_with_allow_target() {
+        let nodes = vec![node("a", "n1", "{}", 4), node("b", "n2", "{}", 4)];
+        let spec = ServiceSpec {
+            image: "x".into(),
+            replicas: 1,
+            resources: ResourceSpec {
+                cpus: 1,
+                memory_mib: 512,
+            },
+            ports: vec![],
+            network: Default::default(),
+            env: BTreeMap::new(),
+            secrets: vec![],
+            volumes: vec![],
+            restart_policy: "on-failure".into(),
+            health: None,
+            labels: BTreeMap::new(),
+            command: None,
+            node_name: None,
+            node_selector: BTreeMap::new(),
+            ssh: None,
+            expose: vec![],
+            allow: vec![mcc_api::AllowSpec {
+                to: "db".into(),
+                port: 5432,
+                protocol: "tcp".into(),
+            }],
+            networks: vec![],
+        };
+        let peers = vec![InstanceRecord {
+            id: "db0".into(),
+            stack: "demo".into(),
+            service: "db".into(),
+            ordinal: 0,
+            node_id: Some("a".into()),
+            phase: "Running".into(),
+            runtime_id: Some("demo-db-0".into()),
+            message: None,
+            spec_json: "{}".into(),
+            updated_at: String::new(),
+        }];
+        let id = pick_node(
+            &pending("web"),
+            &spec,
+            &nodes,
+            &HashMap::new(),
+            &residual_capacity(&nodes, &peers),
+            &peers,
+        )
+        .unwrap();
+        assert_eq!(id, "a");
     }
 }

@@ -79,6 +79,8 @@ message DesiredInstance {
   repeated SecretInjection secrets = 6;
   // Host-side SSH serve desired state (resolved public keys).
   SshDesired ssh = 7;
+  // Mediated service fabric (same-node east–west). D13.
+  FabricDesired fabric = 8;
 }
 
 // Host-side msb secret injection: guest sees placeholder; value for allowlisted hosts.
@@ -105,11 +107,55 @@ message InstanceStatus {
   string message = 3;
   string runtime_id = 4;
   SshObserved ssh = 5;
+  FabricObserved fabric = 6;
 }
 
 message SshObserved {
   string phase = 1; // Closed | Opening | Open | Failed
   string bind = 2;
   uint32 port = 3;
+  string message = 4;
+}
+
+// Desired fabric plan for one instance (built by control plane).
+message FabricDesired {
+  repeated FabricExpose exposes = 1;
+  repeated FabricAllow allows = 2;
+}
+
+message FabricExpose {
+  uint32 guest_port = 1;
+  string protocol = 2;
+}
+
+message FabricAllow {
+  string to_service = 1;
+  uint32 port = 2;
+  string protocol = 3;
+  string fqdn = 4;       // db.<stack>.svc.mcc
+  string short_name = 5; // db
+  string backend_instance_id = 6;
+  string backend_node_id = 7;
+  bool backend_local = 8;
+  uint32 backend_ordinal = 9;
+}
+
+message FabricObserved {
+  repeated FabricExposeStatus exposes = 1;
+  repeated FabricEdgeStatus edges = 2;
+  string message = 3;
+}
+
+message FabricExposeStatus {
+  uint32 guest_port = 1;
+  uint32 host_port = 2;
+  string phase = 3; // Pending | Ready | Failed
+  string message = 4;
+}
+
+message FabricEdgeStatus {
+  string to_service = 1;
+  uint32 port = 2;
+  string phase = 3; // Pending | Ready | Failed
   string message = 4;
 }

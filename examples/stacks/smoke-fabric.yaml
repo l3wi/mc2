@@ -1,0 +1,55 @@
+# Same-node mediated fabric (D13): echo server + client via db.shop.svc.mcc DNS.
+#
+#   mcc apply -f examples/stacks/smoke-fabric.yaml
+#
+# After both Running: from the `client` sandbox (or via mcc exec when available),
+#   wget -qO- http://echo.smoke-fabric.svc.mcc:8080/
+# should hit the `echo` service through the agent L4 splice.
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: smoke-fabric
+  labels:
+    env: lab
+    purpose: fabric-smoke
+
+networks:
+  backend:
+    mode: mediated
+
+services:
+  echo:
+    image: alpine:3.20
+    replicas: 1
+    resources:
+      cpus: 1
+      memoryMiB: 128
+    network:
+      profiles: [public]
+    expose:
+      - port: 8080
+        protocol: tcp
+    command:
+      - /bin/sh
+      - -c
+      - "while true; do echo -e 'HTTP/1.1 200 OK\\r\\nContent-Length: 9\\r\\n\\r\\nFABRIC_OK' | nc -l -p 8080; done"
+    restartPolicy: on-failure
+    labels:
+      app: smoke-fabric-echo
+
+  client:
+    image: alpine:3.20
+    replicas: 1
+    resources:
+      cpus: 1
+      memoryMiB: 128
+    network:
+      profiles: [public]
+    allow:
+      - to: echo
+        port: 8080
+        protocol: tcp
+    command: ["sleep", "infinity"]
+    restartPolicy: on-failure
+    labels:
+      app: smoke-fabric-client

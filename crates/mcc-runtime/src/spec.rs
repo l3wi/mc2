@@ -4,6 +4,7 @@ use mcc_api::agent::DesiredInstance;
 use mcc_api::ServiceSpec;
 use serde::{Deserialize, Serialize};
 
+use crate::fabric::{fabric_from_proto, DesiredFabric};
 use crate::sandbox_name;
 
 /// Phase reported to the control plane.
@@ -62,6 +63,7 @@ pub struct DesiredSandbox {
     pub spec: ServiceSpec,
     pub secrets: Vec<InjectedSecret>,
     pub ssh: DesiredSsh,
+    pub fabric: DesiredFabric,
 }
 
 /// Map gRPC desired instances into runtime work items.
@@ -101,6 +103,7 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
                 config_hash: s.config_hash.clone(),
             })
             .unwrap_or_default();
+        let fabric = fabric_from_proto(d.fabric.as_ref());
         out.push(DesiredSandbox {
             instance_id: d.instance_id.clone(),
             stack: d.stack.clone(),
@@ -110,6 +113,7 @@ pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<De
             spec,
             secrets,
             ssh,
+            fabric,
         });
     }
     Ok(out)
@@ -149,6 +153,9 @@ mod tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
         };
         assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
     }
@@ -171,6 +178,9 @@ mod tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            expose: vec![],
+            allow: vec![],
+            networks: vec![],
         };
         let inst = DesiredInstance {
             instance_id: "i1".into(),
@@ -184,6 +194,7 @@ mod tests {
                 allow_hosts: vec!["api.example.com".into()],
             }],
             ssh: None,
+            fabric: None,
         };
         let work = desired_from_sync(&[inst]).unwrap();
         assert_eq!(work.len(), 1);

@@ -3,6 +3,7 @@
 mod apply;
 mod auth;
 mod bootstrap;
+mod fabric;
 mod grpc;
 mod http;
 mod reschedule;

@@ -9,8 +9,10 @@ use mcc_api::agent::agent_service_client::AgentServiceClient;
 use mcc_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
+mod fabric_serve;
 mod ssh_serve;
 
+use fabric_serve::FabricTable;
 use mcc_runtime::{
     backoff_secs, default_runtime, desired_from_sync, NodeRuntime, RestartPolicy, SandboxPhase,
 };
@@ -147,6 +149,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let mut owned: HashSet<String> = HashSet::new();
     let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
     let mut ssh_table = SshServeTable::new();
+    let mut fabric_table = FabricTable::new();
 
     if let Err(e) = reconcile(
         &mut client,
@@ -156,6 +159,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         &mut owned,
         &mut rt_state,
         &mut ssh_table,
+        &mut fabric_table,
     )
     .await
     {
@@ -195,6 +199,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
                     &mut owned,
                     &mut rt_state,
                     &mut ssh_table,
+                    &mut fabric_table,
                 )
                 .await
                 {
@@ -212,6 +217,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 }
 
 /// Pull desired set, ensure sandboxes running, remove extras, report phases.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile(
     client: &mut AgentServiceClient<Channel>,
     node_id: &str,
@@ -220,6 +226,7 @@ async fn reconcile(
     owned: &mut HashSet<String>,
     rt_state: &mut HashMap<String, InstanceRuntimeState>,
     ssh_table: &mut SshServeTable,
+    fabric_table: &mut FabricTable,
 ) -> Result<()> {
     let sync = client
         .sync(SyncRequest {
@@ -230,7 +237,7 @@ async fn reconcile(
         .context("Sync RPC")?
         .into_inner();
 
-    let desired = desired_from_sync(&sync.instances)?;
+    let mut desired = desired_from_sync(&sync.instances)?;
     let desired_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
 
     // Scale down / GC
@@ -246,7 +253,15 @@ async fn reconcile(
     let mut reports: Vec<InstanceStatus> = Vec::new();
     let now = Instant::now();
 
-    for d in &desired {
+    // Providers first so expose publish index is populated before client edges.
+    desired.sort_by(|a, b| {
+        let ae = a.fabric.exposes.is_empty();
+        let be = b.fabric.exposes.is_empty();
+        ae.cmp(&be) // false (has expose) sorts before true
+            .then_with(|| a.service.cmp(&b.service))
+    });
+
+    for d in &mut desired {
         let policy = RestartPolicy::parse(&d.spec.restart_policy);
         let state = rt_state.entry(d.runtime_id.clone()).or_default();
 
@@ -254,6 +269,7 @@ async fn reconcile(
         if let Some(next) = state.next_restart_ok {
             if now < next {
                 let ssh = ssh_table.reconcile(d, false).await;
+                let fabric = fabric_table.reconcile_not_running(d).await;
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Creating".into(),
@@ -263,9 +279,25 @@ async fn reconcile(
                     ),
                     runtime_id: d.runtime_id.clone(),
                     ssh: Some(ssh),
+                    fabric: Some(fabric),
                 });
                 continue;
             }
+        }
+
+        if let Err(e) = fabric_table.prepare_exposes(d).await {
+            warn!(instance_id = %d.instance_id, error = %e, "fabric prepare_exposes failed");
+            let ssh = ssh_table.reconcile(d, false).await;
+            let fabric = fabric_table.reconcile_not_running(d).await;
+            reports.push(InstanceStatus {
+                instance_id: d.instance_id.clone(),
+                phase: "Failed".into(),
+                message: e,
+                runtime_id: d.runtime_id.clone(),
+                ssh: Some(ssh),
+                fabric: Some(fabric),
+            });
+            continue;
         }
 
         match runtime.ensure_running(d).await {
@@ -357,6 +389,26 @@ async fn reconcile(
                 };
                 let running = st.phase == SandboxPhase::Running;
                 let ssh = ssh_table.reconcile(d, running).await;
+                let fabric = if running {
+                    fabric_table.reconcile_running(d).await
+                } else {
+                    fabric_table.reconcile_not_running(d).await
+                };
+                let mut message = st.message.unwrap_or_default();
+                if !fabric.message.is_empty() {
+                    if !message.is_empty() {
+                        message.push_str("; ");
+                    }
+                    message.push_str(&fabric.message);
+                }
+                for e in &fabric.edges {
+                    if e.phase == "Failed" {
+                        if !message.is_empty() {
+                            message.push_str("; ");
+                        }
+                        message.push_str(&e.message);
+                    }
+                }
                 info!(
                     instance_id = %d.instance_id,
                     runtime_id = %st.runtime_id,
@@ -366,9 +418,10 @@ async fn reconcile(
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: phase.into(),
-                    message: st.message.unwrap_or_default(),
+                    message,
                     runtime_id: st.runtime_id,
                     ssh: Some(ssh),
+                    fabric: Some(fabric),
                 });
             }
             Err(e) => {
@@ -386,12 +439,14 @@ async fn reconcile(
                     state.running_since = None;
                 }
                 let ssh = ssh_table.reconcile(d, false).await;
+                let fabric = fabric_table.reconcile_not_running(d).await;
                 reports.push(InstanceStatus {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
                     message: format!("{e:#}"),
                     runtime_id: d.runtime_id.clone(),
                     ssh: Some(ssh),
+                    fabric: Some(fabric),
                 });
             }
         }
@@ -399,6 +454,7 @@ async fn reconcile(
 
     let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
     ssh_table.close_missing(&keep_ids).await;
+    fabric_table.close_missing(&keep_ids).await;
 
     if reports.is_empty() {
         return Ok(());

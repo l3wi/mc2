@@ -91,8 +91,9 @@ Agents: local cache + report status; **desired state lives on the control plane*
 
 | | |
 | - | - |
-| **v1** | **Published ports only** — MCC stores desired host↔guest mappings and node placement |
+| **v1** | **Published ports only** (north–south) — MCC stores desired host↔guest mappings and node placement |
 | **Soon after** | **Ingress-shaped object** designed early; implement with Caddy/Traefik (or BYO proxy) |
+| **East–west** | See **D13** — mediated service fabric (not CNI / not flat mesh) |
 | **Not v1** | Service mesh, cluster-wide overlay, flat all-to-all sandbox network |
 
 Preserve microsandbox egress defaults and policies; exposure is explicit.
@@ -111,7 +112,8 @@ mcc (Rust, dual-mode binary — linux + darwin-arm64)
 Human:  msb-like DX → mcc apply -f stack.yaml  + bearer token
 Agent:  join token → node creds → desired sandboxes + status
 Node:   local msb only (cloud runtime driver later)
-Expose: ports v1; Ingress object designed for proxy next
+Expose: ports v1 (N–S); mediated fabric D13 (E–W, post-MVP phases);
+        Ingress object designed for proxy next
 Tele:   unified OTLP path (mcc + msb-metrics)
 Dev:    justfile + cargo; GH release binaries for install
 ```
@@ -191,17 +193,47 @@ See [mcc-mvp.md §11](../tasks/mcc-mvp.md).
 
 ---
 
+## D13 — East–west connectivity (mediated service fabric)
+
+| | |
+| - | - |
+| **Decision** | **Host-mediated service fabric** — agent **userspace L4 splice** + **allow-gated DNS**, on msb per-sandbox gateway (smoltcp + policy + publish) |
+| **Methodology** | Same as msb: guest speaks normal TCP; **no real inter-VM network** (no bridge, CNI, pod CIDR, overlay) |
+| **Default** | **Deny east–west** until `expose` + explicit client `allow` |
+| **YAML** | `expose` (internal loopback) separate from `ports:` (north–south); optional `networks` = membership only, **not** mesh |
+| **DNS** | Short `db` + FQDN `db.<stack>.svc.mcc`; **NXDOMAIN** if client has no allow |
+| **Replicas v1** | Single stable backend (e.g. lowest ready ordinal); headless/RR **later** |
+| **Scope v1** | **Same-stack, same-node, TCP only**; multi-node fabric **deferred** (split peers → clear Failed message) |
+| **Ports** | Agent **ephemeral** `127.0.0.1`; report observed; **bind/policy failure → Failed + clear message** (no silent degrade) |
+| **msb profiles** | **Hard gate:** no `private` / `host` for fabric. If narrow DNS allow impossible → **do not ship** (no dirty fallback) |
+| **Secrets** | Prefer fabric FQDN in `allowHosts` when injection applies |
+| **vs Ingress** | Fabric first (E–W). Ingress later (D7) owns public HTTP(S) N–S; does not replace fabric |
+| **First ship** | Full stack-local fabric (not spike-only); cleanliness gate must pass inside the work |
+| **Not v1** | Multi-node tunnels, cross-stack allow, mesh-by-membership, VIP fabric, app traffic over agentd |
+| **Design / task** | [service-fabric.md](./service-fabric.md) · [docs/tasks/service-fabric.md](../tasks/service-fabric.md) |
+
+**Rationale:** Preserve msb’s untrusted-guest threat model while enabling Compose-like multi-service stacks. Prefer **no feature** over a feature that opens host/LAN.
+
+**Operator decisions:** Q1–Q15 recorded in design doc §0 (2026-08-07).
+
+**Phasing:** cleanliness gate → same-node stack fabric → (later) ordinals/RR → (later) multi-node → (later) Ingress N–S.
+
+---
+
 ## Still open (plan-phase detail)
 
-1. Exact Compose-like schema (service fields, restart policy enum, health probe shape)
+1. Exact Compose-like schema details beyond D13 locks (health probe shape, etc.)
 2. Encryption algorithm / key rotation for secret store
-3. gRPC service definitions and REST resource layout
+3. gRPC service definitions and REST resource layout (fabric status fields)
 4. Control-plane HA timeline (still “later”)
-5. Exact OTLP attribute naming vs msb-metrics conventions (match upstream docs when implementing)
+5. Exact OTLP attribute naming vs msb-metrics conventions
 6. When/where to stand up the separate docs site repo (post-MVP OK)
+7. **D13 gate result:** msb narrow DNS-only allow without host/private (technical, not product fork)
+8. Multi-node fabric design when un-deferred
+9. Ingress implementation (D7) when fabric N–S handoff is needed
 
 ---
 
 ## Source
 
-Interview over open questions in findings §5 and follow-up (scheduler, secrets, metrics, packaging); research in [microsandbox.md](./microsandbox.md), [orchestration-review.md](./orchestration-review.md).
+Interview over open questions in findings §5 and follow-up (scheduler, secrets, metrics, packaging); research in [microsandbox.md](./microsandbox.md), [orchestration-review.md](./orchestration-review.md), [service-fabric.md](./service-fabric.md) (D13 + Q1–Q15).

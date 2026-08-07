@@ -2,7 +2,7 @@
 
 Self-hosted, K3s-shaped **command & control** for [microsandbox](https://docs.microsandbox.dev) microVMs.
 
-MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
+MCC adds a desired-state control plane, node agents, scheduling, Compose-like stacks, cluster secrets, port exposure, same-node **mediated service fabric** (`expose` / `allow` / `*.svc.mcc` DNS), and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
 
 > **Status:** MVP phases 0–7 complete. See [docs/tasks/mcc-mvp.md](docs/tasks/mcc-mvp.md).
 
@@ -63,6 +63,8 @@ just test-integration
 | `mcc ps` | List instances / phases |
 | `mcc doctor` | Host / msb readiness checks |
 | `mcc ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (agent serves via microsandbox SDK) |
+
+**Service fabric (same-node):** stack YAML `expose` + client `allow` → agent L4 splice + guest DNS (`db.<stack>.svc.mcc`). Default deny east–west; multi-node deferred. See [docs/research/service-fabric.md](docs/research/service-fabric.md).
 
 One dual-mode binary for operators and nodes.
 

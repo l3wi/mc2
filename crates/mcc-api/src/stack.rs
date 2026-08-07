@@ -13,9 +13,25 @@ pub struct StackDocument {
     pub services: BTreeMap<String, ServiceSpec>,
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeSpec>,
+    /// Logical network membership only (not a free mesh). See D13.
+    #[serde(default)]
+    pub networks: BTreeMap<String, StackNetworkSpec>,
     /// Reserved — not implemented in MVP.
     #[serde(default)]
     pub ingress: Option<serde_json::Value>,
+}
+
+/// Stack-level network group (membership / docs only in v1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StackNetworkSpec {
+    /// Only `mediated` is valid (D13).
+    #[serde(default = "default_network_mode")]
+    pub mode: String,
+}
+
+fn default_network_mode() -> String {
+    "mediated".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +76,36 @@ pub struct ServiceSpec {
     /// Host-side msb SSH serve (not guest sshd). Optional.
     #[serde(default)]
     pub ssh: Option<SshSpec>,
+    /// Cluster-internal listeners (loopback publish; not LAN). D13 fabric.
+    #[serde(default)]
+    pub expose: Vec<ExposeSpec>,
+    /// Explicit east–west allows (default deny). Same-stack only in v1.
+    #[serde(default)]
+    pub allow: Vec<AllowSpec>,
+    /// Optional logical network membership names (not connectivity).
+    #[serde(default)]
+    pub networks: Vec<String>,
+}
+
+/// Internal service listener (fabric `expose`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposeSpec {
+    pub port: u16,
+    #[serde(default = "default_proto")]
+    pub protocol: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Client edge: this service may reach `to`:`port` (fabric `allow`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowSpec {
+    pub to: String,
+    pub port: u16,
+    #[serde(default = "default_proto")]
+    pub protocol: String,
 }
 
 /// Desired host-side SSH front end for a service (msb `ssh` feature).
@@ -213,6 +259,15 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
     if doc.services.is_empty() {
         return Err("services must not be empty".into());
     }
+    for (net_name, net) in &doc.networks {
+        let mode = net.mode.trim().to_ascii_lowercase();
+        if mode != "mediated" {
+            return Err(format!(
+                "network {net_name}: mode must be mediated (got {:?})",
+                net.mode
+            ));
+        }
+    }
     for (name, svc) in &doc.services {
         if svc.image.trim().is_empty() {
             return Err(format!("service {name}: image is required"));
@@ -241,8 +296,71 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
                 ));
             }
         }
+        for net in &svc.networks {
+            if !doc.networks.contains_key(net) {
+                return Err(format!(
+                    "service {name}: networks entry {net:?} is not defined under stack networks"
+                ));
+            }
+        }
+        let mut expose_ports = std::collections::BTreeSet::new();
+        for ex in &svc.expose {
+            if ex.port == 0 {
+                return Err(format!("service {name}: expose.port must be non-zero"));
+            }
+            if !ex.protocol.eq_ignore_ascii_case("tcp") {
+                return Err(format!(
+                    "service {name}: expose protocol must be tcp in v1 (got {:?})",
+                    ex.protocol
+                ));
+            }
+            if !expose_ports.insert(ex.port) {
+                return Err(format!(
+                    "service {name}: duplicate expose.port {}",
+                    ex.port
+                ));
+            }
+        }
+        for a in &svc.allow {
+            if a.to.trim().is_empty() {
+                return Err(format!("service {name}: allow.to is required"));
+            }
+            if a.to == *name {
+                return Err(format!(
+                    "service {name}: allow.to cannot target the same service"
+                ));
+            }
+            if !doc.services.contains_key(&a.to) {
+                return Err(format!(
+                    "service {name}: allow.to {:?} is not a service in this stack",
+                    a.to
+                ));
+            }
+            if a.port == 0 {
+                return Err(format!("service {name}: allow.port must be non-zero"));
+            }
+            if !a.protocol.eq_ignore_ascii_case("tcp") {
+                return Err(format!(
+                    "service {name}: allow protocol must be tcp in v1 (got {:?})",
+                    a.protocol
+                ));
+            }
+            let target = &doc.services[&a.to];
+            let ok = target.expose.iter().any(|e| e.port == a.port);
+            if !ok {
+                return Err(format!(
+                    "service {name}: allow to {}:{} requires that service to expose port {}",
+                    a.to, a.port, a.port
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// Fabric FQDN: `<service>.<stack>.svc.mcc`.
+pub fn fabric_fqdn(stack: &str, service: &str) -> String {
+    format!("{service}.{stack}.svc.mcc")
 }
 
 #[cfg(test)]
@@ -286,5 +404,70 @@ ingress:
 "#;
         let err = parse_stack_yaml(yaml).unwrap_err();
         assert!(err.contains("ingress"), "{err}");
+    }
+
+    #[test]
+    fn fabric_allow_requires_expose() {
+        let yaml = r#"
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: shop
+services:
+  db:
+    image: postgres:16
+  web:
+    image: alpine
+    allow:
+      - to: db
+        port: 5432
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("expose"), "{err}");
+    }
+
+    #[test]
+    fn fabric_allow_ok() {
+        let yaml = r#"
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: shop
+networks:
+  backend:
+    mode: mediated
+services:
+  db:
+    image: postgres:16
+    networks: [backend]
+    expose:
+      - port: 5432
+  web:
+    image: alpine
+    networks: [backend]
+    allow:
+      - to: db
+        port: 5432
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(doc.services["db"].expose[0].port, 5432);
+        assert_eq!(doc.services["web"].allow[0].to, "db");
+        assert_eq!(fabric_fqdn("shop", "db"), "db.shop.svc.mcc");
+    }
+
+    #[test]
+    fn fabric_unknown_network_name() {
+        let yaml = r#"
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: shop
+services:
+  web:
+    image: alpine
+    networks: [missing]
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("not defined"), "{err}");
     }
 }

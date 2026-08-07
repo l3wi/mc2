@@ -1,5 +1,6 @@
 //! Agent gRPC service (`mcc.agent.v1.AgentService`).
 
+use crate::fabric::build_fabric_desired;
 use crate::secrets::resolve_injections;
 use crate::ssh::resolve_ssh_desired;
 use mcc_api::agent::agent_service_server::AgentService;
@@ -123,6 +124,13 @@ impl AgentService for AgentSvc {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Peers in the same stacks (any node) for fabric backend resolution.
+        let all_instances = self
+            .store
+            .list_instances()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         // Include all phases bound to this node so restartPolicy can act on
         // Failed/Stopped (scale-down deletes rows; unbound instances leave Sync).
         let mut instances = Vec::new();
@@ -156,6 +164,12 @@ impl AgentService for AgentSvc {
                 config_hash: ssh_res.config_hash,
             });
 
+            let fabric = if spec.expose.is_empty() && spec.allow.is_empty() {
+                None
+            } else {
+                Some(build_fabric_desired(&i, &spec, &all_instances))
+            };
+
             instances.push(mcc_api::agent::DesiredInstance {
                 instance_id: i.id,
                 stack: i.stack,
@@ -164,6 +178,7 @@ impl AgentService for AgentSvc {
                 spec_json: i.spec_json,
                 secrets,
                 ssh,
+                fabric,
             });
         }
 

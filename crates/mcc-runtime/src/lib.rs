@@ -10,6 +10,11 @@ mod spec;
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
+pub mod fabric;
+pub use fabric::{
+    fabric_expose_guest_ports, fabric_from_proto, fabric_host_allow_ports, DesiredFabric,
+    FabricAllowDesired, FabricExposeDesired,
+};
 pub use spec::{desired_from_sync, DesiredSandbox, DesiredSsh, InjectedSecret, SandboxPhase};
 
 use anyhow::Result;

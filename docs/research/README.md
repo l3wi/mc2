@@ -11,6 +11,9 @@ Local research notes for **MCC** (**MicroCommandControl**) — a self-hosted orc
 | [orchestration-review.md](./orchestration-review.md) | How Docker, Swarm, Kubernetes (full + light distros), Nomad, Kata, Firecracker, gVisor operate |
 | [findings.md](./findings.md) | Synthesis: gaps in Microsandbox, what C2 must provide, recommended design stance |
 | [ssh-control-plane.md](./ssh-control-plane.md) | Authorized key registry + open/close host SSH endpoints (design) |
+| [service-fabric.md](./service-fabric.md) | East–west without a real network: mediated L4 fabric (D13; Q1–Q15 locked) |
+| [decisions.md](./decisions.md) | Resolved design decisions D1–D13 |
+| [../tasks/service-fabric.md](../tasks/service-fabric.md) | Implement plan: same-node stack-local fabric |
 
 **Sources (primary):**
 

@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod stack;
 pub use stack::{
-    parse_stack_yaml, HealthSpec, NetworkSpec, ResourceSpec, SecretRef, ServiceSpec, SshSpec,
-    StackDocument, VolumeMount, VolumeSpec,
+    fabric_fqdn, parse_stack_yaml, AllowSpec, ExposeSpec, HealthSpec, NetworkSpec, PortSpec,
+    ResourceSpec, SecretRef, ServiceSpec, SshSpec, StackDocument, StackNetworkSpec, VolumeMount,
+    VolumeSpec,
 };
 
 /// Generated `mcc.agent.v1` protobuf + tonic service traits.

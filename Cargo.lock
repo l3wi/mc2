@@ -3094,6 +3094,7 @@ dependencies = [
  "async-trait",
  "mcc-api",
  "microsandbox",
+ "microsandbox-network",
  "serde",
  "serde_json",
  "tempfile",

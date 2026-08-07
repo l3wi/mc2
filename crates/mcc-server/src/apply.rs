@@ -91,7 +91,9 @@ pub async fn run_scheduler(store: Arc<dyn Store>) -> Result<u32> {
         let spec: ServiceSpec = serde_json::from_str(&inst.spec_json)
             .with_context(|| format!("parse spec for {}", inst.id))?;
         let load = service_load_map(&instances_snapshot, &inst.service);
-        let Some(node_id) = pick_node(&inst, &spec, &nodes, &load, &residual_mut) else {
+        let Some(node_id) =
+            pick_node(&inst, &spec, &nodes, &load, &residual_mut, &instances_snapshot)
+        else {
             continue;
         };
 
