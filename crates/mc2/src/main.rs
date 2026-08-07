@@ -698,14 +698,33 @@ fn ensure_stack_name(map: &mut serde_yaml::Mapping, file_path: &str) -> bool {
     }
 }
 
-/// Sanitized file stem as a stack name: lowercase, volume-safe charset, no
-/// `--` (the volume namespace separator).
+/// Stack name from the file path: the sanitized stem, or — when the stem is
+/// the generic `stack` (e.g. `examples/01-hello-service/stack.yaml`) — the
+/// sanitized parent directory name. Result is lowercase, volume-safe charset,
+/// no `--` (the volume namespace separator).
 fn stack_name_from_path(file_path: &str) -> String {
-    let stem = std::path::Path::new(file_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("stack");
-    let mut out: String = stem
+    let path = std::path::Path::new(file_path);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("stack");
+    let source = if stem.eq_ignore_ascii_case("stack") {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(stem)
+    } else {
+        stem
+    };
+    let sanitized = sanitize_stack_name(source);
+    if sanitized.is_empty() {
+        "stack".into()
+    } else {
+        sanitized
+    }
+}
+
+/// Lowercase, volume-safe charset; collapse `--` and trim edge dashes.
+fn sanitize_stack_name(source: &str) -> String {
+    let mut out: String = source
         .to_ascii_lowercase()
         .chars()
         .map(|c| {
@@ -719,12 +738,7 @@ fn stack_name_from_path(file_path: &str) -> String {
     while out.contains("--") {
         out = out.replace("--", "-");
     }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "stack".into()
-    } else {
-        out
-    }
+    out.trim_matches('-').to_string()
 }
 
 async fn ps_cmd(args: OperatorArgs) -> Result<()> {
@@ -833,6 +847,17 @@ mod tests {
         let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata: {}\nservices:\n  web:\n    image: alpine:3.20\n";
         let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(raw, "My Stack!.yaml")).unwrap();
         assert_eq!(doc.metadata.name, "my-stack");
+    }
+
+    #[test]
+    fn generic_stack_yaml_takes_parent_dir_name() {
+        let raw = "services:\n  web:\n    image: alpine:3.20\n";
+        let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(
+            raw,
+            "examples/01-hello-service/stack.yaml",
+        ))
+        .unwrap();
+        assert_eq!(doc.metadata.name, "01-hello-service");
     }
 
     #[test]

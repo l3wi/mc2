@@ -31,7 +31,7 @@ export MC2_API=http://127.0.0.1:7443
 ./target/debug/mc2 apply -f examples/01-hello-service/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/status"
-# after hello is Running: curl -s http://127.0.0.1:18080/
+# after hello is Running: curl -s http://127.0.0.1:18091/
 ```
 
 Optional OTLP (server + agent):

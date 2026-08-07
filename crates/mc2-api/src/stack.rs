@@ -215,13 +215,25 @@ fn default_restart() -> String {
     "on-failure".into()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceSpec {
     #[serde(default = "default_cpus")]
     pub cpus: u32,
     #[serde(default = "default_memory", rename = "memoryMiB")]
     pub memory_mib: u64,
+}
+
+/// Field defaults must match the serde field defaults: an omitted `resources`
+/// block deserializes via `Default::default()`, and a zero-memory spec is
+/// rejected by the sandbox runtime.
+impl Default for ResourceSpec {
+    fn default() -> Self {
+        Self {
+            cpus: default_cpus(),
+            memory_mib: default_memory(),
+        }
+    }
 }
 
 fn default_cpus() -> u32 {
@@ -819,6 +831,27 @@ services:
         .unwrap();
         assert_eq!(doc.services["web"].volumes[0].mount, "/data");
         assert_eq!(doc.volumes["data"].kind, "dir");
+    }
+
+    #[test]
+    fn omitted_resources_get_serde_defaults() {
+        // An omitted `resources` block deserializes via Default; a zero-memory
+        // spec is rejected by the sandbox runtime, so the two must agree.
+        let yaml = r#"
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: demo
+services:
+  web:
+    image: alpine:3.20
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(doc.services["web"].resources.cpus, 1);
+        assert_eq!(doc.services["web"].resources.memory_mib, 512);
+        let d = ResourceSpec::default();
+        assert_eq!(d.cpus, 1);
+        assert_eq!(d.memory_mib, 512);
     }
 
     #[test]
