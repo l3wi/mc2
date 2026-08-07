@@ -243,6 +243,27 @@ impl FabricTable {
         observed
     }
 
+    /// Host publish ports for this instance's fabric exposes (if prepared).
+    pub fn expose_host_ports(&self, instance_id: &str) -> Option<Vec<u16>> {
+        self.exposes.get(instance_id).map(|v| {
+            v.iter().map(|b| b.host_port).collect()
+        })
+    }
+
+    /// Drop splices/hosts for one instance (before force-recreate).
+    /// Clears expose bindings so the next prepare allocates fresh host ports.
+    pub async fn drop_instance(&mut self, instance_id: &str) {
+        if let Some(sp) = self.splices.remove(instance_id) {
+            for s in sp {
+                s._handle.abort();
+            }
+        }
+        self.hosts_key.remove(instance_id);
+        self.exposes.remove(instance_id);
+        let mut idx = self.publish_index.lock().await;
+        idx.remove(instance_id);
+    }
+
     pub async fn close_missing(&mut self, keep: &HashSet<String>) {
         let drop_ids: Vec<String> = self
             .exposes

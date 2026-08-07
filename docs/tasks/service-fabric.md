@@ -158,3 +158,12 @@ Full text: design doc §0.
 - Smoke stack uses `python:3.12-alpine` (busybox `httpd` applet missing on msb alpine rootfs).
 - Upstream/cleanliness recorded in design doc §15.
 - **Ingress:** deferred until fabric polish settled (scope next, not implement yet).
+
+### 2026-08-07 — open issues closed
+
+- Apply validation → **HTTP 400** (not 500).
+- Spec-hash recreate on image/command/ports/fabric/label change; drop fabric splices first.
+- Recreate when expose host ports not live (orphan Running without msb publish).
+- `on-failure` + Stopped → Start (msb process exit often Stopped).
+- Agent connect/Join retry with backoff (agent-before-server OK).
+- Smoke re-run: success + 400 + NX + recreate AFTER:0.

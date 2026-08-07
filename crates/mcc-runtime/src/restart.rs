@@ -45,9 +45,12 @@ pub fn action_for_phase(policy: RestartPolicy, phase: SandboxPhase) -> RestartAc
             RestartPolicy::Never => RestartAction::Leave,
             RestartPolicy::OnFailure | RestartPolicy::Always => RestartAction::Recreate,
         },
+        // Stopped while still desired: treat as unexpected exit for Always and
+        // OnFailure (msb often maps process exit → Stopped, not Failed).
+        // Scale-down uses ensure_removed; it never leaves a desired Stopped instance.
         SandboxPhase::Stopped => match policy {
-            RestartPolicy::Always => RestartAction::Start,
-            RestartPolicy::OnFailure | RestartPolicy::Never => RestartAction::Leave,
+            RestartPolicy::Always | RestartPolicy::OnFailure => RestartAction::Start,
+            RestartPolicy::Never => RestartAction::Leave,
         },
     }
 }
@@ -76,14 +79,15 @@ mod tests {
     }
 
     #[test]
-    fn on_failure_recreates_failed_not_stopped() {
+    fn on_failure_recreates_failed_and_starts_stopped() {
         assert_eq!(
             action_for_phase(RestartPolicy::OnFailure, SandboxPhase::Failed),
             RestartAction::Recreate
         );
+        // Process exit often surfaces as Stopped under msb; bring it back.
         assert_eq!(
             action_for_phase(RestartPolicy::OnFailure, SandboxPhase::Stopped),
-            RestartAction::Leave
+            RestartAction::Start
         );
     }
 

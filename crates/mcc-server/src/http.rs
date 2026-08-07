@@ -125,11 +125,7 @@ async fn apply_stack(
         Ok(r) => Ok(Json(r)),
         Err(e) => {
             let msg = e.to_string();
-            let code = if msg.contains("invalid")
-                || msg.contains("unsupported")
-                || msg.contains("required")
-                || msg.contains("ingress")
-            {
+            let code = if is_stack_client_error(&msg) {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -137,6 +133,32 @@ async fn apply_stack(
             Err((code, Json(json!({ "error": msg }))))
         }
     }
+}
+
+/// Stack YAML / apply validation problems → 400 (not 500).
+fn is_stack_client_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("invalid")
+        || m.contains("unsupported")
+        || m.contains("required")
+        || m.contains("require")
+        || m.contains("ingress")
+        || m.contains("must ")
+        || m.contains("must be")
+        || m.contains("must not")
+        || m.contains("not a service")
+        || m.contains("not defined")
+        || m.contains("duplicate")
+        || m.contains("empty")
+        || m.contains("expose")
+        || m.contains("allow")
+        || m.contains("replicas")
+        || m.contains("restartpolicy")
+        || m.contains("apiversion")
+        || m.contains("kind")
+        || m.contains("metadata")
+        || m.contains("parse")
+        || m.contains("yaml")
 }
 
 async fn list_instances(
@@ -527,6 +549,60 @@ mod tests {
             version: "0.1.0-test",
             secrets_key: std::sync::Arc::new(mcc_store::SecretsKey::from_bytes([1u8; 32])),
         }
+    }
+
+    #[test]
+    fn stack_client_errors_map_to_400_keywords() {
+        assert!(is_stack_client_error(
+            "service b: allow to a:9 requires that service to expose port 9"
+        ));
+        assert!(is_stack_client_error(
+            "service web: allow.to \"nosuch\" is not a service in this stack"
+        ));
+        assert!(is_stack_client_error("invalid stack YAML: ..."));
+        assert!(!is_stack_client_error("database locked"));
+        assert!(!is_stack_client_error("connection reset by peer"));
+    }
+
+    #[tokio::test]
+    async fn apply_fabric_validation_returns_400() {
+        let store = MemoryStore::new();
+        store.init_cluster("", "").await.unwrap();
+        let app = router(test_state(store));
+        let body = serde_json::json!({
+            "yaml": r#"
+apiVersion: mcc/v1
+kind: Stack
+metadata:
+  name: bad
+services:
+  a:
+    image: alpine
+  b:
+    image: alpine
+    allow:
+      - to: a
+        port: 9
+"#
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/stacks:apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("expose"),
+            "{v}"
+        );
     }
 
     #[tokio::test]

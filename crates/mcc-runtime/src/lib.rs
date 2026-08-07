@@ -6,6 +6,7 @@ mod msb_sdk;
 mod naming;
 mod restart;
 mod spec;
+mod spec_hash;
 
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::sandbox_name;
@@ -16,6 +17,7 @@ pub use fabric::{
     FabricAllowDesired, FabricExposeDesired,
 };
 pub use spec::{desired_from_sync, DesiredSandbox, DesiredSsh, InjectedSecret, SandboxPhase};
+pub use spec_hash::desired_recreate_hash;
 
 use anyhow::Result;
 use async_trait::async_trait;

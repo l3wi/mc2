@@ -14,7 +14,8 @@ mod ssh_serve;
 
 use fabric_serve::FabricTable;
 use mcc_runtime::{
-    backoff_secs, default_runtime, desired_from_sync, NodeRuntime, RestartPolicy, SandboxPhase,
+    backoff_secs, default_runtime, desired_from_sync, desired_recreate_hash, NodeRuntime,
+    RestartPolicy, SandboxPhase,
 };
 use ssh_serve::SshServeTable;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +32,8 @@ struct InstanceRuntimeState {
     next_restart_ok: Option<Instant>,
     last_health: Option<Instant>,
     running_since: Option<Instant>,
+    /// Last applied recreate hash (`desired_recreate_hash`).
+    spec_hash: Option<String>,
 }
 
 /// Arguments for `mcc agent`.
@@ -111,7 +114,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     // Join token optional when server was bootstrapped with --no-auth.
     let join_token = args.token.clone().unwrap_or_default();
 
-    let mut client = connect(&server, args.tls_ca.as_ref(), args.insecure)
+    let mut client = connect_with_retry(&server, args.tls_ca.as_ref(), args.insecure)
         .await
         .with_context(|| format!("connect to {server}"))?;
 
@@ -120,17 +123,17 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let memory_mib = args.memory_mib.unwrap_or(8192);
     let arch = std::env::consts::ARCH.to_string();
 
-    let join_resp = client
-        .join(JoinRequest {
-            join_token,
-            node_name: name.clone(),
-            labels,
-            arch: arch.clone(),
-            capacity: Some(Capacity { cpus, memory_mib }),
-        })
-        .await
-        .context("Join RPC")?
-        .into_inner();
+    let join_resp = join_with_retry(
+        &mut client,
+        &join_token,
+        &name,
+        labels,
+        &arch,
+        cpus,
+        memory_mib,
+    )
+    .await
+    .context("Join RPC")?;
 
     info!(
         node_id = %join_resp.node_id,
@@ -300,9 +303,50 @@ async fn reconcile(
             continue;
         }
 
+        // Recreate when create-time config changes (image, command, ports, fabric…).
+        let want_hash = desired_recreate_hash(d);
+        let mut force_recreate = false;
+        if let Some(prev) = state.spec_hash.as_ref() {
+            if prev != &want_hash {
+                force_recreate = true;
+                info!(
+                    runtime_id = %d.runtime_id,
+                    "desired spec changed; removing sandbox for recreate"
+                );
+            }
+        }
+        // Expose host ports are only bound at msb create. If we inherited a
+        // Running sandbox without live publish (agent restart / orphan), recreate.
+        if !force_recreate {
+            if let Some(ports) = fabric_table.expose_host_ports(&d.instance_id) {
+                if !ports.is_empty() && !host_ports_accepting(&ports).await {
+                    force_recreate = true;
+                    info!(
+                        runtime_id = %d.runtime_id,
+                        ?ports,
+                        "fabric expose host ports not live; recreating sandbox"
+                    );
+                }
+            }
+        }
+        if force_recreate {
+            fabric_table.drop_instance(&d.instance_id).await;
+            // Re-prepare after drop so publish_index stays correct for this cycle.
+            if let Err(e) = fabric_table.prepare_exposes(d).await {
+                warn!(instance_id = %d.instance_id, error = %e, "fabric re-prepare after drop");
+            }
+            if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
+                warn!(runtime_id = %d.runtime_id, error = %e, "remove before recreate");
+            }
+            owned.remove(&d.runtime_id);
+            state.spec_hash = None;
+            state.running_since = None;
+        }
+
         match runtime.ensure_running(d).await {
             Ok(mut st) => {
                 owned.insert(d.runtime_id.clone());
+                state.spec_hash = Some(want_hash);
 
                 // Reset restart counter after sustained Running.
                 if st.phase == SandboxPhase::Running {
@@ -505,6 +549,99 @@ async fn handle_health_failure(
             message: Some(format!("{message}; recreate: {e:#}")),
         },
     }
+}
+
+/// Connect with retries so agent can start before server gRPC is listening.
+/// True if every host port accepts a TCP connect (msb publish live).
+async fn host_ports_accepting(ports: &[u16]) -> bool {
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    for &p in ports {
+        let ok = timeout(
+            Duration::from_millis(200),
+            TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], p))),
+        )
+        .await;
+        match ok {
+            Ok(Ok(_stream)) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+async fn connect_with_retry(
+    server: &str,
+    tls_ca: Option<&PathBuf>,
+    insecure: bool,
+) -> Result<AgentServiceClient<Channel>> {
+    const ATTEMPTS: u32 = 30;
+    let mut last = None;
+    for attempt in 1..=ATTEMPTS {
+        match connect(server, tls_ca, insecure).await {
+            Ok(c) => {
+                if attempt > 1 {
+                    info!(attempt, "connected to control plane after retry");
+                }
+                return Ok(c);
+            }
+            Err(e) => {
+                last = Some(e);
+                if attempt < ATTEMPTS {
+                    let wait = Duration::from_millis(200 * u64::from(attempt.min(10)));
+                    warn!(
+                        attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        error = %last.as_ref().unwrap(),
+                        "control plane connect failed; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap())
+}
+
+async fn join_with_retry(
+    client: &mut AgentServiceClient<Channel>,
+    join_token: &str,
+    name: &str,
+    labels: HashMap<String, String>,
+    arch: &str,
+    cpus: u32,
+    memory_mib: u64,
+) -> Result<mcc_api::agent::JoinResponse> {
+    const ATTEMPTS: u32 = 15;
+    let mut last = None;
+    for attempt in 1..=ATTEMPTS {
+        match client
+            .join(JoinRequest {
+                join_token: join_token.to_string(),
+                node_name: name.to_string(),
+                labels: labels.clone(),
+                arch: arch.to_string(),
+                capacity: Some(Capacity { cpus, memory_mib }),
+            })
+            .await
+        {
+            Ok(resp) => return Ok(resp.into_inner()),
+            Err(e) => {
+                last = Some(e);
+                if attempt < ATTEMPTS {
+                    let wait = Duration::from_millis(300 * u64::from(attempt.min(10)));
+                    warn!(
+                        attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        error = %last.as_ref().unwrap(),
+                        "Join RPC failed; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+    Err(anyhow::Error::from(last.unwrap()).context("Join exhausted retries"))
 }
 
 async fn connect(
