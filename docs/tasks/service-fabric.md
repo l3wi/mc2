@@ -133,7 +133,7 @@ Full text: design doc §0.
 
 | Date | Result | Notes |
 | ---- | ------ | ----- |
-| 2026-08-07 | **Pass (design)** | Narrow egress: `Destination::Group(Host)` + **TCP single port** only — **not** `NetworkProfile::Host` or `Private`. Guest reaches agent splice via gateway/host path for that port only. DNS: inject `fqdn`/`short` → gateway IP in guest `/etc/hosts`. |
+| 2026-08-07 | **Pass (lab)** | Narrow Host:tcp:port rules only. End-to-end `FABRIC_OK` via FQDN + short name + host splice. No Host/Private profiles. |
 
 ---
 
@@ -149,3 +149,12 @@ Full text: design doc §0.
 - Example: `examples/stacks/smoke-fabric.yaml`.
 - Unit tests: stack parse, fabric plan, scheduler affinity, policy narrow rules.
 - Gate: documented as design pass (narrow Host destination + port).
+
+### 2026-08-07 — lab verify + harden
+
+- Lab success: FQDN + short DNS + host splice → `FABRIC_OK` (python http.server smoke).
+- Lab failures: apply validation, NX unknown name, no-allow peer, private egress deny.
+- Harden: splice/host inject **reuse** (no thrash); `instance_fabric` table + `GET /v1/instances/{id}/fabric`.
+- Smoke stack uses `python:3.12-alpine` (busybox `httpd` applet missing on msb alpine rootfs).
+- Upstream/cleanliness recorded in design doc §15.
+- **Ingress:** deferred until fabric polish settled (scope next, not implement yet).

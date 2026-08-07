@@ -1,9 +1,10 @@
 //! In-memory store for unit tests.
 
 use crate::{
-    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstancePhase,
-    InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus, SecretBlob,
-    SecretMeta, SshAuthorizedKey, StackRecord, Store, StoreError,
+    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
+    InstanceFabricRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin,
+    NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store,
+    StoreError,
 };
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -23,6 +24,7 @@ struct Inner {
     secrets: HashMap<String, SecretBlob>,
     ssh_keys: HashMap<String, SshAuthorizedKey>,
     instance_ssh: HashMap<String, InstanceSshRecord>,
+    instance_fabric: HashMap<String, InstanceFabricRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -582,6 +584,52 @@ impl Store for MemoryStore {
             .read()
             .await
             .instance_ssh
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn update_instance_fabric_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        observed_json: &str,
+        message: Option<&str>,
+    ) -> Result<InstanceFabricRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        if !g.instances.contains_key(instance_id) {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        let rec = InstanceFabricRecord {
+            instance_id: instance_id.into(),
+            phase: phase.into(),
+            observed_json: observed_json.into(),
+            message: message.map(str::to_string),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        g.instance_fabric.insert(instance_id.into(), rec.clone());
+        Ok(rec)
+    }
+
+    async fn get_instance_fabric(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceFabricRecord>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .instance_fabric
+            .get(instance_id)
+            .cloned())
+    }
+
+    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .instance_fabric
             .values()
             .cloned()
             .collect())

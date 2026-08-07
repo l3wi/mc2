@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/stacks:apply", axum::routing::post(apply_stack))
         .route("/v1/instances", get(list_instances))
+        .route("/v1/instances/{id}/fabric", get(get_instance_fabric))
         .route("/v1/secrets", get(list_secrets))
         .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/v1/ssh/keys", get(list_ssh_keys))
@@ -151,6 +152,35 @@ async fn list_instances(
                 Json(json!({ "error": e.to_string() })),
             )
         })
+}
+
+/// Observed fabric status for one instance (agent-reported).
+async fn get_instance_fabric(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match state.store.get_instance_fabric(&id).await {
+        Ok(Some(rec)) => {
+            let observed: serde_json::Value =
+                serde_json::from_str(&rec.observed_json).unwrap_or(json!({}));
+            Ok(Json(json!({
+                "instanceId": rec.instance_id,
+                "phase": rec.phase,
+                "message": rec.message,
+                "updatedAt": rec.updated_at,
+                "observed": observed,
+            })))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no fabric status for instance" })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
 }
 
 /// List secret names only — never values.

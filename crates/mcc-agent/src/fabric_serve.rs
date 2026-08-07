@@ -4,6 +4,7 @@
 //! - **allow**: userspace L4 splice on `127.0.0.1:<service_port>` → backend publish;
 //!   inject fabric DNS names into guest `/etc/hosts` → gateway IP.
 //! - Never enables full Host/Private profiles (policy is create-time narrow rules).
+//! - Splice/host inject reuse: only rebuild when edge config changes.
 
 use mcc_api::agent::{FabricEdgeStatus, FabricExposeStatus, FabricObserved};
 use mcc_runtime::DesiredSandbox;
@@ -23,14 +24,9 @@ struct ExposeBinding {
 }
 
 struct ActiveSplice {
-    #[allow(dead_code)]
-    to_service: String,
-    #[allow(dead_code)]
-    port: u16,
-    #[allow(dead_code)]
-    listen_port: u16,
-    #[allow(dead_code)]
-    backend_host_port: u16,
+    /// Stable key: `to_service:port → backend_instance:backend_host_port`
+    config_key: String,
+    status: FabricEdgeStatus,
     _handle: JoinHandle<()>,
 }
 
@@ -42,7 +38,8 @@ pub struct FabricTable {
     splices: HashMap<String, Vec<ActiveSplice>>,
     /// Shared expose index: backend instance_id → guest_port → host_port
     publish_index: Arc<Mutex<HashMap<String, HashMap<u16, u16>>>>,
-    hosts_injected: HashSet<String>,
+    /// instance_id → last successful hosts inject key (names+gw).
+    hosts_key: HashMap<String, String>,
 }
 
 impl FabricTable {
@@ -51,7 +48,7 @@ impl FabricTable {
             exposes: HashMap::new(),
             splices: HashMap::new(),
             publish_index: Arc::new(Mutex::new(HashMap::new())),
-            hosts_injected: HashSet::new(),
+            hosts_key: HashMap::new(),
         }
     }
 
@@ -151,31 +148,53 @@ impl FabricTable {
             }
         }
 
-        // Drop old splices for this instance and rebuild.
-        if let Some(old) = self.splices.remove(&desired.instance_id) {
-            for s in old {
-                s._handle.abort();
-            }
-        }
+        let mut edge_results: Vec<FabricEdgeStatus> = Vec::new();
+        let mut kept: Vec<ActiveSplice> = Vec::new();
 
-        let mut new_splices = Vec::new();
+        let prev = self.splices.remove(&desired.instance_id).unwrap_or_default();
+        let mut prev_by_key: HashMap<String, ActiveSplice> =
+            prev.into_iter().map(|s| (s.config_key.clone(), s)).collect();
+
         for allow in &desired.fabric.allows {
-            match self.start_edge(desired, allow).await {
-                Ok((status, splice)) => {
-                    if let Some(s) = splice {
-                        new_splices.push(s);
+            match self.plan_edge(allow).await {
+                Ok((config_key, status, need_start, backend_host_port)) => {
+                    let _ = status;
+                    if let Some(existing) = prev_by_key.remove(&config_key) {
+                        // Reuse live splice.
+                        edge_results.push(existing.status.clone());
+                        kept.push(existing);
+                        continue;
                     }
-                    observed.edges.push(status);
+                    if need_start {
+                        match self
+                            .start_splice(desired, allow, &config_key, backend_host_port)
+                            .await
+                        {
+                            Ok(splice) => {
+                                edge_results.push(splice.status.clone());
+                                kept.push(splice);
+                            }
+                            Err(st) => edge_results.push(st),
+                        }
+                    } else {
+                        edge_results.push(status);
+                    }
                 }
-                Err(status) => observed.edges.push(status),
+                Err(st) => edge_results.push(st),
             }
         }
-        if !new_splices.is_empty() {
-            self.splices
-                .insert(desired.instance_id.clone(), new_splices);
+
+        // Abort splices no longer desired.
+        for (_k, old) in prev_by_key {
+            old._handle.abort();
         }
 
-        // Inject /etc/hosts for Ready edges.
+        if !kept.is_empty() {
+            self.splices.insert(desired.instance_id.clone(), kept);
+        }
+
+        observed.edges = edge_results;
+
         if let Err(e) = self.inject_hosts(desired, &observed).await {
             warn!(
                 instance = %desired.instance_id,
@@ -191,13 +210,12 @@ impl FabricTable {
     }
 
     pub async fn reconcile_not_running(&mut self, desired: &DesiredSandbox) -> FabricObserved {
-        // Close client splices; keep expose index if sandbox may return.
         if let Some(old) = self.splices.remove(&desired.instance_id) {
             for s in old {
                 s._handle.abort();
             }
         }
-        self.hosts_injected.remove(&desired.instance_id);
+        self.hosts_key.remove(&desired.instance_id);
 
         let mut observed = FabricObserved::default();
         for ex in &desired.fabric.exposes {
@@ -242,17 +260,17 @@ impl FabricTable {
                 }
             }
             self.exposes.remove(&id);
-            self.hosts_injected.remove(&id);
+            self.hosts_key.remove(&id);
             let mut idx = self.publish_index.lock().await;
             idx.remove(&id);
         }
     }
 
-    async fn start_edge(
+    /// Returns (config_key, status_if_not_starting, need_start, backend_host_port).
+    async fn plan_edge(
         &self,
-        desired: &DesiredSandbox,
         allow: &mcc_runtime::FabricAllowDesired,
-    ) -> Result<(FabricEdgeStatus, Option<ActiveSplice>), FabricEdgeStatus> {
+    ) -> Result<(String, FabricEdgeStatus, bool, u16), FabricEdgeStatus> {
         if !allow.backend_local {
             return Err(FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
@@ -299,12 +317,30 @@ impl FabricTable {
             });
         };
 
-        // Listen on service port so guest dials fqdn:port without rewrite.
+        let config_key = format!(
+            "{}:{}→{}:{}",
+            allow.to_service, allow.port, allow.backend_instance_id, backend_host_port
+        );
+        let status = FabricEdgeStatus {
+            to_service: allow.to_service.clone(),
+            port: u32::from(allow.port),
+            phase: "Ready".into(),
+            message: String::new(),
+        };
+        Ok((config_key, status, true, backend_host_port))
+    }
+
+    async fn start_splice(
+        &self,
+        desired: &DesiredSandbox,
+        allow: &mcc_runtime::FabricAllowDesired,
+        config_key: &str,
+        backend_host_port: u16,
+    ) -> Result<ActiveSplice, FabricEdgeStatus> {
         let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], allow.port))).await
         {
             Ok(l) => l,
             Err(e) => {
-                // Port busy — try ephemeral and report failure (apps expect service port).
                 return Err(FabricEdgeStatus {
                     to_service: allow.to_service.clone(),
                     port: u32::from(allow.port),
@@ -348,21 +384,16 @@ impl FabricTable {
             "fabric edge Ready"
         );
 
-        Ok((
-            FabricEdgeStatus {
+        Ok(ActiveSplice {
+            config_key: config_key.to_string(),
+            status: FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
                 port: u32::from(allow.port),
                 phase: "Ready".into(),
                 message: String::new(),
             },
-            Some(ActiveSplice {
-                to_service: allow.to_service.clone(),
-                port: allow.port,
-                listen_port,
-                backend_host_port,
-                _handle: handle,
-            }),
-        ))
+            _handle: handle,
+        })
     }
 
     async fn inject_hosts(
@@ -385,7 +416,6 @@ impl FabricTable {
             return Ok(());
         }
 
-        // Read gateway IP from guest resolv.conf (nameserver = gateway).
         let handle = microsandbox::Sandbox::get(&desired.runtime_id).await?;
         let sb = handle.connect().await?;
         let out = sb
@@ -396,19 +426,34 @@ impl FabricTable {
             anyhow::bail!("empty gateway from resolv.conf");
         }
 
-        let mut script = String::from("set -e; ");
-        for (fqdn, short) in &ready_names {
-            // Remove prior mcc fabric lines for these names, then append.
-            script.push_str(&format!(
-                "grep -v ' {fqdn}\\|{short} ' /etc/hosts > /tmp/hosts.mcc 2>/dev/null || cp /etc/hosts /tmp/hosts.mcc; "
-            ));
-            script.push_str(&format!(
-                "echo '{gw} {fqdn} {short}' >> /tmp/hosts.mcc; "
-            ));
-            script.push_str("cp /tmp/hosts.mcc /etc/hosts; ");
+        let mut key_parts: Vec<String> = ready_names
+            .iter()
+            .map(|(f, s)| format!("{f}+{s}"))
+            .collect();
+        key_parts.sort();
+        let inject_key = format!("{gw}|{}", key_parts.join(","));
+        if self.hosts_key.get(&desired.instance_id) == Some(&inject_key) {
+            return Ok(());
         }
+
+        // Rebuild fabric host lines under a marker for idempotency.
+        let mut entries = String::new();
+        for (fqdn, short) in &ready_names {
+            entries.push_str(&format!("{gw} {fqdn} {short}\n"));
+        }
+        // Escape for single-quoted shell heredoc is awkward; use printf lines.
+        let mut script = String::from(
+            "set -e; grep -v ' #mcc-fabric$' /etc/hosts > /tmp/hosts.mcc 2>/dev/null || true; ",
+        );
+        for (fqdn, short) in &ready_names {
+            script.push_str(&format!(
+                "printf '%s %s %s #mcc-fabric\\n' '{gw}' '{fqdn}' '{short}' >> /tmp/hosts.mcc; "
+            ));
+        }
+        script.push_str("cp /tmp/hosts.mcc /etc/hosts");
         let _ = sb.shell(script).await?;
-        self.hosts_injected.insert(desired.instance_id.clone());
+        self.hosts_key
+            .insert(desired.instance_id.clone(), inject_key);
         debug!(
             runtime_id = %desired.runtime_id,
             gw = %gw,
@@ -417,7 +462,6 @@ impl FabricTable {
         );
         Ok(())
     }
-
 }
 
 async fn reserve_ephemeral() -> std::io::Result<u16> {

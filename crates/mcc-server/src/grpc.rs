@@ -5,8 +5,9 @@ use crate::secrets::resolve_injections;
 use crate::ssh::resolve_ssh_desired;
 use mcc_api::agent::agent_service_server::AgentService;
 use mcc_api::agent::{
-    HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse, ReportStatusRequest,
-    ReportStatusResponse, SecretInjection, SshDesired, SyncRequest, SyncResponse,
+    FabricObserved, HeartbeatRequest, HeartbeatResponse, JoinRequest, JoinResponse,
+    ReportStatusRequest, ReportStatusResponse, SecretInjection, SshDesired, SyncRequest,
+    SyncResponse,
 };
 use mcc_api::ServiceSpec;
 use mcc_store::{hash_token, NodeHeartbeat, NodeJoin, SecretsKey, Store};
@@ -256,8 +257,85 @@ impl AgentService for AgentSvc {
                     )
                     .await;
             }
+
+            if let Some(ref fabric) = st.fabric {
+                let phase = fabric_summary_phase(fabric);
+                let json = fabric_observed_json(fabric);
+                let msg = if fabric.message.is_empty() {
+                    None
+                } else {
+                    Some(fabric.message.as_str())
+                };
+                let _ = self
+                    .store
+                    .update_instance_fabric_observed(&st.instance_id, &phase, &json, msg)
+                    .await;
+            }
         }
 
         Ok(Response::new(ReportStatusResponse { ok: true }))
+    }
+}
+
+fn fabric_observed_json(f: &FabricObserved) -> String {
+    let exposes: Vec<serde_json::Value> = f
+        .exposes
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "guestPort": e.guest_port,
+                "hostPort": e.host_port,
+                "phase": e.phase,
+                "message": e.message,
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = f
+        .edges
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "toService": e.to_service,
+                "port": e.port,
+                "phase": e.phase,
+                "message": e.message,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "exposes": exposes,
+        "edges": edges,
+        "message": f.message,
+    })
+    .to_string()
+}
+
+fn fabric_summary_phase(f: &FabricObserved) -> String {
+    let mut has_ready = false;
+    let mut has_failed = false;
+    let mut has_pending = false;
+    for e in &f.exposes {
+        match e.phase.as_str() {
+            "Ready" => has_ready = true,
+            "Failed" => has_failed = true,
+            _ => has_pending = true,
+        }
+    }
+    for e in &f.edges {
+        match e.phase.as_str() {
+            "Ready" => has_ready = true,
+            "Failed" => has_failed = true,
+            _ => has_pending = true,
+        }
+    }
+    if f.exposes.is_empty() && f.edges.is_empty() {
+        return "Pending".into();
+    }
+    match (has_failed, has_pending, has_ready) {
+        (true, _, true) => "Mixed".into(),
+        (true, _, false) => "Failed".into(),
+        (false, true, _) => "Pending".into(),
+        (false, false, true) => "Ready".into(),
+        _ => "Pending".into(),
     }
 }

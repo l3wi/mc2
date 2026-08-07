@@ -1,9 +1,29 @@
 # Mediated service fabric — east–west without a real network
 
-**Status:** Design accepted (D13) — **resolved operator defaults** — **implementation in progress**  
+**Status:** Design accepted (D13) — **implemented + lab verified** (same-node v1)  
 **Date:** 2026-08-07  
 **Related:** [microsandbox.md](./microsandbox.md) §6 Networking, [decisions.md](./decisions.md) D7 + D13, [orchestration-review.md](./orchestration-review.md) §5, [ssh-control-plane.md](./ssh-control-plane.md)  
 **Task / implement plan:** [docs/tasks/service-fabric.md](../tasks/service-fabric.md)
+
+---
+
+## Lab verification (2026-08-07, macOS HVF)
+
+| Case | Result |
+| ---- | ------ |
+| Apply `examples/stacks/smoke-fabric.yaml` | Both instances **Running** |
+| Client → `http://echo.<stack>.svc.mcc:8080/` | **FABRIC_OK** |
+| Client → `http://echo:8080/` (short DNS) | **FABRIC_OK** |
+| Host → `http://127.0.0.1:8080/` (splice) | **FABRIC_OK** |
+| `GET /v1/instances/{id}/fabric` | phase **Ready**, edge Ready |
+| Apply allow without `expose` | Rejected with clear error |
+| Apply `allow.to` unknown service | Rejected with clear error |
+| Unknown fabric name (`nope…svc.mcc`) | **bad address** (no hosts / NX) |
+| Peer without `allow` (echo → client FQDN) | **bad address** |
+| Egress to `10.0.0.1` (private) | **Connection refused** (default policy) |
+| Splice thrash | **1** `fabric edge Ready` log across 15s+ reconciles (reuse) |
+
+**Notes:** Minimal alpine may lack `httpd` applet — smoke stack uses `python:3.12-alpine` + `http.server`. Start agent **after** server is listening (join race).
 
 ---
 
@@ -449,18 +469,36 @@ Ingress **does not** replace fabric. It sits in front of services that already h
 
 ---
 
-## 15. Remaining technical unknowns (not product forks)
+## 15. Cleanliness gate + upstream (resolved for v1)
 
-Product options Q1–Q15 are **resolved**. Left for implement / gate:
+### What we ship (clean enough)
 
-1. **msb API details** for domain-only egress allow + DNS pin that agents can install per sandbox without host/private  
-2. How short-name `db` is presented to the guest resolver (msb alias vs injected search domain) while keeping FQDN canonical  
-3. Userspace splice: idle timeouts, half-close, concurrency limits  
-4. Exact scheduler scoring for “prefer co-locate allow peers”  
-5. Whether whole instance phase stays `Running` when only fabric substatus is `Failed` (lean yes — §7.4)  
-6. Secret injection to fabric FQDN for non-TLS protocols (document msb limits)
+msb has **no** first-class “internal service” destination between sandboxes. Cross-sandbox reachability requires the host path.
 
-If (1) fails the cleanliness gate → **stop and document**; do not ship.
+**v1 implementation (lab-proven):**
+
+1. **Not** `NetworkProfile::Host` or `Private` for fabric.  
+2. **Yes** explicit rules: `Destination::Group(Host)` + **TCP + single service port** only (prepended first-match).  
+3. Guest DNS: inject `fqdn` + short name → **gateway IP** in `/etc/hosts` (`#mcc-fabric` marker).  
+4. Agent userspace L4 splice on `127.0.0.1:<service_port>` → backend msb publish.
+
+This is **narrower than Host profile** (which would open all host ports/protocols). Other host ports remain denied under public default.
+
+### Upstream wishlist (msb)
+
+| Ask | Why |
+| ---- | --- |
+| Synthetic internal names / destinations owned by the gateway | Avoid any Host group for fabric |
+| Domain rules that resolve `*.svc.mcc` without `/etc/hosts` inject | Cleaner DNS UX |
+| First-class peer/publish wiring between sandboxes | Less MCC splice glue |
+
+Track as optional upstream; **do not block** MCC v1 fabric.
+
+### Remaining polish (not blockers)
+
+1. Userspace splice: idle timeouts, concurrency limits  
+2. Secret injection + fabric FQDN for non-TLS (msb limits)  
+3. Force recreate when `allow` ports change (policy is create-time)
 
 ---
 

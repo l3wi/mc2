@@ -62,6 +62,24 @@ curl -s "$MCC_API/v1/status" | jq .
 ./target/debug/mcc apply -f examples/stacks/smoke-secrets.yaml
 ```
 
+### Service fabric (same-node east–west)
+
+Compose-like multi-service connectivity without a flat pod network. Stack declares `expose` (internal listeners) and client `allow` edges; the agent L4-splices and injects DNS (`db.<stack>.svc.mcc`). Design: [service-fabric.md](../research/service-fabric.md).
+
+```bash
+./target/debug/mcc apply -f examples/stacks/smoke-fabric.yaml
+./target/debug/mcc ps
+# Fabric status (agent-reported):
+curl -s "$MCC_API/v1/instances/<client-instance-id>/fabric" | jq .
+
+# From the client sandbox (lab helper):
+cargo run -p mcc-runtime --example msb_shell -- smoke-fabric-client-0 \
+  'wget -qO- http://echo.smoke-fabric.svc.mcc:8080/'
+# expect: FABRIC_OK
+```
+
+**Defaults:** deny east–west until `allow`; same-stack + same-node only; no multi-node fabric yet.
+
 ## Auth-enabled cluster
 
 Omit `--no-auth` on first bootstrap. Save the printed **API token** and **join token**.

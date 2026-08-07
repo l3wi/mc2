@@ -1,8 +1,8 @@
 //! SQLite-backed store (default production backend).
 
 use crate::{
-    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstanceRecord,
-    InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, SecretBlob, SecretMeta,
+    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta, InstanceFabricRecord,
+    InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord, SecretBlob, SecretMeta,
     SshAuthorizedKey, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
@@ -961,6 +961,79 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
         Ok(rows.iter().map(Self::map_instance_ssh).collect())
+    }
+
+    async fn update_instance_fabric_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        observed_json: &str,
+        message: Option<&str>,
+    ) -> Result<InstanceFabricRecord, StoreError> {
+        if self.get_instance(instance_id).await?.is_none() {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO instance_fabric (instance_id, phase, observed_json, message, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(instance_id) DO UPDATE SET
+                 phase = excluded.phase,
+                 observed_json = excluded.observed_json,
+                 message = excluded.message,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(instance_id)
+        .bind(phase)
+        .bind(observed_json)
+        .bind(message)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        self.get_instance_fabric(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+    }
+
+    async fn get_instance_fabric(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceFabricRecord>, StoreError> {
+        let row = sqlx::query(
+            r#"SELECT instance_id, phase, observed_json, message, updated_at
+               FROM instance_fabric WHERE instance_id = ?"#,
+        )
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.map(|r| InstanceFabricRecord {
+            instance_id: r.get("instance_id"),
+            phase: r.get("phase"),
+            observed_json: r.get("observed_json"),
+            message: r.get("message"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError> {
+        let rows = sqlx::query(
+            r#"SELECT instance_id, phase, observed_json, message, updated_at FROM instance_fabric"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows
+            .iter()
+            .map(|r| InstanceFabricRecord {
+                instance_id: r.get("instance_id"),
+                phase: r.get("phase"),
+                observed_json: r.get("observed_json"),
+                message: r.get("message"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 }
 

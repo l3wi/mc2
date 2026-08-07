@@ -24,6 +24,11 @@ microsandbox-network = "0.6.8"
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow = { workspace = true }
+
+[[example]]
+name = "msb_shell"
+required-features = []
 
 [lib]
 name = "mcc_runtime"

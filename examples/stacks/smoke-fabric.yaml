@@ -19,11 +19,12 @@ networks:
 
 services:
   echo:
-    image: alpine:3.20
+    # python image: alpine micro rootfs may lack busybox httpd applet.
+    image: python:3.12-alpine
     replicas: 1
     resources:
       cpus: 1
-      memoryMiB: 128
+      memoryMiB: 256
     network:
       profiles: [public]
     expose:
@@ -32,8 +33,8 @@ services:
     command:
       - /bin/sh
       - -c
-      - "while true; do echo -e 'HTTP/1.1 200 OK\\r\\nContent-Length: 9\\r\\n\\r\\nFABRIC_OK' | nc -l -p 8080; done"
-    restartPolicy: on-failure
+      - "mkdir -p /tmp/www && printf 'FABRIC_OK\\n' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"
+    restartPolicy: always
     labels:
       app: smoke-fabric-echo
 
@@ -50,6 +51,6 @@ services:
         port: 8080
         protocol: tcp
     command: ["sleep", "infinity"]
-    restartPolicy: on-failure
+    restartPolicy: always
     labels:
       app: smoke-fabric-client

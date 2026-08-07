@@ -16,7 +16,9 @@ pub use instance::{InstancePhase, InstanceRecord, StackRecord};
 pub use memory::MemoryStore;
 pub use node::{NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus};
 pub use sqlite::SqliteStore;
-pub use ssh::{ssh_fingerprint, validate_public_key, InstanceSshRecord, SshAuthorizedKey};
+pub use ssh::{
+    ssh_fingerprint, validate_public_key, InstanceFabricRecord, InstanceSshRecord, SshAuthorizedKey,
+};
 pub use token::{hash_token, verify_token, TokenKind};
 
 /// Metadata for a secret (never includes plaintext).
@@ -220,4 +222,20 @@ pub trait Store: Send + Sync {
     ) -> Result<InstanceSshRecord, StoreError>;
 
     async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError>;
+
+    /// Agent ReportStatus: fabric observed snapshot (JSON).
+    async fn update_instance_fabric_observed(
+        &self,
+        instance_id: &str,
+        phase: &str,
+        observed_json: &str,
+        message: Option<&str>,
+    ) -> Result<InstanceFabricRecord, StoreError>;
+
+    async fn get_instance_fabric(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceFabricRecord>, StoreError>;
+
+    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError>;
 }

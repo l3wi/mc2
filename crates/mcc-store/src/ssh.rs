@@ -57,6 +57,18 @@ impl Default for InstanceSshRecord {
     }
 }
 
+/// Agent-reported fabric observed snapshot for one instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceFabricRecord {
+    pub instance_id: String,
+    /// Pending | Ready | Failed | Mixed
+    pub phase: String,
+    pub observed_json: String,
+    pub message: Option<String>,
+    pub updated_at: String,
+}
+
 /// SHA256 fingerprint of an OpenSSH public key line (`SHA256:<hex>`).
 pub fn ssh_fingerprint(public_key: &str) -> String {
     use sha2::{Digest, Sha256};
