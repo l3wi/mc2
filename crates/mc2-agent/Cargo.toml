@@ -1,0 +1,32 @@
+[package]
+name = "mc2-agent"
+description = "MicroCommandControl node agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mc2-api = { workspace = true }
+mc2-runtime = { workspace = true }
+mc2-metrics = { workspace = true }
+anyhow = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+tracing = { workspace = true }
+tonic = { version = "0.12", features = ["transport", "tls", "tls-roots"] }
+http = "1"
+num_cpus = "1"
+# Same SDK as runtime; ssh feature enabled via mc2-runtime (cargo feature unification).
+microsandbox = { version = "0.6.8", features = ["ssh"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[lib]
+name = "mc2_agent"
+path = "src/lib.rs"

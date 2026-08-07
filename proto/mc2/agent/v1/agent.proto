@@ -1,0 +1,181 @@
+// MicroCommandControl agent API (gRPC).
+// Phase 2: implemented with tonic/prost.
+syntax = "proto3";
+
+package mc2.agent.v1;
+
+// Agent control-plane service. Agents call these RPCs against the server.
+service AgentService {
+  // Register a node with a join token; returns node credentials.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Periodic capacity + health report.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Pull desired instance specs for this node (Phase 3+).
+  rpc Sync(SyncRequest) returns (SyncResponse);
+
+  // Report instance phase / errors / resource summary (Phase 3+).
+  rpc ReportStatus(ReportStatusRequest) returns (ReportStatusResponse);
+}
+
+message JoinRequest {
+  string join_token = 1;
+  string node_name = 2;
+  map<string, string> labels = 3;
+  string arch = 4;
+  Capacity capacity = 5;
+}
+
+message JoinResponse {
+  string node_id = 1;
+  // Long-lived node token for Heartbeat/Sync (v1; mTLS later).
+  string node_token = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string node_token = 2;
+  Capacity capacity = 3;
+  string status = 4; // Ready | NotReady | Draining
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+message SyncRequest {
+  string node_id = 1;
+  string node_token = 2;
+}
+
+message SyncResponse {
+  repeated DesiredInstance instances = 1;
+  // Per-node Ingress routes (D7 file catalog). Empty if no stacks declare ingress.
+  repeated IngressRouteDesired ingress_routes = 2;
+}
+
+message ReportStatusRequest {
+  string node_id = 1;
+  string node_token = 2;
+  repeated InstanceStatus instances = 3;
+}
+
+message ReportStatusResponse {
+  bool ok = 1;
+}
+
+message Capacity {
+  uint32 cpus = 1;
+  uint64 memory_mib = 2;
+}
+
+message DesiredInstance {
+  string instance_id = 1;
+  string stack = 2;
+  string service = 3;
+  uint32 ordinal = 4;
+  // Opaque JSON/YAML service spec until typed messages land
+  string spec_json = 5;
+  // Resolved secret injection material (plaintext values; gRPC only to owning agent).
+  repeated SecretInjection secrets = 6;
+  // Host-side SSH serve desired state (resolved public keys).
+  SshDesired ssh = 7;
+  // Mediated service fabric (same-node east–west). D13.
+  FabricDesired fabric = 8;
+}
+
+// Host-side msb secret injection: guest sees placeholder; value for allowlisted hosts.
+message SecretInjection {
+  string env = 1;
+  string value = 2;
+  repeated string allow_hosts = 3;
+}
+
+// Host-side SSH front end (not guest sshd).
+message SshDesired {
+  bool enabled = 1;
+  string bind = 2;
+  uint32 port = 3; // 0 = auto
+  string user = 4;
+  bool sftp = 5;
+  repeated string authorized_public_keys = 6;
+  string config_hash = 7;
+}
+
+message InstanceStatus {
+  string instance_id = 1;
+  string phase = 2; // Pending | Scheduled | Creating | Running | Failed | Stopped
+  string message = 3;
+  string runtime_id = 4;
+  SshObserved ssh = 5;
+  FabricObserved fabric = 6;
+}
+
+message SshObserved {
+  string phase = 1; // Closed | Opening | Open | Failed
+  string bind = 2;
+  uint32 port = 3;
+  string message = 4;
+}
+
+// Desired fabric plan for one instance (built by control plane).
+message FabricDesired {
+  repeated FabricExpose exposes = 1;
+  repeated FabricAllow allows = 2;
+}
+
+message FabricExpose {
+  uint32 guest_port = 1;
+  string protocol = 2;
+}
+
+message FabricAllow {
+  string to_service = 1;
+  uint32 port = 2;
+  string protocol = 3;
+  string fqdn = 4;       // db.<stack>.svc.mc2
+  string short_name = 5; // db
+  string backend_instance_id = 6;
+  string backend_node_id = 7;
+  bool backend_local = 8;
+  uint32 backend_ordinal = 9;
+}
+
+message FabricObserved {
+  repeated FabricExposeStatus exposes = 1;
+  repeated FabricEdgeStatus edges = 2;
+  string message = 3;
+}
+
+message FabricExposeStatus {
+  uint32 guest_port = 1;
+  uint32 host_port = 2;
+  string phase = 3; // Pending | Ready | Failed
+  string message = 4;
+}
+
+message FabricEdgeStatus {
+  string to_service = 1;
+  uint32 port = 2;
+  string phase = 3; // Pending | Ready | Failed
+  string message = 4;
+}
+
+// One HTTP route for BYO Traefik/Caddy file export (same-node, loopback backend).
+message IngressRouteDesired {
+  string id = 1;                 // stable route id
+  string stack = 2;
+  string host = 3;
+  string path = 4;
+  string path_type = 5;          // Prefix | Exact
+  string service = 6;
+  uint32 guest_port = 7;
+  uint32 host_port = 8;          // from ports[].host
+  string bind = 9;               // 127.0.0.1
+  bool tls_enabled = 10;
+  string cert_resolver = 11;
+  string caddy_tls = 12;         // auto | internal | off
+  string backend_instance_id = 13;
+  uint32 backend_ordinal = 14;
+}

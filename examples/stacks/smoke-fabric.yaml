@@ -1,11 +1,11 @@
-# Same-node mediated fabric (D13): echo server + client via db.shop.svc.mcc DNS.
+# Same-node mediated fabric (D13): echo server + client via db.shop.svc.mc2 DNS.
 #
-#   mcc apply -f examples/stacks/smoke-fabric.yaml
+#   mc2 apply -f examples/stacks/smoke-fabric.yaml
 #
-# After both Running: from the `client` sandbox (or via mcc exec when available),
-#   wget -qO- http://echo.smoke-fabric.svc.mcc:8080/
+# After both Running: from the `client` sandbox (or via mc2 exec when available),
+#   wget -qO- http://echo.smoke-fabric.svc.mc2:8080/
 # should hit the `echo` service through the agent L4 splice.
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: smoke-fabric

@@ -27,14 +27,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mcc-linux-amd64
+            artifact: mc2-linux-amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mcc-linux-arm64
+            artifact: mc2-linux-arm64
             use_cross: true
           - target: aarch64-apple-darwin
             os: macos-14
-            artifact: mcc-darwin-arm64
+            artifact: mc2-darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -58,14 +58,14 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build -p mcc --release --target ${{ matrix.target }}
+            cross build -p mc2 --release --target ${{ matrix.target }}
           else
-            cargo build -p mcc --release --target ${{ matrix.target }}
+            cargo build -p mc2 --release --target ${{ matrix.target }}
           fi
-          BIN="target/${{ matrix.target }}/release/mcc"
+          BIN="target/${{ matrix.target }}/release/mc2"
           if [[ ! -f "$BIN" ]]; then
             # cross may place under target/ without nested path in some setups
-            BIN="target/release/mcc"
+            BIN="target/release/mc2"
           fi
           cp "$BIN" "${{ matrix.artifact }}"
           chmod +x "${{ matrix.artifact }}"

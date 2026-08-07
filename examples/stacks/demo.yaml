@@ -1,8 +1,8 @@
 # Example stack for MicroCommandControl (small alpine image for quick pulls).
-# Apply: mcc apply -f examples/stacks/demo.yaml --token <api-token>
+# Apply: mc2 apply -f examples/stacks/demo.yaml --token <api-token>
 #
 # alpine's busybox httpd serves files from / (demo page is the filesystem listing).
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: demo
@@ -25,7 +25,7 @@ services:
       profiles: [public]
     env:
       APP_ENV: lab
-    # Cluster secrets (set with `mcc secret set NAME --value …`), then reference:
+    # Cluster secrets (set with `mc2 secret set NAME --value …`), then reference:
     # secrets:
     #   - name: GITHUB_TOKEN
     #     env: GITHUB_TOKEN
@@ -42,4 +42,14 @@ services:
       app: web
 
 # volumes: {}
-# ingress:  # reserved — not implemented in MVP
+# Optional north–south HTTP via BYO Traefik/Caddy (agent --ingress-config-dir):
+# ingress:
+#   tls:
+#     enabled: true
+#     caddyTls: internal
+#   rules:
+#     - host: demo.local
+#       paths:
+#         - path: /
+#           service: web
+#           port: 8000

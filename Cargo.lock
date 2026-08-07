@@ -3027,16 +3027,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
-name = "mcc"
+name = "mc2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "mcc-agent",
- "mcc-api",
- "mcc-metrics",
- "mcc-server",
- "mcc-store",
+ "mc2-agent",
+ "mc2-api",
+ "mc2-metrics",
+ "mc2-server",
+ "mc2-store",
  "reqwest 0.12.28",
  "serde_json",
  "tempfile",
@@ -3046,24 +3046,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-agent"
+name = "mc2-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "http",
- "mcc-api",
- "mcc-metrics",
- "mcc-runtime",
+ "mc2-api",
+ "mc2-metrics",
+ "mc2-runtime",
  "microsandbox",
  "num_cpus",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tonic 0.12.3",
  "tracing",
 ]
 
 [[package]]
-name = "mcc-api"
+name = "mc2-api"
 version = "0.1.0"
 dependencies = [
  "prost 0.13.5",
@@ -3076,7 +3078,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-metrics"
+name = "mc2-metrics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3087,12 +3089,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-runtime"
+name = "mc2-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "mcc-api",
+ "mc2-api",
  "microsandbox",
  "microsandbox-network",
  "serde",
@@ -3105,7 +3107,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-server"
+name = "mc2-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3114,9 +3116,9 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
- "mcc-api",
- "mcc-metrics",
- "mcc-store",
+ "mc2-api",
+ "mc2-metrics",
+ "mc2-store",
  "rand 0.8.7",
  "rcgen 0.13.2",
  "serde",
@@ -3132,7 +3134,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-store"
+name = "mc2-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3152,15 +3154,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcc-tests"
+name = "mc2-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
- "mcc-api",
- "mcc-runtime",
- "mcc-server",
- "mcc-store",
+ "mc2-api",
+ "mc2-runtime",
+ "mc2-server",
+ "mc2-store",
  "reqwest 0.12.28",
  "serde_json",
  "tempfile",

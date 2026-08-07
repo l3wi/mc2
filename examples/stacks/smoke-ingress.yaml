@@ -1,0 +1,45 @@
+# Same-node Ingress smoke: publish ports: + stack ingress: → agent file catalog.
+# Agent: mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
+# Proxy: see examples/ingress/README.md
+#
+# Apply: mc2 apply -f examples/stacks/smoke-ingress.yaml
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: smoke-ingress
+  labels:
+    env: lab
+
+services:
+  web:
+    image: python:3.12-alpine
+    replicas: 1
+    resources:
+      cpus: 1
+      memoryMiB: 128
+    ports:
+      - host: 18080
+        guest: 8000
+        protocol: tcp
+        # bind defaults to 127.0.0.1 (required for Ingress v1)
+    network:
+      profiles: [public]
+    restartPolicy: on-failure
+    command: ["python", "-m", "http.server", "8000"]
+    labels:
+      app: web
+
+ingress:
+  tls:
+    enabled: true
+    # Traefik static config must define this resolver (or set enabled: false for :80 only)
+    certResolver: le
+    # Caddy: internal CA for lab (no public DNS)
+    caddyTls: internal
+  rules:
+    - host: smoke-ingress.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+          port: 8000

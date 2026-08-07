@@ -2,7 +2,7 @@
 //!
 //! Covers Phase 1 exit criteria: server listens; bearer auth on `/v1/status`.
 
-use mcc_tests::TestCluster;
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn health_is_public() {
     let (status, body) = cluster.get_json("/health", None).await.unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["service"], "mcc-server");
+    assert_eq!(body["service"], "mc2-server");
 }
 
 #[tokio::test]
@@ -32,7 +32,7 @@ async fn status_requires_valid_bearer() {
         .await
         .unwrap();
     assert_eq!(ok, StatusCode::OK);
-    assert_eq!(body["api_version"], "mcc/v1");
+    assert_eq!(body["api_version"], "mc2/v1");
     assert_eq!(body["nodes_total"], 0);
     assert!(body.get("version").is_some());
 }

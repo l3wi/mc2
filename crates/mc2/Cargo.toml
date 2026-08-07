@@ -1,0 +1,30 @@
+[package]
+name = "mc2"
+description = "MicroCommandControl — dual-mode CLI (server | agent | operator commands)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mc2"
+path = "src/main.rs"
+
+[dependencies]
+mc2-server = { workspace = true }
+mc2-agent = { workspace = true }
+mc2-api = { workspace = true }
+mc2-store = { workspace = true }
+mc2-metrics = { workspace = true }
+# SecretMeta type for CLI list parsing
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,10 +3,10 @@
 //! CI does not boot microVMs. These tests exercise the same control-plane path a
 //! real agent uses before `Sandbox::create_detached` (set → apply → Sync secrets).
 
-use mcc_api::agent::agent_service_client::AgentServiceClient;
-use mcc_api::agent::{Capacity, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest};
-use mcc_runtime::desired_from_sync;
-use mcc_tests::TestCluster;
+use mc2_api::agent::agent_service_client::AgentServiceClient;
+use mc2_api::agent::{Capacity, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest};
+use mc2_runtime::desired_from_sync;
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ const SECRET_ENV: &str = "API_TOKEN";
 const ALLOW_HOST: &str = "api.example.com";
 
 const STACK_WITH_SECRET: &str = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: smoke-secrets
@@ -199,6 +199,7 @@ async fn secret_reaches_agent_sync_for_sandbox() {
                 message: "secrets smoke (injection material verified; no hypervisor)".into(),
                 runtime_id: work[0].runtime_id.clone(),
                 ssh: None,
+                fabric: None,
             }],
         })
         .await
@@ -222,7 +223,7 @@ async fn sync_fails_when_secret_missing() {
     let (mut agent, node_id, node_token) = join_worker(&cluster).await;
 
     let yaml = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: sec-missing
@@ -289,7 +290,7 @@ async fn sync_fails_when_allow_hosts_empty() {
     assert_eq!(put.status(), StatusCode::OK);
 
     let yaml = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: sec-empty-hosts

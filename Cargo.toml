@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mcc",
-    "crates/mcc-server",
-    "crates/mcc-agent",
-    "crates/mcc-api",
-    "crates/mcc-store",
-    "crates/mcc-runtime",
-    "crates/mcc-metrics",
+    "crates/mc2",
+    "crates/mc2-server",
+    "crates/mc2-agent",
+    "crates/mc2-api",
+    "crates/mc2-store",
+    "crates/mc2-runtime",
+    "crates/mc2-metrics",
     "tests",
 ]
 
@@ -15,18 +15,18 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/placeholder/mcc"
-authors = ["MCC contributors"]
+repository = "https://github.com/placeholder/mc2"
+authors = ["MC2 contributors"]
 # microsandbox 0.6.x / smoltcp need a recent stable (1.91+).
 rust-version = "1.91"
 
 [workspace.dependencies]
-mcc-api = { path = "crates/mcc-api" }
-mcc-store = { path = "crates/mcc-store" }
-mcc-server = { path = "crates/mcc-server" }
-mcc-agent = { path = "crates/mcc-agent" }
-mcc-runtime = { path = "crates/mcc-runtime" }
-mcc-metrics = { path = "crates/mcc-metrics" }
+mc2-api = { path = "crates/mc2-api" }
+mc2-store = { path = "crates/mc2-store" }
+mc2-server = { path = "crates/mc2-server" }
+mc2-agent = { path = "crates/mc2-agent" }
+mc2-runtime = { path = "crates/mc2-runtime" }
+mc2-metrics = { path = "crates/mc2-metrics" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

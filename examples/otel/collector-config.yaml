@@ -1,7 +1,7 @@
-# OpenTelemetry Collector example for MCC + microsandbox (msb-metrics).
+# OpenTelemetry Collector example for MC2 + microsandbox (msb-metrics).
 #
-# MCC (server/agent) exports control-plane metrics when:
-#   export MCC_OTLP_ENDPOINT=http://127.0.0.1:4317
+# MC2 (server/agent) exports control-plane metrics when:
+#   export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 #   # or OTEL_EXPORTER_OTLP_ENDPOINT
 #
 # Sandbox CPU/mem/net stay on msb-metrics / msb — point that sidecar at the
@@ -26,11 +26,11 @@ receivers:
 processors:
   batch:
     timeout: 5s
-  # Attribute service.name: mcc-server | mcc-agent | msb-metrics
+  # Attribute service.name: mc2-server | mc2-agent | msb-metrics
   resource:
     attributes:
       - key: collector
-        value: mcc-lab
+        value: mc2-lab
         action: upsert
 
 exporters:
@@ -40,7 +40,7 @@ exporters:
   # Optional: Prometheus scrape endpoint for Grafana
   prometheus:
     endpoint: 0.0.0.0:8889
-    namespace: mcc_lab
+    namespace: mc2_lab
   # Optional: remote OTLP backend
   # otlp:
   #   endpoint: otlp.example.com:4317

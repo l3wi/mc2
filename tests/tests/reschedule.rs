@@ -1,12 +1,12 @@
 //! Integration: node NotReady → non-sticky instance rescheduled to another Ready node.
 
-use mcc_api::agent::agent_service_client::AgentServiceClient;
-use mcc_api::agent::{
+use mc2_api::agent::agent_service_client::AgentServiceClient;
+use mc2_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
-use mcc_server::reschedule_not_ready;
-use mcc_store::Store;
-use mcc_tests::TestCluster;
+use mc2_server::reschedule_not_ready;
+use mc2_store::Store;
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +51,7 @@ async fn not_ready_node_reschedules_to_peer() {
     let mut b = join(&cluster, "worker-b").await;
 
     let yaml = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: resched
@@ -150,6 +150,7 @@ services:
                 message: "reschedule harness".into(),
                 runtime_id: "resched-web-0".into(),
                 ssh: None,
+                fabric: None,
             }],
         })
         .await
@@ -165,7 +166,7 @@ async fn sticky_volume_stays_on_not_ready_node() {
     let mut b = join(&cluster, "sticky-b").await;
 
     let yaml = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: sticky

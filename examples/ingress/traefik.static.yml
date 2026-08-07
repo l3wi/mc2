@@ -1,0 +1,33 @@
+# Operator-owned Traefik static config (not written by MC2).
+# Point file provider at the agent --ingress-config-dir/traefik directory.
+#
+# Example:
+#   mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
+#   traefik --configFile=examples/ingress/traefik.static.yml
+#
+# Adjust ACME email / disable TLS entrypoint for pure lab HTTP.
+
+entryPoints:
+  web:
+    address: ":8088"
+  websecure:
+    address: ":8443"
+
+# Optional ACME (public hosts only). For lab, prefer HTTP-only routers
+# (set ingress.tls.enabled: false in stack YAML) or use Caddy tls internal.
+certificatesResolvers:
+  le:
+    acme:
+      email: you@example.com
+      storage: /tmp/traefik-acme.json
+      httpChallenge:
+        entryPoint: web
+
+providers:
+  file:
+    directory: /tmp/mc2-ingress/traefik
+    watch: true
+
+api:
+  dashboard: true
+  insecure: true

@@ -1,9 +1,9 @@
 //! Integration: SSH key registry + instance open/close via REST API.
 
-use mcc_tests::TestCluster;
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 
-const FAKE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJustAFakeKeyMaterialHere0000 test@mcc";
+const FAKE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJustAFakeKeyMaterialHere0000 test@mc2";
 
 #[tokio::test]
 async fn ssh_key_put_list_delete() {
@@ -55,8 +55,8 @@ async fn ssh_key_put_list_delete() {
 
 #[tokio::test]
 async fn instance_ssh_put_requires_keys_and_can_close() {
-    use mcc_api::agent::agent_service_client::AgentServiceClient;
-    use mcc_api::agent::{Capacity, JoinRequest};
+    use mc2_api::agent::agent_service_client::AgentServiceClient;
+    use mc2_api::agent::{Capacity, JoinRequest};
     use std::collections::HashMap;
 
     let cluster = TestCluster::start().await.expect("start");
@@ -91,7 +91,7 @@ async fn instance_ssh_put_requires_keys_and_can_close() {
         .unwrap();
 
     let yaml = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: sshdemo

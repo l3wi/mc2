@@ -6,9 +6,9 @@
 //! See [docs/guides/testing.md](../docs/guides/testing.md).
 
 use anyhow::{Context, Result};
-use mcc_api::agent::agent_service_server::AgentServiceServer;
-use mcc_server::{router, AgentSvc, AppState, Bootstrap};
-use mcc_store::{SecretsKey, SqliteStore, Store};
+use mc2_api::agent::agent_service_server::AgentServiceServer;
+use mc2_server::{router, AgentSvc, AppState, Bootstrap};
+use mc2_store::{SecretsKey, SqliteStore, Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

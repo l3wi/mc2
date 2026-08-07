@@ -3,16 +3,16 @@
 //! Does not start microVMs (no hypervisor in CI). Agent status is reported over gRPC
 //! the same way a real agent would after SDK reconcile.
 
-use mcc_api::agent::agent_service_client::AgentServiceClient;
-use mcc_api::agent::{
+use mc2_api::agent::agent_service_client::AgentServiceClient;
+use mc2_api::agent::{
     Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
 };
-use mcc_tests::TestCluster;
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 use std::collections::HashMap;
 
 const DEMO: &str = r#"
-apiVersion: mcc/v1
+apiVersion: mc2/v1
 kind: Stack
 metadata:
   name: demo
@@ -80,13 +80,14 @@ async fn apply_schedules_and_agent_marks_running() {
         .instances
         .iter()
         .map(|d| {
-            let rid = mcc_runtime::sandbox_name(&d.stack, &d.service, d.ordinal);
+            let rid = mc2_runtime::sandbox_name(&d.stack, &d.service, d.ordinal);
             InstanceStatus {
                 instance_id: d.instance_id.clone(),
                 phase: "Running".into(),
                 message: "test harness (no hypervisor)".into(),
                 runtime_id: rid,
                 ssh: None,
+                fabric: None,
             }
         })
         .collect();

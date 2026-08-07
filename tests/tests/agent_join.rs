@@ -1,8 +1,8 @@
 //! Integration: agent gRPC Join/Heartbeat + REST `/v1/nodes`.
 
-use mcc_api::agent::agent_service_client::AgentServiceClient;
-use mcc_api::agent::{Capacity, HeartbeatRequest, JoinRequest};
-use mcc_tests::TestCluster;
+use mc2_api::agent::agent_service_client::AgentServiceClient;
+use mc2_api::agent::{Capacity, HeartbeatRequest, JoinRequest};
+use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ async fn join_then_list_nodes_ready() {
         .into_inner();
 
     assert!(!join.node_id.is_empty());
-    assert!(join.node_token.starts_with("mccnt_"));
+    assert!(join.node_token.starts_with("mc2nt_"));
 
     let hb = client
         .heartbeat(HeartbeatRequest {
