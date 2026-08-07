@@ -4,6 +4,14 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Stack YAML defaults (DX)
+
+- `mc2 apply` fills missing boilerplate before sending: `apiVersion`
+  (`mc2/v1`), `kind` (`Stack`), and `metadata.name` (sanitized file stem).
+  Partial files — even `services:` + `image:` only — now apply. Present values
+  are never rewritten; complete files pass through verbatim (comments kept).
+  Documented in `examples/README.md`.
+
 ### Persistent volumes (v1)
 
 - Stack YAML `volumes:` are now validated: mounts must reference declared

@@ -170,7 +170,8 @@ struct DoctorArgs {
 
 #[derive(Debug, Parser)]
 struct ApplyArgs {
-    /// Path to stack YAML
+    /// Path to stack YAML. Boilerplate is optional: apiVersion, kind, and
+    /// metadata.name (defaults to the file name) are filled in when missing.
     #[arg(short = 'f', long = "file")]
     file: String,
 
@@ -610,8 +611,8 @@ fn urlencoding_simple(s: &str) -> String {
 
 async fn apply_cmd(args: ApplyArgs) -> Result<()> {
     // Token optional when server was bootstrapped with --no-auth.
-    let yaml =
-        std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
+    let raw = std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
+    let yaml = fill_stack_defaults(&raw, &args.file);
     let url = format!("{}/v1/stacks:apply", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let res = operator_post(&client, &url, args.op.token.as_deref())
@@ -626,6 +627,104 @@ async fn apply_cmd(args: ApplyArgs) -> Result<()> {
     }
     println!("{body}");
     Ok(())
+}
+
+/// Fill omissible boilerplate for local DX: `apiVersion`, `kind`, and
+/// `metadata.name` (derived from the file name). Only missing fields are
+/// filled; present values are never rewritten (wrong values still fail server
+/// validation loudly). Non-YAML or non-mapping input passes through for the
+/// server to reject. Note: filling re-serializes the document, dropping YAML
+/// comments — complete documents are returned verbatim.
+fn fill_stack_defaults(raw: &str, file_path: &str) -> String {
+    let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
+        return raw.to_string();
+    };
+    let Some(map) = doc.as_mapping_mut() else {
+        return raw.to_string();
+    };
+    let mut changed = ensure_scalar(map, "apiVersion", mc2_api::API_VERSION);
+    changed |= ensure_scalar(map, "kind", "Stack");
+    changed |= ensure_stack_name(map, file_path);
+    if changed {
+        serde_yaml::to_string(&doc).unwrap_or_else(|_| raw.to_string())
+    } else {
+        raw.to_string()
+    }
+}
+
+fn ensure_scalar(map: &mut serde_yaml::Mapping, key: &str, value: &str) -> bool {
+    let key = serde_yaml::Value::String(key.into());
+    if map
+        .get(&key)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return false;
+    }
+    map.insert(key, serde_yaml::Value::String(value.into()));
+    true
+}
+
+fn ensure_stack_name(map: &mut serde_yaml::Mapping, file_path: &str) -> bool {
+    let meta_key = serde_yaml::Value::String("metadata".into());
+    let name_key = serde_yaml::Value::String("name".into());
+    let has_name = |meta: &serde_yaml::Mapping| {
+        meta.get(&name_key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    match map.get_mut(&meta_key) {
+        Some(serde_yaml::Value::Mapping(meta)) => {
+            if has_name(meta) {
+                return false;
+            }
+            meta.insert(
+                name_key,
+                serde_yaml::Value::String(stack_name_from_path(file_path)),
+            );
+            true
+        }
+        // metadata present but malformed: leave it for server validation.
+        Some(_) => false,
+        None => {
+            let mut meta = serde_yaml::Mapping::new();
+            meta.insert(
+                name_key,
+                serde_yaml::Value::String(stack_name_from_path(file_path)),
+            );
+            map.insert(meta_key, serde_yaml::Value::Mapping(meta));
+            true
+        }
+    }
+}
+
+/// Sanitized file stem as a stack name: lowercase, volume-safe charset, no
+/// `--` (the volume namespace separator).
+fn stack_name_from_path(file_path: &str) -> String {
+    let stem = std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("stack");
+    let mut out: String = stem
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "stack".into()
+    } else {
+        out
+    }
 }
 
 async fn ps_cmd(args: OperatorArgs) -> Result<()> {
@@ -711,5 +810,40 @@ mod tests {
     #[test]
     fn cli_parses_help() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn minimal_stack_gets_boilerplate_and_passes_validation() {
+        let raw = "services:\n  web:\n    image: alpine:3.20\n";
+        let filled = fill_stack_defaults(raw, "demo.yaml");
+        let doc = mc2_api::parse_stack_yaml(&filled).unwrap();
+        assert_eq!(doc.metadata.name, "demo");
+        assert_eq!(doc.api_version, mc2_api::API_VERSION);
+        assert_eq!(doc.kind, "Stack");
+    }
+
+    #[test]
+    fn complete_stack_passes_through_verbatim() {
+        let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata:\n  name: x\nservices:\n  web:\n    image: alpine:3.20\n";
+        assert_eq!(fill_stack_defaults(raw, "whatever.yaml"), raw);
+    }
+
+    #[test]
+    fn metadata_without_name_gets_file_stem() {
+        let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata: {}\nservices:\n  web:\n    image: alpine:3.20\n";
+        let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(raw, "My Stack!.yaml")).unwrap();
+        assert_eq!(doc.metadata.name, "my-stack");
+    }
+
+    #[test]
+    fn wrong_api_version_is_left_for_server() {
+        let raw = "apiVersion: wrong/v9\nkind: Stack\nmetadata:\n  name: x\nservices:\n  web:\n    image: alpine\n";
+        assert_eq!(fill_stack_defaults(raw, "x.yaml"), raw);
+    }
+
+    #[test]
+    fn invalid_yaml_passes_through() {
+        let raw = "not: [valid";
+        assert_eq!(fill_stack_defaults(raw, "x.yaml"), raw);
     }
 }
