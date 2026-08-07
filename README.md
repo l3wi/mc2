@@ -62,7 +62,7 @@ just test-integration
 | `mcc secret set\|ls\|rm` | Cluster secrets (encrypted; values never listed) |
 | `mcc ps` | List instances / phases |
 | `mcc doctor` | Host / msb readiness checks |
-| `mcc ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (agent: `MCC_SSH_BACKEND`) |
+| `mcc ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (agent serves via microsandbox SDK) |
 
 One dual-mode binary for operators and nodes.
 

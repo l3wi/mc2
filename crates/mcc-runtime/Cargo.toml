@@ -16,8 +16,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
-# Official microsandbox Rust SDK (libkrun embed) — not the msb CLI.
-microsandbox = "0.6.8"
+# Official microsandbox Rust SDK (libkrun embed). `ssh` = in-process host SSH serve.
+microsandbox = { version = "0.6.8", features = ["ssh"] }
 
 [dev-dependencies]
 tempfile = "3"

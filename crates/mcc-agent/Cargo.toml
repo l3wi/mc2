@@ -14,11 +14,13 @@ mcc-metrics = { workspace = true }
 anyhow = { workspace = true }
 
 clap = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
 tracing = { workspace = true }
 tonic = { version = "0.12", features = ["transport", "tls", "tls-roots"] }
 http = "1"
 num_cpus = "1"
+# Same SDK as runtime; ssh feature enabled via mcc-runtime (cargo feature unification).
+microsandbox = { version = "0.6.8", features = ["ssh"] }
 
 [lib]
 name = "mcc_agent"

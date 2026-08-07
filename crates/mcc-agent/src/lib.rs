@@ -14,7 +14,7 @@ mod ssh_serve;
 use mcc_runtime::{
     backoff_secs, default_runtime, desired_from_sync, NodeRuntime, RestartPolicy, SandboxPhase,
 };
-use ssh_serve::{SshBackend, SshServeConfig, SshServeTable};
+use ssh_serve::SshServeTable;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,24 +70,6 @@ pub struct AgentArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// How this agent opens host SSH for instances: `auto` | `msb-cli` | `disabled` | `sdk`
-    ///
-    /// - `auto` (default): use msb CLI when `msb ssh` exists, else report Failed with a hint  
-    /// - `msb-cli`: require `msb ssh serve` / `authorize`  
-    /// - `disabled`: never open listeners (CP still tracks keys/desired)  
-    /// - `sdk`: in-process microsandbox SSH (not available until upstream deps resolve)
-    #[arg(
-        long,
-        default_value = "auto",
-        env = "MCC_SSH_BACKEND",
-        value_name = "MODE"
-    )]
-    pub ssh_backend: String,
-
-    /// Path to `msb` binary for `msb-cli` / `auto` SSH backend (default: `msb` on PATH)
-    #[arg(long, env = "MCC_MSB_BIN", default_value = "msb")]
-    pub msb_bin: PathBuf,
-
     /// Log and exit without connecting
     #[arg(long, hide = true)]
     pub dry_run: bool,
@@ -103,20 +85,12 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     let runtime: Arc<dyn NodeRuntime> = Arc::new(default_runtime());
 
-    let ssh_backend = SshBackend::parse(&args.ssh_backend)
-        .map_err(|e| anyhow::anyhow!("--ssh-backend / MCC_SSH_BACKEND: {e}"))?;
-    let ssh_cfg = SshServeConfig {
-        backend: ssh_backend,
-        msb_bin: args.msb_bin.clone(),
-    };
-
     info!(
         node = %name,
         server = ?args.server,
         has_token = args.token.is_some(),
         runtime = "microsandbox-sdk",
-        ssh_backend = ssh_backend.as_str(),
-        msb_bin = %args.msb_bin.display(),
+        ssh = "sdk",
         api = mcc_api::API_VERSION,
         "MicroCommandControl agent starting"
     );
@@ -172,7 +146,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     // Track runtime ids we created so we can GC on scale-down.
     let mut owned: HashSet<String> = HashSet::new();
     let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
-    let mut ssh_table = SshServeTable::new(ssh_cfg);
+    let mut ssh_table = SshServeTable::new();
 
     if let Err(e) = reconcile(
         &mut client,
@@ -424,7 +398,7 @@ async fn reconcile(
     }
 
     let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
-    ssh_table.close_missing(&keep_ids);
+    ssh_table.close_missing(&keep_ids).await;
 
     if reports.is_empty() {
         return Ok(());
@@ -591,8 +565,6 @@ mod tests {
             cpus: None,
             memory_mib: None,
             labels: vec![],
-            ssh_backend: "auto".into(),
-            msb_bin: std::path::PathBuf::from("msb"),
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

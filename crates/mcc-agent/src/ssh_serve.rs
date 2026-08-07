@@ -1,140 +1,37 @@
-//! Host-side SSH serve for instances — backend is **configurable**.
+//! Host-side SSH serve for instances via the **microsandbox SDK only**.
 //!
-//! | Backend | Behavior |
-//! | ------- | -------- |
-//! | `auto` | Use `msb-cli` when `msb ssh` is available; otherwise report Failed with config hint |
-//! | `msb-cli` | Always spawn `msb ssh serve` (require capable CLI) |
-//! | `disabled` | Never open listeners; desired SSH stays Closed/Failed with message |
-//! | `sdk` | Reserved — in-process microsandbox `ssh` feature (blocked on crates.io today) |
-//!
-//! Configure on the agent:
-//!   `--ssh-backend auto|msb-cli|disabled|sdk`  or  `MCC_SSH_BACKEND`
-//!   `--msb-bin PATH`  or  `MCC_MSB_BIN`  (default: `msb` on PATH)
+//! No `msb` CLI subprocess. Uses `Sandbox::ssh().server_with(...).serve(stream)`
+//! over a host TCP listener (default bind 127.0.0.1, auto port when port=0).
 
 use mcc_api::agent::SshObserved;
 use mcc_runtime::DesiredSandbox;
+use microsandbox::Sandbox;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
-
-/// How this agent materializes host SSH endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SshBackend {
-    /// Prefer msb CLI when it supports `ssh`; otherwise fail with a clear hint.
-    #[default]
-    Auto,
-    /// Require `msb ssh serve` / `authorize`.
-    MsbCli,
-    /// Do not open SSH (control plane still tracks desired keys/ports).
-    Disabled,
-    /// In-process SDK (not available until microsandbox `ssh` feature resolves).
-    Sdk,
-}
-
-impl SshBackend {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "msb-cli" | "msb_cli" | "msb" | "cli" => Ok(Self::MsbCli),
-            "disabled" | "off" | "none" => Ok(Self::Disabled),
-            "sdk" | "inprocess" | "embedded" => Ok(Self::Sdk),
-            other => Err(format!(
-                "unknown ssh backend {other:?} (want auto|msb-cli|disabled|sdk)"
-            )),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::MsbCli => "msb-cli",
-            Self::Disabled => "disabled",
-            Self::Sdk => "sdk",
-        }
-    }
-}
-
-/// Agent-side SSH serve configuration.
-#[derive(Debug, Clone)]
-pub struct SshServeConfig {
-    pub backend: SshBackend,
-    /// Binary used for `msb-cli` backend (default `msb`).
-    pub msb_bin: PathBuf,
-}
-
-impl Default for SshServeConfig {
-    fn default() -> Self {
-        Self {
-            backend: SshBackend::Auto,
-            msb_bin: PathBuf::from("msb"),
-        }
-    }
-}
 
 struct ActiveServe {
     config_hash: String,
     bind: String,
     port: u16,
-    child: Mutex<Option<Child>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    join: JoinHandle<()>,
 }
 
-/// Per-agent map of instance_id → SSH listener process.
+/// Per-agent map of instance_id → in-process SSH accept loop.
+#[derive(Default)]
 pub struct SshServeTable {
-    cfg: SshServeConfig,
     active: HashMap<String, ActiveServe>,
-    /// Cached capability probe for configured msb binary.
-    msb_ssh_ok: Option<bool>,
 }
 
 impl SshServeTable {
-    pub fn new(cfg: SshServeConfig) -> Self {
-        info!(
-            backend = cfg.backend.as_str(),
-            msb_bin = %cfg.msb_bin.display(),
-            "ssh serve config"
-        );
-        Self {
-            cfg,
-            active: HashMap::new(),
-            msb_ssh_ok: None,
-        }
-    }
-
-    fn msb_supports_ssh(&mut self) -> bool {
-        if let Some(ok) = self.msb_ssh_ok {
-            return ok;
-        }
-        let ok = Command::new(&self.cfg.msb_bin)
-            .args(["ssh", "--help"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        self.msb_ssh_ok = Some(ok);
-        if !ok {
-            warn!(
-                msb_bin = %self.cfg.msb_bin.display(),
-                "msb binary has no `ssh` subcommand — set MCC_SSH_BACKEND=disabled or upgrade msb / use a path that supports SSH"
-            );
-        }
-        ok
-    }
-
-    fn effective_backend(&mut self) -> SshBackend {
-        match self.cfg.backend {
-            SshBackend::Auto => {
-                if self.msb_supports_ssh() {
-                    SshBackend::MsbCli
-                } else {
-                    SshBackend::Disabled
-                }
-            }
-            other => other,
-        }
+    pub fn new() -> Self {
+        info!("ssh serve: microsandbox SDK (in-process)");
+        Self::default()
     }
 
     pub async fn reconcile(
@@ -147,7 +44,7 @@ impl SshServeTable {
             && !desired.ssh.authorized_public_keys.is_empty();
 
         if !want {
-            self.close(&desired.instance_id);
+            self.close(&desired.instance_id).await;
             return SshObserved {
                 phase: "Closed".into(),
                 bind: String::new(),
@@ -162,98 +59,32 @@ impl SshServeTable {
             };
         }
 
-        let backend = self.effective_backend();
-        match backend {
-            SshBackend::Disabled => {
-                self.close(&desired.instance_id);
-                let msg = if self.cfg.backend == SshBackend::Auto {
-                    format!(
-                        "ssh backend=auto: {} has no `ssh` subcommand (set MCC_SSH_BACKEND=msb-cli after upgrading msb, or MCC_SSH_BACKEND=disabled)",
-                        self.cfg.msb_bin.display()
-                    )
-                } else {
-                    "ssh backend=disabled on this agent".into()
-                };
-                SshObserved {
-                    phase: "Failed".into(),
-                    bind: String::new(),
-                    port: 0,
-                    message: msg,
-                }
-            }
-            SshBackend::Sdk => {
-                self.close(&desired.instance_id);
-                SshObserved {
-                    phase: "Failed".into(),
-                    bind: String::new(),
-                    port: 0,
-                    message: "ssh backend=sdk not available (microsandbox crate ssh feature blocked on crates.io; use msb-cli or wait for upstream)".into(),
-                }
-            }
-            SshBackend::MsbCli | SshBackend::Auto => {
-                // Auto already resolved to MsbCli when capable; if forced MsbCli, re-check.
-                if backend == SshBackend::MsbCli && !self.msb_supports_ssh() {
-                    self.close(&desired.instance_id);
-                    return SshObserved {
-                        phase: "Failed".into(),
-                        bind: String::new(),
-                        port: 0,
-                        message: format!(
-                            "ssh backend=msb-cli but {} lacks `ssh` (upgrade msb or set MCC_MSB_BIN / MCC_SSH_BACKEND)",
-                            self.cfg.msb_bin.display()
-                        ),
-                    };
-                }
-                self.reconcile_msb_cli(desired).await
-            }
-        }
-    }
-
-    async fn reconcile_msb_cli(&mut self, desired: &DesiredSandbox) -> SshObserved {
         if let Some(active) = self.active.get(&desired.instance_id) {
-            if active.config_hash == desired.ssh.config_hash {
-                let alive = process_alive(&active.child);
-                if alive {
-                    return SshObserved {
-                        phase: "Open".into(),
-                        bind: active.bind.clone(),
-                        port: u32::from(active.port),
-                        message: format!("msb-cli ({})", self.cfg.msb_bin.display()),
-                    };
-                }
-                warn!(
-                    instance = %desired.instance_id,
-                    "msb ssh serve process exited; will restart"
-                );
+            if active.config_hash == desired.ssh.config_hash && !active.join.is_finished() {
+                return SshObserved {
+                    phase: "Open".into(),
+                    bind: active.bind.clone(),
+                    port: u32::from(active.port),
+                    message: "sdk".into(),
+                };
             }
-            self.close(&desired.instance_id);
+            self.close(&desired.instance_id).await;
         }
 
-        match start_serve_msb(&self.cfg.msb_bin, desired) {
+        match start_serve_sdk(desired).await {
             Ok(active) => {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                if !process_alive(&active.child) {
-                    warn!(instance = %desired.instance_id, "msb ssh serve exited immediately");
-                    return SshObserved {
-                        phase: "Failed".into(),
-                        bind: String::new(),
-                        port: 0,
-                        message:
-                            "msb ssh serve exited immediately (check sandbox name / msb version)"
-                                .into(),
-                    };
-                }
                 let obs = SshObserved {
                     phase: "Open".into(),
                     bind: active.bind.clone(),
                     port: u32::from(active.port),
-                    message: format!("msb-cli ({})", self.cfg.msb_bin.display()),
+                    message: "sdk".into(),
                 };
                 info!(
                     instance = %desired.instance_id,
+                    runtime_id = %desired.runtime_id,
                     bind = %active.bind,
                     port = active.port,
-                    "ssh serve open (msb-cli)"
+                    "ssh serve open (sdk)"
                 );
                 self.active.insert(desired.instance_id.clone(), active);
                 obs
@@ -270,19 +101,17 @@ impl SshServeTable {
         }
     }
 
-    pub fn close(&mut self, instance_id: &str) {
-        if let Some(active) = self.active.remove(instance_id) {
-            if let Ok(mut g) = active.child.lock() {
-                if let Some(mut child) = g.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+    pub async fn close(&mut self, instance_id: &str) {
+        if let Some(mut active) = self.active.remove(instance_id) {
+            if let Some(tx) = active.shutdown.take() {
+                let _ = tx.send(());
             }
+            active.join.abort();
             info!(instance = %instance_id, "ssh serve closed");
         }
     }
 
-    pub fn close_missing(&mut self, keep: &std::collections::HashSet<String>) {
+    pub async fn close_missing(&mut self, keep: &std::collections::HashSet<String>) {
         let stale: Vec<String> = self
             .active
             .keys()
@@ -290,95 +119,81 @@ impl SshServeTable {
             .cloned()
             .collect();
         for id in stale {
-            self.close(&id);
+            self.close(&id).await;
         }
     }
 }
 
-fn process_alive(child: &Mutex<Option<Child>>) -> bool {
-    let Ok(mut g) = child.lock() else {
-        return false;
-    };
-    let Some(ch) = g.as_mut() else {
-        return false;
-    };
-    match ch.try_wait() {
-        Ok(None) => true,
-        Ok(Some(_)) => false,
-        Err(_) => false,
-    }
-}
-
-fn start_serve_msb(msb_bin: &PathBuf, desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
-    for key in &desired.ssh.authorized_public_keys {
-        let out = Command::new(msb_bin)
-            .args(["ssh", "authorize", "--key", key])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr);
-                warn!(%err, "msb ssh authorize failed");
-            }
-            Err(e) => warn!(error = %e, "msb ssh authorize spawn failed"),
-        }
-    }
-
+async fn start_serve_sdk(desired: &DesiredSandbox) -> anyhow::Result<ActiveServe> {
     let bind_ip: std::net::IpAddr = desired
         .ssh
         .bind
         .parse()
         .unwrap_or_else(|_| std::net::IpAddr::from([127, 0, 0, 1]));
 
-    let port = if desired.ssh.port == 0 {
-        let listener = std::net::TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
-        let p = listener.local_addr()?.port();
-        drop(listener);
-        p
+    let listener = if desired.ssh.port == 0 {
+        TcpListener::bind(SocketAddr::new(bind_ip, 0)).await?
     } else {
-        desired.ssh.port
+        TcpListener::bind(SocketAddr::new(bind_ip, desired.ssh.port)).await?
     };
+    let local = listener.local_addr()?;
+    let port = local.port();
+    let bind = desired.ssh.bind.clone();
 
-    let host = desired.ssh.bind.clone();
-    let name = desired.runtime_id.clone();
-    let child = Command::new(msb_bin)
-        .args([
-            "ssh",
-            "serve",
-            &name,
-            "--host",
-            &host,
-            "--port",
-            &port.to_string(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "spawn `{} ssh serve`: {e} (set MCC_MSB_BIN or MCC_SSH_BACKEND)",
-                msb_bin.display()
-            )
-        })?;
+    let handle = Sandbox::get(&desired.runtime_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Sandbox::get({}): {e}", desired.runtime_id))?;
+    let sb = handle
+        .connect()
+        .await
+        .map_err(|e| anyhow::anyhow!("Sandbox::connect({}): {e}", desired.runtime_id))?;
+
+    let keys = desired.ssh.authorized_public_keys.clone();
+    let user = desired.ssh.user.clone();
+    let sftp = desired.ssh.sftp;
+    let server = sb
+        .ssh()
+        .server_with(|opts| {
+            let mut o = opts.user(user).sftp(sftp);
+            for k in keys {
+                o = o.authorized_key(k);
+            }
+            o
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh server_with: {e}"))?;
+
+    let (tx, mut rx) = oneshot::channel::<()>();
+    let server = Arc::new(server);
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                acc = listener.accept() => {
+                    match acc {
+                        Ok((stream, peer)) => {
+                            let srv = server.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = srv.serve(stream).await {
+                                    warn!(%peer, error = %e, "ssh connection ended");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "ssh accept failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     Ok(ActiveServe {
         config_hash: desired.ssh.config_hash.clone(),
-        bind: host,
+        bind,
         port,
-        child: Mutex::new(Some(child)),
+        shutdown: Some(tx),
+        join,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_backends() {
-        assert_eq!(SshBackend::parse("auto").unwrap(), SshBackend::Auto);
-        assert_eq!(SshBackend::parse("msb-cli").unwrap(), SshBackend::MsbCli);
-        assert_eq!(SshBackend::parse("disabled").unwrap(), SshBackend::Disabled);
-        assert_eq!(SshBackend::parse("sdk").unwrap(), SshBackend::Sdk);
-        assert!(SshBackend::parse("nope").is_err());
-    }
 }
