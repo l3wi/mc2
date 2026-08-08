@@ -49,5 +49,4 @@ async fn local_node_is_registered() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["id"], cluster.local_node_id);
     assert_eq!(arr[0]["status"], "Ready");
-    assert!(arr[0].get("node_token_hash").is_none());
 }

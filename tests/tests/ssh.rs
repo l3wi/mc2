@@ -1,5 +1,9 @@
 //! Integration: SSH key registry + instance open/close via REST API.
+//!
+//! Observed phase/bind/port come from the node loop's store writes; this
+//! suite simulates those writes directly (no hypervisor).
 
+use mc2_store::Store;
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 
@@ -148,4 +152,95 @@ services:
         .await
         .unwrap();
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
+}
+
+/// Node-loop store writes (observed Open/Closed) surface through the REST view.
+#[tokio::test]
+async fn node_observed_ssh_roundtrip_through_rest() {
+    let cluster = TestCluster::start().await.expect("start");
+
+    let put_key = cluster
+        .client()
+        .put(format!("{}/v1/ssh/keys/dev", cluster.base_url))
+        .bearer_auth(&cluster.api_token)
+        .json(&serde_json::json!({ "publicKey": FAKE_KEY }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_key.status(), StatusCode::OK);
+
+    let yaml = r#"
+apiVersion: mc2/v1
+kind: Stack
+metadata:
+  name: sshobs
+services:
+  web:
+    image: alpine:3.20
+    replicas: 1
+    resources: { cpus: 1, memoryMiB: 128 }
+    command: ["sleep", "infinity"]
+"#;
+    let apply = cluster
+        .client()
+        .post(format!("{}/v1/stacks:apply", cluster.base_url))
+        .bearer_auth(&cluster.api_token)
+        .json(&serde_json::json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(apply.status(), StatusCode::OK);
+
+    let (_, instances) = cluster
+        .get_json("/v1/instances", Some(&cluster.api_token))
+        .await
+        .unwrap();
+    let id = instances[0]["id"].as_str().unwrap();
+
+    // Enable override, then simulate the node loop opening the serve port.
+    let open = cluster
+        .client()
+        .put(format!("{}/v1/instances/{id}/ssh", cluster.base_url))
+        .bearer_auth(&cluster.api_token)
+        .json(&serde_json::json!({
+            "enabled": true,
+            "port": 0,
+            "authorizedKeys": ["dev"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open.status(), StatusCode::OK);
+
+    cluster
+        .store
+        .update_instance_ssh_observed(id, "Open", Some("127.0.0.1"), Some(2222), Some("sdk"))
+        .await
+        .unwrap();
+
+    let (st, view) = cluster
+        .get_json(&format!("/v1/instances/{id}/ssh"), Some(&cluster.api_token))
+        .await
+        .unwrap();
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(view["phase"], "Open");
+    assert_eq!(view["bind"], "127.0.0.1");
+    assert_eq!(view["port"], 2222);
+    assert_eq!(view["message"], "sdk");
+
+    // Instance stops → node loop closes the serve; observed flips to Closed.
+    cluster
+        .store
+        .update_instance_ssh_observed(id, "Closed", None, None, None)
+        .await
+        .unwrap();
+
+    let (st, view) = cluster
+        .get_json(&format!("/v1/instances/{id}/ssh"), Some(&cluster.api_token))
+        .await
+        .unwrap();
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(view["phase"], "Closed");
+    assert!(view["bind"].is_null());
+    assert!(view["port"].is_null());
 }

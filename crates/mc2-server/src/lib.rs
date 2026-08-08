@@ -345,6 +345,14 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/home/.mc2"));
     }
 
+    #[test]
+    fn parse_labels_ok_and_rejects_malformed() {
+        let m = parse_labels(&["role=worker".into(), "zone=a".into()]).unwrap();
+        assert_eq!(m.get("role").unwrap(), "worker");
+        assert_eq!(m.get("zone").unwrap(), "a");
+        assert!(parse_labels(&["missing-equals".into()]).is_err());
+    }
+
     #[tokio::test]
     async fn dry_run_inits() {
         let dir = tempfile::tempdir().unwrap();
