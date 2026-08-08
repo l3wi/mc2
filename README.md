@@ -6,6 +6,16 @@ MC2 gives you desired-state orchestration over microsandbox: stacks, replicas, r
 
 The server **embeds** the microsandbox SDK directly (no daemon, no separate worker process — MSB-embedded style): `mc2 server` is the orchestrator — SQLite state, REST API, scheduler, and the reconcile loop that fork+execs `msb sandbox` microVMs.
 
+## Install
+
+Prebuilt binaries for Linux (amd64/arm64) and macOS (Apple Silicon) ship with every release:
+
+```bash
+curl -fsSL https://github.com/l3wi/mc2/releases/latest/download/mc2-installer.sh | sh
+```
+
+Or grab the checksummed `.tar.xz` for your platform from [releases](https://github.com/l3wi/mc2/releases).
+
 ## Quick start (dev)
 
 Requirements: Rust **1.91+**, [just](https://github.com/casey/just), a hypervisor (Linux KVM / Apple Silicon HVF) for running sandboxes. Full walkthrough: [docs/guides/quickstart.md](docs/guides/quickstart.md).
@@ -50,12 +60,19 @@ just test-integration
 | Command | Role |
 | ------- | ---- |
 | `mc2 server` | The orchestrator (SQLite, REST, scheduler, embedded msb runtime) |
-| `mc2 node ls` | Show the local node (capacity, status) via REST |
+| `mc2 node ls` | Show the local node (capacity, status) |
 | `mc2 apply -f stack.yaml` | Apply desired stack (schedule + run) |
+| `mc2 ps [--stack s] [--service s]` | List instances / phases |
+| `mc2 status` | Health + version + counts |
+| `mc2 fabric <instance>` | Observed fabric status (expose/allow) |
+| `mc2 ingress` | Desired ingress routes |
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted; values never listed) |
-| `mc2 ps` | List instances / instance phases |
+| `mc2 ssh key\|open\|close\|ls` | SSH keys + open/close endpoints |
 | `mc2 doctor` | Host / msb readiness checks |
-| `mc2 ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (served via microsandbox SDK) |
+| `mc2 completions <shell>` | Shell completions (bash/zsh/fish) |
+
+All listing commands accept `-o json`. Instance commands accept
+`<stack>/<service>/<ordinal>` in place of a UUID.
 
 **Service fabric:** stack YAML `expose` + client `allow` → L4 splice + guest DNS (`db.<stack>.svc.mc2`). Default deny east–west. See [examples/03-service-fabric/](examples/03-service-fabric/).
 

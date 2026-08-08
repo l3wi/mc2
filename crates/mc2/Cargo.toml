@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "mc2"
@@ -20,6 +21,7 @@ mc2-metrics = { workspace = true }
 # SecretMeta type for CLI list parsing
 anyhow = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

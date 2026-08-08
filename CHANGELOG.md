@@ -4,6 +4,30 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### First-class CLI (full API parity)
+
+- New commands covering the whole REST surface: `mc2 status` (health +
+  counts), `mc2 fabric <instance>` (observed expose/allow status),
+  `mc2 ingress` (desired route table), `mc2 ssh key show <name>`.
+- `-o json|table` on all listing commands (`ps`, `node ls`, `secret ls`,
+  `ingress`, `fabric`, `ssh ls`, `ssh key ls`) for scriptable output.
+- `mc2 ps --stack/--service` client-side filters.
+- Instance addressing: every instance command accepts
+  `<stack>/<service>/<ordinal>` (e.g. `mc2 fabric demo/web/0`) in addition
+  to the raw UUID.
+- Unified API error shape: non-2xx responses surface the server's `error`
+  field (`apply failed: 400 Bad Request: ...`) instead of raw JSON.
+- `mc2 completions bash|zsh|fish` (clap_complete).
+
+### Distribution (dist)
+
+- Repository is now public at https://github.com/l3wi/mc2; release
+  pipeline replaced with **dist** (cargo-dist 0.32): tag push builds
+  `linux-amd64`, `linux-arm64`, `darwin-arm64` on native runners (no
+  cross-compilation), ships checksummed `.tar.xz` archives and a
+  `mc2-installer.sh` (rustup-style), and generates release notes from
+  CHANGELOG.md.
+
 ### BREAKING: single-process merge (gRPC agent deleted)
 
 - `mc2 server` now hosts the **local node** in-process: scheduler + SQLite +

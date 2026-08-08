@@ -139,3 +139,62 @@ fn server_init_only_second_run_no_fresh_tokens_banner() {
         "second init should not re-print bootstrap banner: {combined}"
     );
 }
+
+#[test]
+fn help_lists_parity_commands() {
+    let out = mc2().arg("--help").output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for cmd in ["status", "fabric", "ingress", "completions", "ps", "node"] {
+        assert!(stdout.contains(cmd), "missing {cmd}: {stdout}");
+    }
+}
+
+#[test]
+fn ssh_key_help_lists_show() {
+    let out = mc2().args(["ssh", "key", "--help"]).output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("show"), "{stdout}");
+}
+
+#[test]
+fn completions_generate_for_all_shells() {
+    for shell in ["bash", "zsh", "fish"] {
+        let out = mc2().args(["completions", shell]).output().expect("run");
+        assert!(
+            out.status.success(),
+            "{shell}: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.len() > 100, "{shell} output too short");
+        assert!(stdout.contains("mc2"), "{shell} must reference mc2");
+    }
+}
+
+#[test]
+fn fabric_error_is_unified_api_error() {
+    // Server unreachable: connection error, non-zero exit, one-line message.
+    let out = mc2()
+        .args(["fabric", "demo/web/0", "--api", "http://127.0.0.1:1"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.to_lowercase().contains("error"), "{combined}");
+}
+
+#[test]
+fn ps_supports_json_output_flag() {
+    let out = mc2().args(["ps", "--help"]).output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--output"), "{stdout}");
+    assert!(stdout.contains("json"), "{stdout}");
+    assert!(stdout.contains("--stack"), "{stdout}");
+}

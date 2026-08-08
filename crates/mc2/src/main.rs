@@ -7,7 +7,7 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Debug, Parser)]
@@ -29,16 +29,24 @@ enum Commands {
     Server(mc2_server::ServerArgs),
     /// Apply a stack YAML (desired state)
     Apply(ApplyArgs),
-    /// Show the local node (capacity, status)
+    /// Cluster status (health + version + counts)
+    Status(StatusArgs),
+    /// Node operations
     Node(NodeCmd),
     /// List instances (desired sandboxes)
-    Ps(OperatorArgs),
+    Ps(PsArgs),
+    /// Observed fabric status for one instance
+    Fabric(FabricArgs),
+    /// Desired ingress routes
+    Ingress(IngressArgs),
     /// Secrets (encrypted at rest; values never listed)
     Secret(SecretCmd),
     /// SSH authorized keys + endpoints
     Ssh(SshCmd),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
+    /// Generate shell completions
+    Completions(CompletionsArgs),
     /// Show version info
     Version,
 }
@@ -55,7 +63,7 @@ enum SshCommands {
     Key(SshKeyCmd),
     /// List open SSH endpoints
     #[command(name = "ls", alias = "list")]
-    Ls(OperatorArgs),
+    Ls(ListArgs),
     /// Show SSH state for an instance
     Show(SshInstanceArgs),
     /// Open SSH on an instance (API override)
@@ -74,8 +82,10 @@ struct SshKeyCmd {
 enum SshKeyCommands {
     /// Add or replace an authorized public key
     Add(SshKeyAddArgs),
+    /// Show one authorized public key
+    Show(SshKeyShowArgs),
     #[command(name = "ls", alias = "list")]
-    Ls(OperatorArgs),
+    Ls(ListArgs),
     #[command(name = "rm", alias = "delete")]
     Rm(SshKeyRmArgs),
 }
@@ -134,8 +144,7 @@ enum SecretCommands {
     Set(SecretSetArgs),
     /// List secret names (values never shown)
     #[command(name = "ls", alias = "list")]
-    Ls(OperatorArgs),
-    /// Delete a secret
+    Ls(ListArgs),
     #[command(name = "rm", alias = "delete")]
     Rm(SecretRmArgs),
 }
@@ -186,7 +195,7 @@ struct NodeCmd {
 enum NodeCommands {
     /// List registered nodes (`mc2 node ls`)
     #[command(name = "ls", alias = "list")]
-    Ls(OperatorArgs),
+    Ls(ListArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -198,6 +207,84 @@ struct OperatorArgs {
     /// Operator API bearer token
     #[arg(long, env = "MC2_API_KEY")]
     token: Option<String>,
+}
+
+/// Output format for listing commands.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable table (default)
+    #[default]
+    Table,
+    /// Machine-readable JSON
+    Json,
+}
+
+/// Common listing args: connection + output format.
+#[derive(Debug, Parser)]
+struct ListArgs {
+    #[command(flatten)]
+    op: OperatorArgs,
+    /// Output format
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct StatusArgs {
+    #[command(flatten)]
+    op: OperatorArgs,
+    /// Output format
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct PsArgs {
+    #[command(flatten)]
+    op: OperatorArgs,
+    /// Output format
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+    /// Only instances of this stack
+    #[arg(long)]
+    stack: Option<String>,
+    /// Only instances of this service
+    #[arg(long)]
+    service: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct FabricArgs {
+    /// Instance id, or <stack>/<service>/<ordinal> (e.g. demo/web/0)
+    id: String,
+    #[command(flatten)]
+    op: OperatorArgs,
+    /// Output format
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct IngressArgs {
+    #[command(flatten)]
+    op: OperatorArgs,
+    /// Output format
+    #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
+    output: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+struct SshKeyShowArgs {
+    name: String,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct CompletionsArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 fn init_tracing() {
@@ -217,10 +304,13 @@ async fn main() -> Result<()> {
         Commands::Server(args) => mc2_server::run(args).await?,
 
         Commands::Apply(args) => apply_cmd(args).await?,
+        Commands::Status(args) => status_cmd(args).await?,
         Commands::Node(NodeCmd {
             command: NodeCommands::Ls(args),
         }) => node_ls(args).await?,
         Commands::Ps(args) => ps_cmd(args).await?,
+        Commands::Fabric(args) => fabric_cmd(args).await?,
+        Commands::Ingress(args) => ingress_cmd(args).await?,
         Commands::Secret(SecretCmd { command }) => match command {
             SecretCommands::Set(a) => secret_set(a).await?,
             SecretCommands::Ls(a) => secret_ls(a).await?,
@@ -229,6 +319,7 @@ async fn main() -> Result<()> {
         Commands::Ssh(SshCmd { command }) => match command {
             SshCommands::Key(SshKeyCmd { command }) => match command {
                 SshKeyCommands::Add(a) => ssh_key_add(a).await?,
+                SshKeyCommands::Show(a) => ssh_key_show(a).await?,
                 SshKeyCommands::Ls(a) => ssh_key_ls(a).await?,
                 SshKeyCommands::Rm(a) => ssh_key_rm(a).await?,
             },
@@ -243,6 +334,7 @@ async fn main() -> Result<()> {
                 std::process::exit(code);
             }
         }
+        Commands::Completions(args) => completions_cmd(args)?,
         Commands::Version => {
             println!(
                 "mc2 {} — MC2 (MicroCommandControl)",
@@ -327,6 +419,15 @@ fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
     }
 }
 
+/// Unified non-2xx error: prefer the server's `error` field over raw JSON.
+fn api_error(op: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| body.to_string());
+    anyhow::anyhow!("{op} failed: {status}: {detail}")
+}
+
 fn operator_get(
     client: &reqwest::Client,
     url: &str,
@@ -384,24 +485,28 @@ async fn secret_set(args: SecretSetArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("secret set failed: {status} {body}");
+        return Err(api_error("secret set", status, &body));
     }
     // Body is metadata only (no value)
     println!("{body}");
     Ok(())
 }
 
-async fn secret_ls(args: OperatorArgs) -> Result<()> {
-    let url = format!("{}/v1/secrets", args.api.trim_end_matches('/'));
+async fn secret_ls(args: ListArgs) -> Result<()> {
+    let url = format!("{}/v1/secrets", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.token.as_deref())
+    let res = operator_get(&client, &url, args.op.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("secret ls failed: {status} {body}");
+        return Err(api_error("secret ls", status, &body));
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
     }
     let list: Vec<mc2_store::SecretMeta> =
         serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
@@ -434,7 +539,7 @@ async fn secret_rm(args: SecretRmArgs) -> Result<()> {
         return Ok(());
     }
     let body = res.text().await.unwrap_or_default();
-    bail!("secret rm failed: {status} {body}");
+    Err(api_error("secret rm", status, &body))
 }
 
 async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
@@ -461,26 +566,39 @@ async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh-key add failed: {status} {body}");
+        return Err(api_error("ssh key add", status, &body));
     }
     println!("{body}");
     Ok(())
 }
 
-async fn ssh_key_ls(args: OperatorArgs) -> Result<()> {
-    let url = format!("{}/v1/ssh/keys", args.api.trim_end_matches('/'));
+async fn ssh_key_ls(args: ListArgs) -> Result<()> {
+    let url = format!("{}/v1/ssh/keys", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET ssh keys")?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh-key ls failed: {status} {body}");
+        return Err(api_error("ssh key ls", status, &body));
     }
-    println!("{body}");
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
+    }
+    let keys: Vec<mc2_store::SshAuthorizedKey> =
+        serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    if keys.is_empty() {
+        println!("No authorized keys.");
+        return Ok(());
+    }
+    println!("{:<24} {:<52} NAME", "FINGERPRINT", "PUBLIC KEY");
+    for k in keys {
+        println!("{:<24} {:<52} {}", k.fingerprint, k.public_key, k.name);
+    }
     Ok(())
 }
 
@@ -502,23 +620,64 @@ async fn ssh_key_rm(args: SshKeyRmArgs) -> Result<()> {
         return Ok(());
     }
     let body = res.text().await.unwrap_or_default();
-    bail!("ssh-key rm failed: {status} {body}");
+    Err(api_error("ssh key rm", status, &body))
 }
 
-async fn ssh_endpoints_ls(args: OperatorArgs) -> Result<()> {
-    let url = format!("{}/v1/ssh/endpoints", args.api.trim_end_matches('/'));
+async fn ssh_endpoints_ls(args: ListArgs) -> Result<()> {
+    let url = format!("{}/v1/ssh/endpoints", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET ssh endpoints")?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh ls failed: {status} {body}");
+        return Err(api_error("ssh ls", status, &body));
     }
-    println!("{body}");
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
+    }
+    // Shape: { "endpoints": [...] } from list_ssh_endpoints.
+    let v: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    let endpoints: Vec<serde_json::Value> = v
+        .get("endpoints")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if endpoints.is_empty() {
+        println!("No open SSH endpoints.");
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<16} {:<8} {:<22} BIND:PORT",
+        "INSTANCE", "STACK/SERVICE", "PHASE", "NODE"
+    );
+    for e in endpoints {
+        let bind = e["bind"].as_str().unwrap_or("-");
+        let port = e["port"].as_u64().unwrap_or(0);
+        println!(
+            "{:<18} {:<16} {:<8} {:<22} {}:{}",
+            e["instanceId"]
+                .as_str()
+                .unwrap_or("-")
+                .chars()
+                .take(18)
+                .collect::<String>(),
+            format!(
+                "{}/{}",
+                e["stack"].as_str().unwrap_or("-"),
+                e["service"].as_str().unwrap_or("-")
+            ),
+            e["phase"].as_str().unwrap_or("-"),
+            e["nodeName"].as_str().unwrap_or("-"),
+            bind,
+            port
+        );
+    }
     Ok(())
 }
 
@@ -537,7 +696,7 @@ async fn ssh_instance_show(args: SshInstanceArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh show failed: {status} {body}");
+        return Err(api_error("ssh show", status, &body));
     }
     println!("{body}");
     Ok(())
@@ -563,7 +722,7 @@ async fn ssh_instance_open(args: SshOpenArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh open failed: {status} {body}");
+        return Err(api_error("ssh open", status, &body));
     }
     println!("{body}");
     Ok(())
@@ -587,7 +746,7 @@ async fn ssh_instance_close(args: SshInstanceArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ssh close failed: {status} {body}");
+        return Err(api_error("ssh close", status, &body));
     }
     println!("{body}");
     Ok(())
@@ -620,7 +779,7 @@ async fn apply_cmd(args: ApplyArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("apply failed: {status} {body}");
+        return Err(api_error("apply", status, &body));
     }
     println!("{body}");
     Ok(())
@@ -738,20 +897,30 @@ fn sanitize_stack_name(source: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-async fn ps_cmd(args: OperatorArgs) -> Result<()> {
-    let url = format!("{}/v1/instances", args.api.trim_end_matches('/'));
+async fn ps_cmd(args: PsArgs) -> Result<()> {
+    let url = format!("{}/v1/instances", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.token.as_deref())
+    let res = operator_get(&client, &url, args.op.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("ps failed: {status} {body}");
+        return Err(api_error("ps", status, &body));
     }
-    let instances: Vec<mc2_store::InstanceRecord> =
+    let mut instances: Vec<mc2_store::InstanceRecord> =
         serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    if let Some(ref stack) = args.stack {
+        instances.retain(|i| i.stack == *stack);
+    }
+    if let Some(ref service) = args.service {
+        instances.retain(|i| i.service == *service);
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&instances)?);
+        return Ok(());
+    }
     if instances.is_empty() {
         println!("No instances.");
         return Ok(());
@@ -774,17 +943,21 @@ async fn ps_cmd(args: OperatorArgs) -> Result<()> {
     Ok(())
 }
 
-async fn node_ls(args: OperatorArgs) -> Result<()> {
-    let url = format!("{}/v1/nodes", args.api.trim_end_matches('/'));
+async fn node_ls(args: ListArgs) -> Result<()> {
+    let url = format!("{}/v1/nodes", args.op.api.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.token.as_deref())
+    let res = operator_get(&client, &url, args.op.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("GET {url} failed: {status} {body}");
+        return Err(api_error("node ls", status, &body));
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
     }
     let nodes: Vec<mc2_api::NodeView> =
         serde_json::from_str(&body).with_context(|| format!("parse nodes JSON: {body}"))?;
@@ -810,6 +983,207 @@ async fn node_ls(args: OperatorArgs) -> Result<()> {
             n.last_heartbeat.unwrap_or_else(|| "-".into())
         );
     }
+    Ok(())
+}
+
+/// Cluster status: health + version + counts.
+async fn status_cmd(args: StatusArgs) -> Result<()> {
+    let base = args.op.api.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let health = operator_get(&client, &format!("{base}/health"), None)
+        .send()
+        .await
+        .with_context(|| format!("GET {base}/health"))?;
+    if !health.status().is_success() {
+        bail!(
+            "status failed: {}: server unreachable at {base}",
+            health.status()
+        );
+    }
+    let res = operator_get(
+        &client,
+        &format!("{base}/v1/status"),
+        args.op.token.as_deref(),
+    )
+    .send()
+    .await
+    .with_context(|| format!("GET {base}/v1/status"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("status", status, &body));
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    println!("mc2 {} — {}", v["version"].as_str().unwrap_or("?"), base);
+    println!("  api schema: {}", v["api_version"].as_str().unwrap_or("?"));
+    println!(
+        "  nodes: {}/{} ready",
+        v["nodes_ready"].as_u64().unwrap_or(0),
+        v["nodes_total"].as_u64().unwrap_or(0)
+    );
+    println!("  stacks: {}", v["stacks"].as_u64().unwrap_or(0));
+    println!("  instances: {}", v["instances"].as_u64().unwrap_or(0));
+    if let Some(msg) = v["message"].as_str() {
+        println!("  message: {msg}");
+    }
+    Ok(())
+}
+
+/// Resolve `<stack>/<service>/<ordinal>` to an instance id; pass UUIDs through.
+async fn resolve_instance_id(op: &OperatorArgs, id_or_ref: &str) -> Result<String> {
+    if !id_or_ref.contains('/') {
+        return Ok(id_or_ref.to_string());
+    }
+    let parts: Vec<&str> = id_or_ref.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        bail!("instance ref must be <stack>/<service>/<ordinal>, got {id_or_ref}");
+    }
+    let (stack, service, ordinal) = (parts[0], parts[1], parts[2]);
+    let ordinal: u32 = ordinal
+        .parse()
+        .with_context(|| format!("ordinal must be a number, got {ordinal}"))?;
+    let url = format!("{}/v1/instances", op.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, op.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let body = res.text().await.unwrap_or_default();
+    let instances: Vec<mc2_store::InstanceRecord> =
+        serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
+    instances
+        .iter()
+        .find(|i| i.stack == stack && i.service == service && i.ordinal == ordinal)
+        .map(|i| i.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("no instance {stack}/{service}/{ordinal}"))
+}
+
+/// Observed fabric status for one instance.
+async fn fabric_cmd(args: FabricArgs) -> Result<()> {
+    let id = resolve_instance_id(&args.op, &args.id).await?;
+    let url = format!(
+        "{}/v1/instances/{}/fabric",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&id)
+    );
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, args.op.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("fabric", status, &body));
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    println!(
+        "instance {} — fabric {}",
+        v["instanceId"].as_str().unwrap_or("-"),
+        v["phase"].as_str().unwrap_or("-")
+    );
+    if let Some(msg) = v["message"].as_str().filter(|m| !m.is_empty()) {
+        println!("  message: {msg}");
+    }
+    let observed = v
+        .get("observed")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    for ex in observed["exposes"].as_array().into_iter().flatten() {
+        println!(
+            "  expose guest:{} -> host:{} [{}]",
+            ex["guestPort"].as_u64().unwrap_or(0),
+            ex["hostPort"].as_u64().unwrap_or(0),
+            ex["phase"].as_str().unwrap_or("-")
+        );
+    }
+    for edge in observed["edges"].as_array().into_iter().flatten() {
+        println!(
+            "  allow {}:{} [{}]",
+            edge["toService"].as_str().unwrap_or("-"),
+            edge["port"].as_u64().unwrap_or(0),
+            edge["phase"].as_str().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+/// Desired ingress routes.
+async fn ingress_cmd(args: IngressArgs) -> Result<()> {
+    let url = format!("{}/v1/ingress", args.op.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, args.op.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("ingress", status, &body));
+    }
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let routes = v["routes"].as_array().cloned().unwrap_or_default();
+    if routes.is_empty() {
+        println!("No ingress routes.");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<12} {:<10} {:<8} {:<8} ID",
+        "HOST", "PATH", "SERVICE", "GUEST", "HOST_PORT"
+    );
+    for r in routes {
+        println!(
+            "{:<24} {:<12} {:<10} {:<8} {:<8} {}",
+            r["host"].as_str().unwrap_or("-"),
+            r["path"].as_str().unwrap_or("/"),
+            r["service"].as_str().unwrap_or("-"),
+            r["guestPort"].as_u64().unwrap_or(0),
+            r["hostPort"].as_u64().unwrap_or(0),
+            r["id"].as_str().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+/// Show one authorized public key.
+async fn ssh_key_show(args: SshKeyShowArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/ssh/keys/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.name)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.context("GET ssh key")?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("ssh key show", status, &body));
+    }
+    println!("{body}");
+    Ok(())
+}
+
+/// Generate shell completions to stdout.
+fn completions_cmd(args: CompletionsArgs) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    clap_complete::generate(args.shell, &mut cmd, "mc2", &mut std::io::stdout());
     Ok(())
 }
 
@@ -867,5 +1241,37 @@ mod tests {
     fn invalid_yaml_passes_through() {
         let raw = "not: [valid";
         assert_eq!(fill_stack_defaults(raw, "x.yaml"), raw);
+    }
+
+    #[test]
+    fn api_error_prefers_server_error_field() {
+        let e = api_error(
+            "fabric",
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"error":"no fabric status"}"#,
+        );
+        assert_eq!(
+            e.to_string(),
+            "fabric failed: 404 Not Found: no fabric status"
+        );
+    }
+
+    #[test]
+    fn api_error_falls_back_to_raw_body() {
+        let e = api_error("ps", reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert!(e.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn uuid_refs_pass_through_without_lookup() {
+        let op = OperatorArgs {
+            api: "http://127.0.0.1:1".into(),
+            token: None,
+        };
+        // No slash → no network call, returned verbatim.
+        let id = resolve_instance_id(&op, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99")
+            .await
+            .unwrap();
+        assert_eq!(id, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99");
     }
 }

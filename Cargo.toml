@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/placeholder/mc2"
+repository = "https://github.com/l3wi/mc2"
 authors = ["MC2 contributors"]
 # microsandbox 0.6.x / smoltcp need a recent stable (1.91+).
 rust-version = "1.91"
@@ -41,3 +41,19 @@ serde_yaml = "0.9"
 lto = true
 codegen-units = 1
 strip = true
+
+
+# Distribution via `dist` (cargo-dist): `dist generate` writes the release CI;
+# `dist plan --tag=vX.Y.Z` previews a release. Installer: shell script.
+[workspace.metadata.dist]
+dist = true
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+installers = ["shell"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+# Release notes from CHANGELOG.md sections.
+changelog = true
