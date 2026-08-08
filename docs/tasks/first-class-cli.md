@@ -1,6 +1,6 @@
 # Task: First-class CLI — API parity + dist packaging
 
-Status: **PROPOSED — awaiting review**
+Status: **DONE 2026-08-08** (commit `3ea67a7`, pushed to `dev`)
 Date: 2026-08-08
 
 ## Context
@@ -145,13 +145,20 @@ Plus:
       checksummed tarballs.
 - [ ] `just check` green.
 
-## Open question
+## Open question (resolved)
 
-- **GitHub repo URL** for installer publishing: tarballs/checksums work
-  with the placeholder, but shell-installer/Homebrew URLs need the real
-  `owner/repo`. Provide it, or we ship dist with `installers = []` first
-  and enable installers once the repo exists.
+- Repo created public at **github.com/l3wi/mc2**; installer enabled in the
+  same change.
 
 ## Handover notes (append as completed)
 
-- (pending)
+- **Done 2026-08-08.** Repo public, all commits pushed. dist 0.32 (brew
+  `axodotdev/tap/cargo-dist`); config in `[workspace.metadata.dist]`;
+  `dist generate` wrote `.github/workflows/release.yml` (old hand-rolled
+  one deleted); `dist plan --tag=v0.1.0` verified: 3 targets on native
+  runners (macos-14, ubuntu-22.04-arm, ubuntu-22.04 — no cross), tar.xz +
+  sha256 + `mc2-installer.sh`. First release fires on the first `vX.Y.Z`
+  tag push. Lab smoke: status / ps / ingress / fabric / ssh key show /
+  completions all verified against a live server; a fabric edge failure
+  (host port 8080 occupied — environmental) correctly surfaced through the
+  unified error path.
