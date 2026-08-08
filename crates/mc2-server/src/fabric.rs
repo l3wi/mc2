@@ -1,7 +1,7 @@
-//! Build per-instance fabric plans for agent Sync (D13).
+//! Build per-instance fabric plans for the node loop (D13).
 
-use mc2_api::agent::{FabricAllow, FabricDesired, FabricExpose};
 use mc2_api::{fabric_fqdn, ServiceSpec};
+use mc2_runtime::{DesiredFabric, FabricAllowDesired, FabricExposeDesired};
 use mc2_store::InstanceRecord;
 use std::collections::HashMap;
 
@@ -10,12 +10,12 @@ pub fn build_fabric_desired(
     inst: &InstanceRecord,
     spec: &ServiceSpec,
     peers: &[InstanceRecord],
-) -> FabricDesired {
-    let exposes: Vec<FabricExpose> = spec
+) -> DesiredFabric {
+    let exposes: Vec<FabricExposeDesired> = spec
         .expose
         .iter()
-        .map(|e| FabricExpose {
-            guest_port: u32::from(e.port),
+        .map(|e| FabricExposeDesired {
+            guest_port: e.port,
             protocol: e.protocol.clone(),
         })
         .collect();
@@ -59,9 +59,9 @@ pub fn build_fabric_desired(
             None => (String::new(), String::new(), 0, false),
         };
 
-        allows.push(FabricAllow {
+        allows.push(FabricAllowDesired {
             to_service: a.to.clone(),
-            port: u32::from(a.port),
+            port: a.port,
             protocol: a.protocol.clone(),
             fqdn: fabric_fqdn(&inst.stack, &a.to),
             short_name: a.to.clone(),
@@ -72,7 +72,7 @@ pub fn build_fabric_desired(
         });
     }
 
-    FabricDesired { exposes, allows }
+    DesiredFabric { exposes, allows }
 }
 
 #[cfg(test)]

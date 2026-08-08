@@ -55,10 +55,6 @@ async fn ssh_key_put_list_delete() {
 
 #[tokio::test]
 async fn instance_ssh_put_requires_keys_and_can_close() {
-    use mc2_api::agent::agent_service_client::AgentServiceClient;
-    use mc2_api::agent::{Capacity, JoinRequest};
-    use std::collections::HashMap;
-
     let cluster = TestCluster::start().await.expect("start");
 
     // Register key
@@ -72,24 +68,7 @@ async fn instance_ssh_put_requires_keys_and_can_close() {
         .unwrap();
     assert_eq!(put_key.status(), StatusCode::OK);
 
-    // Join + apply so we have an instance
-    let mut agent = AgentServiceClient::connect(cluster.grpc_url.clone())
-        .await
-        .unwrap();
-    agent
-        .join(JoinRequest {
-            join_token: cluster.join_token.clone(),
-            node_name: "n1".into(),
-            labels: HashMap::new(),
-            arch: "aarch64".into(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-        })
-        .await
-        .unwrap();
-
+    // Apply so we have an instance (auto local node picks it up).
     let yaml = r#"
 apiVersion: mc2/v1
 kind: Stack

@@ -1,7 +1,8 @@
-//! SSH key registry helpers + resolve desired SSH for Sync.
+//! SSH key registry helpers + resolve desired SSH for the node loop.
 
 use anyhow::{Context, Result};
 use mc2_api::SshSpec;
+use mc2_runtime::DesiredSsh;
 use mc2_store::{InstanceSshRecord, Store};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -11,13 +12,13 @@ pub async fn resolve_ssh_desired(
     store: Arc<dyn Store>,
     instance_id: &str,
     yaml_ssh: Option<&SshSpec>,
-) -> Result<ResolvedSsh> {
+) -> Result<DesiredSsh> {
     let row = store
         .get_instance_ssh(instance_id)
         .await
         .context("get ssh")?;
 
-    let (enabled, bind, port, user, sftp, key_names) = if let Some(ref r) = row {
+    let (enabled, bind, port, user, sftp, key_names) = if let Some(r) = &row {
         if r.has_override {
             let names: Vec<String> = r
                 .desired_key_names_json
@@ -42,7 +43,7 @@ pub async fn resolve_ssh_desired(
                 spec.authorized_keys.clone(),
             )
         } else {
-            return Ok(ResolvedSsh::disabled());
+            return Ok(DesiredSsh::default());
         }
     } else if let Some(spec) = yaml_ssh {
         (
@@ -54,11 +55,11 @@ pub async fn resolve_ssh_desired(
             spec.authorized_keys.clone(),
         )
     } else {
-        return Ok(ResolvedSsh::disabled());
+        return Ok(DesiredSsh::default());
     };
 
     if !enabled {
-        return Ok(ResolvedSsh::disabled());
+        return Ok(DesiredSsh::default());
     }
 
     if key_names.is_empty() {
@@ -77,7 +78,7 @@ pub async fn resolve_ssh_desired(
 
     let _ = key_names;
     let config_hash = hash_ssh_config(&bind, port, &user, sftp, &public_keys);
-    Ok(ResolvedSsh {
+    Ok(DesiredSsh {
         enabled: true,
         bind,
         port,
@@ -99,31 +100,6 @@ fn hash_ssh_config(bind: &str, port: u16, user: &str, sftp: bool, keys: &[String
         h.update([0]);
     }
     hex::encode(h.finalize())
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedSsh {
-    pub enabled: bool,
-    pub bind: String,
-    pub port: u16,
-    pub user: String,
-    pub sftp: bool,
-    pub authorized_public_keys: Vec<String>,
-    pub config_hash: String,
-}
-
-impl ResolvedSsh {
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            bind: "127.0.0.1".into(),
-            port: 0,
-            user: "root".into(),
-            sftp: true,
-            authorized_public_keys: vec![],
-            config_hash: String::new(),
-        }
-    }
 }
 
 /// Build instance_ssh desired record from a PUT body.

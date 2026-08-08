@@ -1,7 +1,7 @@
-//! Build per-node Ingress route plans for agent Sync (D7).
+//! Build per-node Ingress route plans for the node loop (D7).
 
-use mc2_api::agent::IngressRouteDesired;
 use mc2_api::{make_ingress_route_id, parse_stack_yaml, IngressSpec, ServiceSpec};
+use mc2_runtime::DesiredIngressRoute;
 use mc2_store::InstanceRecord;
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +13,7 @@ pub fn build_ingress_routes_for_node(
     node_id: &str,
     stacks_yaml: &[(String, String)], // (stack_name, raw_yaml)
     instances: &[InstanceRecord],
-) -> Vec<IngressRouteDesired> {
+) -> Vec<DesiredIngressRoute> {
     let mut out = Vec::new();
 
     let stacks_on_node: HashSet<String> = instances
@@ -51,7 +51,7 @@ fn routes_from_ingress(
     services: &std::collections::BTreeMap<String, ServiceSpec>,
     node_id: &str,
     instances: &[InstanceRecord],
-) -> Vec<IngressRouteDesired> {
+) -> Vec<DesiredIngressRoute> {
     let tls_enabled = ing.tls.enabled;
     let cert_resolver = ing.tls.cert_resolver.clone().unwrap_or_default();
 
@@ -99,15 +99,15 @@ fn routes_from_ingress(
                 path.path.clone()
             };
 
-            routes.push(IngressRouteDesired {
+            routes.push(DesiredIngressRoute {
                 id: make_ingress_route_id(stack, &rule.host, &path_str, &path.service, path.port),
                 stack: stack.into(),
                 host: rule.host.clone(),
                 path: path_str,
                 path_type: path.path_type.clone(),
                 service: path.service.clone(),
-                guest_port: u32::from(path.port),
-                host_port: u32::from(ps.host),
+                guest_port: path.port,
+                host_port: ps.host,
                 bind: ps.bind.clone(),
                 tls_enabled,
                 cert_resolver: cert_resolver.clone(),
@@ -139,7 +139,7 @@ fn routes_from_ingress(
         let (backend_instance_id, backend_ordinal) = backend
             .map(|b| (b.id.clone(), b.ordinal))
             .unwrap_or_default();
-        routes.push(IngressRouteDesired {
+        routes.push(DesiredIngressRoute {
             id: format!("{stack}-tcp-{}-{}", tcp.name, tcp.service),
             stack: stack.into(),
             host: String::new(),
@@ -147,7 +147,7 @@ fn routes_from_ingress(
             path_type: String::new(),
             service: tcp.service.clone(),
             guest_port: 0,
-            host_port: u32::from(ssh.port),
+            host_port: ssh.port,
             bind: ssh.bind.clone(),
             tls_enabled: false,
             cert_resolver: String::new(),

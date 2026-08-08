@@ -31,7 +31,7 @@ fn doctor_runs() {
     let out = mc2().arg("doctor").output().expect("run");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("mc2 doctor"), "{stdout}");
-    assert!(stdout.contains("agent runtime"), "{stdout}");
+    assert!(stdout.contains("runtime:"), "{stdout}");
 }
 
 #[test]
@@ -40,9 +40,12 @@ fn help_lists_core_commands() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("server"));
-    assert!(stdout.contains("agent"));
     assert!(stdout.contains("apply"));
     assert!(stdout.contains("secret"));
+    assert!(
+        !stdout.contains("  agent"),
+        "agent command removed: {stdout}"
+    );
 }
 
 #[test]

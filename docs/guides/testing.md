@@ -16,7 +16,7 @@ Prefer small, obvious tests that fail if someone breaks the behavior later — o
 
 ### Directed unit tests
 
-- One behavior per test; name says the rule (`join_token_is_not_accepted_as_api_bearer`).
+- One behavior per test; name says the rule (`local_node_is_registered`).
 - No sleep-based flakiness; no full process when a function call is enough.
 - Prefer `MemoryStore` / pure functions for combinatorial cases (scheduler scores, token verify).
 
@@ -79,13 +79,13 @@ cargo test -p mc2 --test cli_smoke
 
 `.github/workflows/ci.yml`: `fmt` → `clippy -D warnings` → `cargo test --workspace` → `cargo build -p mc2`.
 
-Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not boot real microVMs in CI; exercise control-plane + gRPC with reported status. Real microsandbox runs are lab-only.
+Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not boot real microVMs in CI; drive the node through direct store writes and `build_desired_set`. Real microsandbox runs are lab-only.
 
 ### Secrets smoke (CI vs lab)
 
 | Path | What it proves |
 | ---- | -------------- |
-| `tests/tests/secrets.rs` | `mc2 secret set` → stack apply with refs → agent **Sync** returns `SecretInjection` (env/value/allowHosts) mapped via `desired_from_sync` (same path before SDK create). Missing secret / empty `allowHosts` → Sync `FailedPrecondition`. |
+| `tests/tests/secrets.rs` | `mc2 secret set` → stack apply with refs → `build_desired_set` returns `InjectedSecret` (env/value/allowHosts) (same path before SDK create). Missing secret / empty `allowHosts` → desired set errors. |
 | Lab | `mc2 secret set SMOKE_TOKEN --value …` then `mc2 apply -f examples/02-secrets/stack.yaml` on a node with hypervisor; guest env shows msb placeholder, value injects only to allowlisted hosts. |
 
 ### Ingress smoke (CI vs lab)
@@ -95,13 +95,13 @@ Integration tests must stay **free of KVM/HVF** so Linux CI stays green. Do not 
 | `mc2-api` stack tests | YAML: `ports:` + `ingress:` accept; missing ports / non-loopback bind / empty rules → reject |
 | `mc2-runtime` `ingress_render` | Catalog → Traefik strings; guest/host port mapping; pending not in proxy; multi-host; host port change |
 | `mc2-server` `ingress` | Per-node plan: guest→host port, multi-path, skip other nodes, no ingress → empty |
-| `mc2-agent` `ingress_files` | **Ready gate:** Running + TCP accept → files with upstream; dead port / not Running → empty proxy; lifecycle port change, stop, route removed, fingerprint skip |
-| `tests/tests/ingress.rs` | Apply → Sync `ingress_routes` (host/guest ports + host) → `GET /v1/ingress`; 400 validation; lifecycle update path/port, remove ingress, multi-path; no routes until scheduled |
+| `mc2-server` `ingress_files` | **Ready gate:** Running + TCP accept → files with upstream; dead port / not Running → empty proxy; lifecycle port change, stop, route removed, fingerprint skip |
+| `tests/tests/ingress.rs` | Apply → desired set `ingress_routes` (host/guest ports + host) → `GET /v1/ingress`; 400 validation; lifecycle update path/port, remove ingress, multi-path; no routes until scheduled |
 | Lab | `mc2 apply -f examples/04-http-ingress/stack.yaml` with `--ingress-config-dir`; Traefik — [examples/04-http-ingress/README.md](../../examples/04-http-ingress/README.md) |
 
 ```bash
 cargo test -p mc2-tests --test ingress
-cargo test -p mc2-agent --lib ingress_files
+cargo test -p mc2-server --lib ingress_files
 cargo test -p mc2-runtime --lib ingress_render
 ```
 
@@ -111,7 +111,7 @@ cargo test -p mc2-runtime --lib ingress_render
 | ---- | -------------- |
 | `mc2-api` stack tests | YAML: declared `dir` volumes accept; undeclared mounts, non-`dir` kinds, invalid names, `--` in names, relative/duplicate mounts → reject |
 | `mc2-runtime` `naming` + `spec_hash` | `volume_name` namespace/collision rules; `volume_mount_plan` order; mount change forces recreate |
-| `tests/tests/volumes.rs` | Apply → instance scheduled (user-facing names persisted) → agent Sync → `desired_from_sync` → `volume_mount_plan` resolves `mc2-<stack>--<volume>`; 400 for undeclared volume |
+| `tests/tests/volumes.rs` | Apply → instance scheduled (user-facing names persisted) → `build_desired_set` → `volume_mount_plan` resolves `mc2-<stack>--<volume>`; 400 for undeclared volume |
 | Lab | Marker file under `/data` survives sandbox recreate; instance stays on its node; volume dir remains after stack removal — [examples/06-persistent-volumes/README.md](../../examples/06-persistent-volumes/README.md) |
 
 ```bash
@@ -123,15 +123,15 @@ cargo test -p mc2-api --lib stack
 
 ## Where to add tests
 
-| Area | Prefer unit | Prefer integration |
-| ---- | ----------- | ------------------ |
-| Agent join | token/node field validation | join → node Ready in DB; REST list nodes |
+| Area | Unit | Integration |
+| ---- | ---- | ----------- |
+| Local node | store upsert/touch | auto node row Ready; REST list nodes |
 | Apply/schedule | YAML parse, spread score | apply → instances scheduled (mock runtime) |
 | msb runtime | naming, profile mapping, volume mount plan | unit only in CI; full SDK lab-only |
-| Secrets | encrypt/decrypt roundtrip | set → apply → agent Sync injection; missing/empty allowHosts fail closed |
-| Reschedule | restartPolicy matrix; sticky/never | two-node NotReady → rebind (`tests/tests/reschedule.rs`); sticky volumes stay |
-| Ingress | render, plan, file ready-gate + TCP probe | `tests/tests/ingress.rs` apply/Sync/REST lifecycle |
-| Volumes | validation matrix; naming/mount plan; recreate hash | `tests/tests/volumes.rs` apply/Sync contract; marker persistence lab-only |
+| Secrets | encrypt/decrypt roundtrip | set → apply → desired-set injection; missing/empty allowHosts fail closed |
+| Reschedule | restartPolicy matrix; sticky/never | NotReady → unbind → recovery rebind (`tests/tests/reschedule.rs`); sticky volumes stay |
+| Ingress | render, plan, file ready-gate + TCP probe | `tests/tests/ingress.rs` apply/desired-set/REST lifecycle |
+| Volumes | validation matrix; naming/mount plan; recreate hash | `tests/tests/volumes.rs` apply/desired-set contract; marker persistence lab-only |
 
 ---
 

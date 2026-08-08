@@ -1,5 +1,5 @@
-# Same-node Ingress smoke: publish ports: + stack ingress: → agent file catalog.
-# Agent: mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
+# Same-node Ingress smoke: publish ports: + stack ingress: → server file catalog.
+# Server: mc2 server ... --ingress-config-dir /tmp/mc2-ingress
 # Proxy: see examples/04-http-ingress/README.md
 #
 # Apply: mc2 apply -f examples/04-http-ingress/stack.yaml

@@ -1,56 +1,15 @@
-//! Integration: node NotReady → non-sticky instance rescheduled to another Ready node.
+//! Integration: node NotReady → non-sticky instance unbound; rebinds when the
+//! node returns to Ready. Sticky volumes stay bound.
+//!
+//! Single local node (v1): the flow is store-driven, no transport.
 
-use mc2_api::agent::agent_service_client::AgentServiceClient;
-use mc2_api::agent::{
-    Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
-};
 use mc2_server::reschedule_not_ready;
-use mc2_store::Store;
+use mc2_store::{NodeHeartbeat, Store};
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-struct Joined {
-    client: AgentServiceClient<tonic::transport::Channel>,
-    node_id: String,
-    node_token: String,
-    name: String,
-}
-
-async fn join(cluster: &TestCluster, name: &str) -> Joined {
-    let mut client = AgentServiceClient::connect(cluster.grpc_url.clone())
-        .await
-        .expect("grpc");
-    let join = client
-        .join(JoinRequest {
-            join_token: cluster.join_token.clone(),
-            node_name: name.into(),
-            labels: HashMap::new(),
-            arch: "aarch64".into(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    Joined {
-        client,
-        node_id: join.node_id,
-        node_token: join.node_token,
-        name: name.into(),
-    }
-}
-
-#[tokio::test]
-async fn not_ready_node_reschedules_to_peer() {
-    let cluster = TestCluster::start().await.expect("start");
-    let mut a = join(&cluster, "worker-a").await;
-    let mut b = join(&cluster, "worker-b").await;
-
-    let yaml = r#"
+const WEB: &str = r#"
 apiVersion: mc2/v1
 kind: Stack
 metadata:
@@ -65,11 +24,17 @@ services:
     restartPolicy: on-failure
     command: ["sleep", "infinity"]
 "#;
+
+#[tokio::test]
+async fn not_ready_node_unbinds_and_rebinds_on_recovery() {
+    let cluster = TestCluster::start().await.expect("start");
+    let node_id = cluster.local_node_id.clone();
+
     let res = cluster
         .client()
         .post(format!("{}/v1/stacks:apply", cluster.base_url))
         .bearer_auth(&cluster.api_token)
-        .json(&serde_json::json!({ "yaml": yaml }))
+        .json(&serde_json::json!({ "yaml": WEB }))
         .send()
         .await
         .unwrap();
@@ -83,38 +48,19 @@ services:
     let arr = instances.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     let inst_id = arr[0]["id"].as_str().unwrap().to_string();
-    let bound = arr[0]["node_id"].as_str().unwrap().to_string();
+    assert_eq!(arr[0]["node_id"], node_id);
 
-    let (dead, live) = if bound == a.node_id {
-        (&mut a, &mut b)
-    } else {
-        (&mut b, &mut a)
-    };
-
-    // Mark bound node NotReady via gRPC heartbeat status.
-    dead.client
-        .heartbeat(HeartbeatRequest {
-            node_id: dead.node_id.clone(),
-            node_token: dead.node_token.clone(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-            status: "NotReady".into(),
-        })
-        .await
-        .unwrap();
-    // Keep live Ready
-    live.client
-        .heartbeat(HeartbeatRequest {
-            node_id: live.node_id.clone(),
-            node_token: live.node_token.clone(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-            status: "Ready".into(),
-        })
+    // Node goes NotReady.
+    cluster
+        .store
+        .touch_node(
+            &node_id,
+            NodeHeartbeat {
+                cpus: 8,
+                memory_mib: 16384,
+                status: "NotReady".into(),
+            },
+        )
         .await
         .unwrap();
 
@@ -122,54 +68,46 @@ services:
         .await
         .expect("reschedule");
     assert_eq!(unbound, 1, "should unbind from NotReady node");
-    assert_eq!(scheduled, 1, "should bind to remaining Ready node");
+    assert_eq!(scheduled, 0, "no Ready node to schedule onto yet");
 
-    let after = cluster.store.get_instance(&inst_id).await.unwrap().unwrap();
-    assert_eq!(after.phase, "Scheduled");
-    assert_eq!(after.node_id.as_deref(), Some(live.node_id.as_str()));
+    let mid = cluster.store.get_instance(&inst_id).await.unwrap().unwrap();
+    assert_eq!(mid.phase, "Pending");
+    assert!(mid.node_id.is_none());
 
-    let sync = live
-        .client
-        .sync(SyncRequest {
-            node_id: live.node_id.clone(),
-            node_token: live.node_token.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(sync.instances.len(), 1);
-    assert_eq!(sync.instances[0].instance_id, inst_id);
-
-    live.client
-        .report_status(ReportStatusRequest {
-            node_id: live.node_id.clone(),
-            node_token: live.node_token.clone(),
-            instances: vec![InstanceStatus {
-                instance_id: inst_id,
-                phase: "Running".into(),
-                message: "reschedule harness".into(),
-                runtime_id: "resched-web-0".into(),
-                ssh: None,
-                fabric: None,
-            }],
-        })
+    // Node recovers → scheduler rebinds.
+    cluster
+        .store
+        .touch_node(
+            &node_id,
+            NodeHeartbeat {
+                cpus: 8,
+                memory_mib: 16384,
+                status: "Ready".into(),
+            },
+        )
         .await
         .unwrap();
 
-    let _ = (&dead.name, &live.name);
+    let (_, rescheduled) = reschedule_not_ready(cluster.store.clone() as Arc<dyn Store>)
+        .await
+        .expect("reschedule after recovery");
+    assert_eq!(rescheduled, 1, "should rebind to the recovered node");
+
+    let after = cluster.store.get_instance(&inst_id).await.unwrap().unwrap();
+    assert_eq!(after.phase, "Scheduled");
+    assert_eq!(after.node_id.as_deref(), Some(node_id.as_str()));
 }
 
 #[tokio::test]
 async fn sticky_volume_stays_on_not_ready_node() {
     let cluster = TestCluster::start().await.expect("start");
-    let mut a = join(&cluster, "sticky-a").await;
-    let mut b = join(&cluster, "sticky-b").await;
+    let node_id = cluster.local_node_id.clone();
 
     let yaml = r#"
 apiVersion: mc2/v1
 kind: Stack
 metadata:
-  name: sticky
+  name: sticky-resched
 volumes:
   data:
     kind: dir
@@ -180,10 +118,10 @@ services:
     resources:
       cpus: 1
       memoryMiB: 128
-    restartPolicy: on-failure
     volumes:
       - name: data
         mount: /data
+    restartPolicy: on-failure
     command: ["sleep", "infinity"]
 "#;
     let res = cluster
@@ -202,18 +140,18 @@ services:
         .unwrap();
     let inst_id = instances[0]["id"].as_str().unwrap().to_string();
     let bound = instances[0]["node_id"].as_str().unwrap().to_string();
+    assert_eq!(bound, node_id);
 
-    let dead = if bound == a.node_id { &mut a } else { &mut b };
-    dead.client
-        .heartbeat(HeartbeatRequest {
-            node_id: dead.node_id.clone(),
-            node_token: dead.node_token.clone(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-            status: "NotReady".into(),
-        })
+    cluster
+        .store
+        .touch_node(
+            &bound,
+            NodeHeartbeat {
+                cpus: 8,
+                memory_mib: 16384,
+                status: "NotReady".into(),
+            },
+        )
         .await
         .unwrap();
 

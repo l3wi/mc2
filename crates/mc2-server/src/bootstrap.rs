@@ -25,7 +25,6 @@ pub fn expand_data_dir(raw: &str) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct FreshCredentials {
     pub api_token: String,
-    pub join_token: String,
 }
 
 /// Result of ensuring the data directory is ready.
@@ -41,12 +40,12 @@ pub struct BootstrapResult {
 pub struct Bootstrap {
     pub data_dir: PathBuf,
     pub secrets_key_path: PathBuf,
-    /// When true, initialize without API/join tokens (open lab cluster).
+    /// When true, initialize without an API token (open lab cluster).
     pub no_auth: bool,
 }
 
 impl Bootstrap {
-    /// Create data dir, secrets key, open DB, init cluster tokens if needed.
+    /// Create data dir, secrets key, open DB, init cluster token if needed.
     pub async fn ensure(self) -> Result<BootstrapResult> {
         std::fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("mkdir {}", self.data_dir.display()))?;
@@ -60,7 +59,7 @@ impl Bootstrap {
             if self.no_auth {
                 // Empty hashes ⇒ auth not required (see Store::verify_*).
                 store
-                    .init_cluster("", "")
+                    .init_cluster("")
                     .await
                     .context("init open cluster meta")?;
                 info!(
@@ -70,16 +69,12 @@ impl Bootstrap {
                 None
             } else {
                 let api_token = generate_token("mc2at");
-                let join_token = generate_token("mc2jt");
                 store
-                    .init_cluster(&hash_token(&api_token), &hash_token(&join_token))
+                    .init_cluster(&hash_token(&api_token))
                     .await
                     .context("init cluster meta")?;
                 info!("initialized new cluster in {}", self.data_dir.display());
-                Some(FreshCredentials {
-                    api_token,
-                    join_token,
-                })
+                Some(FreshCredentials { api_token })
             }
         } else {
             None
@@ -179,6 +174,5 @@ mod tests {
         let store = SqliteStore::open(data.join("mc2.db")).await.unwrap();
         assert!(!store.api_auth_required().await.unwrap());
         assert!(store.verify_api_token("").await.unwrap());
-        assert!(store.verify_join_token("").await.unwrap());
     }
 }

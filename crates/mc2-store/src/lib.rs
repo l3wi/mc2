@@ -19,7 +19,7 @@ pub use sqlite::SqliteStore;
 pub use ssh::{
     ssh_fingerprint, validate_public_key, InstanceFabricRecord, InstanceSshRecord, SshAuthorizedKey,
 };
-pub use token::{hash_token, verify_token, TokenKind};
+pub use token::{hash_token, verify_token};
 
 /// Metadata for a secret (never includes plaintext).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,7 +63,6 @@ pub enum StoreError {
 pub struct ClusterMeta {
     pub initialized: bool,
     pub api_token_hash: String,
-    pub join_token_hash: String,
     pub created_at: String,
 }
 
@@ -81,35 +80,19 @@ pub struct ClusterCounts {
 pub trait Store: Send + Sync {
     async fn get_cluster_meta(&self) -> Result<Option<ClusterMeta>, StoreError>;
 
-    async fn init_cluster(
-        &self,
-        api_token_hash: &str,
-        join_token_hash: &str,
-    ) -> Result<ClusterMeta, StoreError>;
+    async fn init_cluster(&self, api_token_hash: &str) -> Result<ClusterMeta, StoreError>;
 
     /// Operator REST: if no API token was configured (empty hash), returns true
     /// for any caller (including missing bearer). Otherwise checks the bearer.
     async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError>;
 
-    /// Agent join: if no join token was configured (empty hash), returns true
-    /// even when `token` is empty. Otherwise checks the join token.
-    async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError>;
-
     /// True when the cluster requires an operator API bearer token.
     async fn api_auth_required(&self) -> Result<bool, StoreError>;
 
-    /// True when the cluster requires a join token to register agents.
-    async fn join_auth_required(&self) -> Result<bool, StoreError>;
-
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError>;
 
-    async fn upsert_node_join(&self, join: NodeJoin) -> Result<NodeRecord, StoreError>;
-    async fn heartbeat_node(
-        &self,
-        node_id: &str,
-        node_token: &str,
-        hb: NodeHeartbeat,
-    ) -> Result<NodeRecord, StoreError>;
+    async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError>;
+    async fn touch_node(&self, node_id: &str, hb: NodeHeartbeat) -> Result<NodeRecord, StoreError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
     async fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError>;
     async fn mark_stale_nodes(&self, grace: Duration) -> Result<u32, StoreError>;

@@ -1,14 +1,7 @@
-//! Token hashing helpers (API + join tokens).
+//! Token hashing helper (operator API token).
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-
-/// Which bootstrap token is being handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenKind {
-    Api,
-    Join,
-}
 
 /// SHA-256 hex digest of a plaintext token.
 pub fn hash_token(token: &str) -> String {

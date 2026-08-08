@@ -1,9 +1,8 @@
-//! MicroCommandControl (MC2) — dual-mode binary.
+//! MicroCommandControl (MC2) — single-binary control plane + CLI.
 //!
 //! ```text
-//! mc2 server   # control plane
-//! mc2 agent    # node agent (embeds microsandbox runtime)
-//! mc2 apply    # operator: apply a stack (Phase 3+)
+//! mc2 server   # control plane + local node
+//! mc2 apply    # operator: apply a stack
 //! mc2 node ls  # list nodes
 //! ```
 
@@ -15,8 +14,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[command(
     name = "mc2",
     about = "MC2 (MicroCommandControl) — self-hosted C2 for microsandbox microVMs",
-    long_about = "MC2 (MicroCommandControl) is a K3s-shaped control plane for \
-                  microsandbox microVMs. One dual-mode binary: server, agent, and operator CLI.",
+    long_about = "MC2 (MicroCommandControl) runs microsandbox microVMs from desired stack YAML. \
+                  One binary: server (control plane + local node) and operator CLI.",
     version
 )]
 struct Cli {
@@ -26,10 +25,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the MicroCommandControl server (control plane)
+    /// Run the MicroCommandControl server (control plane + local node)
     Server(mc2_server::ServerArgs),
-    /// Run the MicroCommandControl agent (node worker)
-    Agent(mc2_agent::AgentArgs),
     /// Apply a stack YAML (desired state)
     Apply(ApplyArgs),
     /// Node operations
@@ -218,7 +215,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Server(args) => mc2_server::run(args).await?,
-        Commands::Agent(args) => mc2_agent::run(args).await?,
+
         Commands::Apply(args) => apply_cmd(args).await?,
         Commands::Node(NodeCmd {
             command: NodeCommands::Ls(args),
@@ -266,7 +263,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Returns process exit code (0 = ok for server/dev; 1 = agent hypervisor missing).
+/// Returns process exit code (0 = ok; 1 = hypervisor missing).
 fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
     let mut issues = 0u32;
     println!("mc2 doctor — host checks");
@@ -280,14 +277,14 @@ fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
         if kvm {
             println!("  /dev/kvm: yes");
         } else {
-            println!("  /dev/kvm: MISSING (required for agent microVMs on Linux)");
+            println!("  /dev/kvm: MISSING (required for microVMs on Linux)");
             issues += 1;
         }
     }
     #[cfg(target_os = "macos")]
     {
         if std::env::consts::ARCH == "aarch64" {
-            println!("  hypervisor: Apple Silicon HVF expected (agent machine)");
+            println!("  hypervisor: Apple Silicon HVF expected");
         } else {
             println!("  hypervisor: unsupported arch on macOS (Apple Silicon only)");
             issues += 1;
@@ -295,11 +292,11 @@ fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        println!("  platform: unsupported for agent (Linux KVM or macOS arm64)");
+        println!("  platform: unsupported for microVMs (Linux KVM or macOS arm64)");
         issues += 1;
     }
 
-    println!("  agent runtime: microsandbox Rust SDK only (embedded)");
+    println!("  runtime: microsandbox Rust SDK (embedded)");
     if let Some(ep) = mc2_metrics::otlp_endpoint_from_env() {
         println!("  otlp: {ep}");
     } else {
@@ -312,7 +309,7 @@ fn doctor_cmd(args: DoctorArgs) -> Result<i32> {
                 let v = String::from_utf8_lossy(&o.stdout);
                 let e = String::from_utf8_lossy(&o.stderr);
                 println!(
-                    "  msb CLI: ok — {} (optional host tooling; not used by agent)",
+                    "  msb CLI: ok — {} (optional host tooling)",
                     v.trim().lines().next().unwrap_or(e.trim())
                 );
             }

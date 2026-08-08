@@ -69,7 +69,6 @@ impl SqliteStore {
             status: row.get("status"),
             last_heartbeat: row.get("last_heartbeat"),
             created_at: row.get("created_at"),
-            node_token_hash: row.get("node_token_hash"),
         }
     }
 
@@ -112,7 +111,7 @@ impl Store for SqliteStore {
     async fn get_cluster_meta(&self) -> Result<Option<ClusterMeta>, StoreError> {
         let row = sqlx::query(
             r#"
-            SELECT initialized, api_token_hash, join_token_hash, created_at
+            SELECT initialized, api_token_hash, created_at
             FROM cluster_meta WHERE id = 1
             "#,
         )
@@ -123,16 +122,11 @@ impl Store for SqliteStore {
         Ok(row.map(|r| ClusterMeta {
             initialized: r.get::<i64, _>("initialized") != 0,
             api_token_hash: r.get("api_token_hash"),
-            join_token_hash: r.get("join_token_hash"),
             created_at: r.get("created_at"),
         }))
     }
 
-    async fn init_cluster(
-        &self,
-        api_token_hash: &str,
-        join_token_hash: &str,
-    ) -> Result<ClusterMeta, StoreError> {
+    async fn init_cluster(&self, api_token_hash: &str) -> Result<ClusterMeta, StoreError> {
         if self.get_cluster_meta().await?.is_some() {
             return Err(StoreError::AlreadyExists("cluster".into()));
         }
@@ -140,12 +134,11 @@ impl Store for SqliteStore {
         let created_at = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO cluster_meta (id, initialized, api_token_hash, join_token_hash, created_at)
-            VALUES (1, 1, ?1, ?2, ?3)
+            INSERT INTO cluster_meta (id, initialized, api_token_hash, created_at)
+            VALUES (1, 1, ?1, ?2)
             "#,
         )
         .bind(api_token_hash)
-        .bind(join_token_hash)
         .bind(&created_at)
         .execute(&self.pool)
         .await
@@ -154,7 +147,6 @@ impl Store for SqliteStore {
         Ok(ClusterMeta {
             initialized: true,
             api_token_hash: api_token_hash.to_string(),
-            join_token_hash: join_token_hash.to_string(),
             created_at,
         })
     }
@@ -172,32 +164,11 @@ impl Store for SqliteStore {
         Ok(verify_token(token, &meta.api_token_hash))
     }
 
-    async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError> {
-        let Some(meta) = self.get_cluster_meta().await? else {
-            return Ok(false);
-        };
-        if meta.join_token_hash.is_empty() {
-            return Ok(true);
-        }
-        if token.is_empty() {
-            return Ok(false);
-        }
-        Ok(verify_token(token, &meta.join_token_hash))
-    }
-
     async fn api_auth_required(&self) -> Result<bool, StoreError> {
         Ok(self
             .get_cluster_meta()
             .await?
             .map(|m| !m.api_token_hash.is_empty())
-            .unwrap_or(true))
-    }
-
-    async fn join_auth_required(&self) -> Result<bool, StoreError> {
-        Ok(self
-            .get_cluster_meta()
-            .await?
-            .map(|m| !m.join_token_hash.is_empty())
             .unwrap_or(true))
     }
 
@@ -231,10 +202,10 @@ impl Store for SqliteStore {
         })
     }
 
-    async fn upsert_node_join(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
+    async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
         let existing = sqlx::query(
             r#"SELECT id, name, labels_json, arch, cpus, memory_mib, status,
-                      last_heartbeat, created_at, node_token_hash
+                      last_heartbeat, created_at
                FROM nodes WHERE name = ?1"#,
         )
         .bind(&join.name)
@@ -253,17 +224,15 @@ impl Store for SqliteStore {
                   arch = ?2,
                   cpus = ?3,
                   memory_mib = ?4,
-                  node_token_hash = ?5,
                   status = 'Ready',
-                  last_heartbeat = ?6
-                WHERE id = ?7
+                  last_heartbeat = ?5
+                WHERE id = ?6
                 "#,
             )
             .bind(&join.labels_json)
             .bind(&join.arch)
             .bind(join.cpus as i64)
             .bind(join.memory_mib as i64)
-            .bind(&join.node_token_hash)
             .bind(&now)
             .bind(&id)
             .execute(&self.pool)
@@ -281,8 +250,8 @@ impl Store for SqliteStore {
             r#"
             INSERT INTO nodes (
               id, name, labels_json, arch, cpus, memory_mib, status,
-              last_heartbeat, created_at, node_token_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Ready', ?7, ?8, ?9)
+              last_heartbeat, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Ready', ?7, ?8)
             "#,
         )
         .bind(&id)
@@ -293,7 +262,6 @@ impl Store for SqliteStore {
         .bind(join.memory_mib as i64)
         .bind(&now)
         .bind(&now)
-        .bind(&join.node_token_hash)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
@@ -303,18 +271,10 @@ impl Store for SqliteStore {
             .ok_or_else(|| StoreError::NotFound(id))
     }
 
-    async fn heartbeat_node(
-        &self,
-        node_id: &str,
-        node_token: &str,
-        hb: NodeHeartbeat,
-    ) -> Result<NodeRecord, StoreError> {
-        let Some(node) = self.get_node(node_id).await? else {
+    async fn touch_node(&self, node_id: &str, hb: NodeHeartbeat) -> Result<NodeRecord, StoreError> {
+        let Some(_node) = self.get_node(node_id).await? else {
             return Err(StoreError::NotFound(format!("node {node_id}")));
         };
-        if !verify_token(node_token, &node.node_token_hash) {
-            return Err(StoreError::Unauthorized);
-        }
 
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -344,7 +304,7 @@ impl Store for SqliteStore {
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
         let rows = sqlx::query(
             r#"SELECT id, name, labels_json, arch, cpus, memory_mib, status,
-                      last_heartbeat, created_at, node_token_hash
+                      last_heartbeat, created_at
                FROM nodes ORDER BY name"#,
         )
         .fetch_all(&self.pool)
@@ -357,7 +317,7 @@ impl Store for SqliteStore {
     async fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
         let row = sqlx::query(
             r#"SELECT id, name, labels_json, arch, cpus, memory_mib, status,
-                      last_heartbeat, created_at, node_token_hash
+                      last_heartbeat, created_at
                FROM nodes WHERE id = ?1"#,
         )
         .bind(node_id)
@@ -1044,24 +1004,20 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn sqlite_join_and_list() {
+    async fn sqlite_upsert_local_node_and_touch() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("mc2.db");
         let store = SqliteStore::open(&db).await.unwrap();
 
-        store
-            .init_cluster(&hash_token("api"), &hash_token("join"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("api")).await.unwrap();
 
         let node = store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "worker-1".into(),
                 labels_json: r#"{"role":"worker"}"#.into(),
                 arch: "aarch64".into(),
                 cpus: 8,
                 memory_mib: 16384,
-                node_token_hash: hash_token("node-tok"),
             })
             .await
             .unwrap();
@@ -1072,9 +1028,8 @@ mod tests {
         assert_eq!(list[0].name, "worker-1");
 
         store
-            .heartbeat_node(
+            .touch_node(
                 &node.id,
-                "node-tok",
                 NodeHeartbeat {
                     cpus: 8,
                     memory_mib: 16384,
@@ -1094,7 +1049,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = dir.path().join("mc2.db");
         let store = SqliteStore::open(&db).await.unwrap();
-        store.init_cluster("", "").await.unwrap();
+        store.init_cluster("").await.unwrap();
         store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
             .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
@@ -1118,7 +1073,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = dir.path().join("mc2.db");
         let store = SqliteStore::open(&db).await.unwrap();
-        store.init_cluster("", "").await.unwrap();
+        store.init_cluster("").await.unwrap();
         let key = SecretsKey::from_bytes([9u8; 32]);
         let (n, c) = key.encrypt(b"p@ss").unwrap();
         store.put_secret_blob("DB_PASS", &n, &c).await.unwrap();

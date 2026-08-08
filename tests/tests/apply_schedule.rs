@@ -1,15 +1,13 @@
-//! Integration: apply stack → schedule onto Ready node → agent reports Running.
+//! Integration: apply stack → schedule onto the local node → desired set
+//! resolves → store writes mark Running.
 //!
-//! Does not start microVMs (no hypervisor in CI). Agent status is reported over gRPC
-//! the same way a real agent would after SDK reconcile.
+//! Does not start microVMs (no hypervisor in CI). The "node" is driven by
+//! direct store writes, the same rows the in-process node loop would write.
 
-use mc2_api::agent::agent_service_client::AgentServiceClient;
-use mc2_api::agent::{
-    Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
-};
+use mc2_server::build_desired_set;
+use mc2_store::{SecretsKey, Store};
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
-use std::collections::HashMap;
 
 const DEMO: &str = r#"
 apiVersion: mc2/v1
@@ -26,27 +24,8 @@ services:
 "#;
 
 #[tokio::test]
-async fn apply_schedules_and_agent_marks_running() {
+async fn apply_schedules_and_reports_running() {
     let cluster = TestCluster::start().await.expect("start");
-
-    // Join agent first
-    let mut agent = AgentServiceClient::connect(cluster.grpc_url.clone())
-        .await
-        .expect("grpc");
-    let join = agent
-        .join(JoinRequest {
-            join_token: cluster.join_token.clone(),
-            node_name: "worker".into(),
-            labels: HashMap::new(),
-            arch: "aarch64".into(),
-            capacity: Some(Capacity {
-                cpus: 8,
-                memory_mib: 16384,
-            }),
-        })
-        .await
-        .unwrap()
-        .into_inner();
 
     // Apply stack
     let url = format!("{}/v1/stacks:apply", cluster.base_url);
@@ -65,40 +44,25 @@ async fn apply_schedules_and_agent_marks_running() {
     assert_eq!(body["scheduled"], 2);
     assert_eq!(body["pending"], 0);
 
-    // Simulate agent after SDK reconcile: Sync + ReportStatus Running
-    let sync = agent
-        .sync(SyncRequest {
-            node_id: join.node_id.clone(),
-            node_token: join.node_token.clone(),
-        })
+    // Desired set resolves for the local node (what the node loop would run).
+    let key = SecretsKey::load_file(&cluster.data_dir.join("secrets.key")).unwrap();
+    let (desired, routes) = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(sync.instances.len(), 2);
+        .expect("build desired set");
+    assert_eq!(desired.len(), 2);
+    assert!(routes.is_empty());
+    let mut names: Vec<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["demo-web-0", "demo-web-1"]);
 
-    let reports: Vec<InstanceStatus> = sync
-        .instances
-        .iter()
-        .map(|d| {
-            let rid = mc2_runtime::sandbox_name(&d.stack, &d.service, d.ordinal);
-            InstanceStatus {
-                instance_id: d.instance_id.clone(),
-                phase: "Running".into(),
-                message: "test harness (no hypervisor)".into(),
-                runtime_id: rid,
-                ssh: None,
-                fabric: None,
-            }
-        })
-        .collect();
-    agent
-        .report_status(ReportStatusRequest {
-            node_id: join.node_id.clone(),
-            node_token: join.node_token.clone(),
-            instances: reports,
-        })
-        .await
-        .unwrap();
+    // Simulate the node loop's store writes after SDK reconcile.
+    for d in &desired {
+        cluster
+            .store
+            .update_instance_status(&d.instance_id, "Running", Some(&d.runtime_id), None)
+            .await
+            .unwrap();
+    }
 
     let (st, instances) = cluster
         .get_json("/v1/instances", Some(&cluster.api_token))
@@ -108,26 +72,16 @@ async fn apply_schedules_and_agent_marks_running() {
     let arr = instances.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert!(arr.iter().all(|i| i["phase"] == "Running"));
-    assert!(arr.iter().all(|i| i["node_id"] == join.node_id));
-
-    // heartbeat still works
-    agent
-        .heartbeat(HeartbeatRequest {
-            node_id: join.node_id,
-            node_token: join.node_token,
-            capacity: Some(Capacity {
-                cpus: 8,
-                memory_mib: 16384,
-            }),
-            status: "Ready".into(),
-        })
-        .await
-        .unwrap();
+    assert!(arr
+        .iter()
+        .all(|i| i["node_id"] == serde_json::Value::String(cluster.local_node_id.clone())));
 }
 
 #[tokio::test]
 async fn apply_without_nodes_leaves_pending() {
-    let cluster = TestCluster::start().await.expect("start");
+    let cluster = TestCluster::start_with_node(false)
+        .await
+        .expect("start without node");
     let url = format!("{}/v1/stacks:apply", cluster.base_url);
     let res = cluster
         .client()

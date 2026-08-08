@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/mc2",
     "crates/mc2-server",
-    "crates/mc2-agent",
     "crates/mc2-api",
     "crates/mc2-store",
     "crates/mc2-runtime",
@@ -24,7 +23,7 @@ rust-version = "1.91"
 mc2-api = { path = "crates/mc2-api" }
 mc2-store = { path = "crates/mc2-store" }
 mc2-server = { path = "crates/mc2-server" }
-mc2-agent = { path = "crates/mc2-agent" }
+
 mc2-runtime = { path = "crates/mc2-runtime" }
 mc2-metrics = { path = "crates/mc2-metrics" }
 

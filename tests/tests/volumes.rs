@@ -1,15 +1,13 @@
-//! Integration: stack volumes → validation, scheduling, agent Sync mount material.
+//! Integration: stack volumes → validation, scheduling, desired-set mount material.
 //!
-//! CI does not boot microVMs. These tests exercise the same control-plane path a
-//! real agent uses before `Sandbox::create_detached` (apply → Sync → mount plan),
-//! mirroring `secrets.rs`.
+//! CI does not boot microVMs. These tests exercise the same control-plane path the
+//! node loop uses before `Sandbox::create_detached` (apply → desired set → mount plan).
 
-use mc2_api::agent::agent_service_client::AgentServiceClient;
-use mc2_api::agent::{Capacity, JoinRequest, SyncRequest};
-use mc2_runtime::{desired_from_sync, volume_mount_plan};
+use mc2_runtime::volume_mount_plan;
+use mc2_server::build_desired_set;
+use mc2_store::SecretsKey;
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
-use std::collections::HashMap;
 
 const STACK_WITH_VOLUME: &str = r#"
 apiVersion: mc2/v1
@@ -37,38 +35,10 @@ services:
     command: ["sleep", "infinity"]
 "#;
 
-async fn join_worker(
-    cluster: &TestCluster,
-) -> (
-    AgentServiceClient<tonic::transport::Channel>,
-    String,
-    String,
-) {
-    let mut agent = AgentServiceClient::connect(cluster.grpc_url.clone())
-        .await
-        .expect("grpc connect");
-    let join = agent
-        .join(JoinRequest {
-            join_token: cluster.join_token.clone(),
-            node_name: "volumes-worker".into(),
-            labels: HashMap::new(),
-            arch: "aarch64".into(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-        })
-        .await
-        .expect("join")
-        .into_inner();
-    (agent, join.node_id, join.node_token)
-}
-
 /// Apply → instance scheduled; the persisted spec keeps user-facing volume names.
 #[tokio::test]
 async fn apply_persists_volume_mounts_and_schedules_sticky() {
     let cluster = TestCluster::start().await.expect("start");
-    let (_, node_id, _) = join_worker(&cluster).await;
 
     let apply = cluster
         .client()
@@ -91,21 +61,20 @@ async fn apply_persists_volume_mounts_and_schedules_sticky() {
     assert_eq!(st, StatusCode::OK);
     let arr = instances.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["node_id"], node_id);
+    assert_eq!(arr[0]["node_id"], cluster.local_node_id);
 
     // Persisted spec is the user-facing contract: YAML names, not resolved
-    // msb names. Resolution happens agent-side at create time.
+    // msb names. Resolution happens node-side at create time.
     let spec_json = arr[0]["spec_json"].as_str().unwrap();
     assert!(spec_json.contains("\"name\":\"data\""), "{spec_json}");
     assert!(spec_json.contains("\"mount\":\"/data\""), "{spec_json}");
     assert!(!spec_json.contains("smoke-volumes--"), "{spec_json}");
 }
 
-/// Agent Sync delivers the exact material `create_detached` mounts from.
+/// The desired set delivers the exact material `create_detached` mounts from.
 #[tokio::test]
-async fn sync_delivers_volume_material_to_agent() {
+async fn desired_set_delivers_volume_material() {
     let cluster = TestCluster::start().await.expect("start");
-    let (mut agent, node_id, node_token) = join_worker(&cluster).await;
 
     let apply = cluster
         .client()
@@ -117,21 +86,15 @@ async fn sync_delivers_volume_material_to_agent() {
         .unwrap();
     assert_eq!(apply.status(), StatusCode::OK);
 
-    let sync = agent
-        .sync(SyncRequest {
-            node_id,
-            node_token,
-        })
+    let key = SecretsKey::load_file(&cluster.data_dir.join("secrets.key")).unwrap();
+    let (desired, _) = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect("sync")
-        .into_inner();
-    assert_eq!(sync.instances.len(), 1);
+        .expect("build desired set");
+    assert_eq!(desired.len(), 1);
 
-    // Same mapping the real agent uses before SDK create: guest path →
+    // Same mapping the node loop uses before SDK create: guest path →
     // resolved msb named-volume identity.
-    let work = desired_from_sync(&sync.instances).expect("desired_from_sync");
-    assert_eq!(work.len(), 1);
-    let plan = volume_mount_plan(&work[0]);
+    let plan = volume_mount_plan(&desired[0]);
     assert_eq!(
         plan,
         vec![("/data".to_string(), "mc2-smoke-volumes--data".to_string())]

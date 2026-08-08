@@ -630,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn apply_fabric_validation_returns_400() {
         let store = MemoryStore::new();
-        store.init_cluster("", "").await.unwrap();
+        store.init_cluster("").await.unwrap();
         let app = router(test_state(store));
         let body = serde_json::json!({
             "yaml": r#"
@@ -684,10 +684,7 @@ services:
     #[tokio::test]
     async fn status_requires_auth() {
         let store = MemoryStore::new();
-        store
-            .init_cluster(&hash_token("secret"), &hash_token("join"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("secret")).await.unwrap();
         let app = router(test_state(store));
 
         let unauth = app
@@ -721,7 +718,7 @@ services:
     #[tokio::test]
     async fn open_cluster_status_without_token() {
         let store = MemoryStore::new();
-        store.init_cluster("", "").await.unwrap();
+        store.init_cluster("").await.unwrap();
         let app = router(test_state(store));
         let res = app
             .oneshot(
@@ -738,18 +735,14 @@ services:
     #[tokio::test]
     async fn list_nodes_returns_joined() {
         let store = MemoryStore::new();
+        store.init_cluster(&hash_token("secret")).await.unwrap();
         store
-            .init_cluster(&hash_token("secret"), &hash_token("join"))
-            .await
-            .unwrap();
-        store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "n1".into(),
                 labels_json: r#"{"role":"worker"}"#.into(),
                 arch: "aarch64".into(),
                 cpus: 2,
                 memory_mib: 4096,
-                node_token_hash: hash_token("nt"),
             })
             .await
             .unwrap();

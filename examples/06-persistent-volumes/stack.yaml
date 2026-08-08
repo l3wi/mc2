@@ -2,10 +2,10 @@
 #
 #   mc2 apply -f examples/06-persistent-volumes/stack.yaml
 #
-# The volume `data` is backed by a named directory volume on the agent node
-# (default ~/.microsandbox/volumes, override with `mc2 agent --volume-dir`).
+# The volume `data` is backed by a named directory volume on the node
+# (default ~/.microsandbox/volumes, override with `mc2 server --volume-dir`).
 # Data survives sandbox recreate/restart and stack removal. CI covers
-# apply → agent Sync mount material in tests/tests/volumes.rs (no hypervisor).
+# apply → desired-set mount material in tests/tests/volumes.rs (no hypervisor).
 apiVersion: mc2/v1
 kind: Stack
 metadata:

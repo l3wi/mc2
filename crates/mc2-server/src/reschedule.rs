@@ -140,30 +140,25 @@ mod tests {
     #[tokio::test]
     async fn unbinds_non_sticky_from_not_ready_onto_ready_peer() {
         let store = MemoryStore::new();
-        store
-            .init_cluster(&hash_token("a"), &hash_token("j"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("a")).await.unwrap();
 
         let a = store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "a".into(),
                 labels_json: "{}".into(),
                 arch: "aarch64".into(),
                 cpus: 4,
                 memory_mib: 8192,
-                node_token_hash: hash_token("token-a"),
             })
             .await
             .unwrap();
         let b = store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "b".into(),
                 labels_json: "{}".into(),
                 arch: "aarch64".into(),
                 cpus: 4,
                 memory_mib: 8192,
-                node_token_hash: hash_token("token-b"),
             })
             .await
             .unwrap();
@@ -182,9 +177,8 @@ mod tests {
 
         // Force A NotReady via heartbeat status; keep B Ready.
         store
-            .heartbeat_node(
+            .touch_node(
                 &a.id,
-                "token-a",
                 NodeHeartbeat {
                     cpus: 4,
                     memory_mib: 8192,
@@ -194,9 +188,8 @@ mod tests {
             .await
             .unwrap();
         store
-            .heartbeat_node(
+            .touch_node(
                 &b.id,
-                "token-b",
                 NodeHeartbeat {
                     cpus: 4,
                     memory_mib: 8192,
@@ -219,29 +212,24 @@ mod tests {
     #[tokio::test]
     async fn sticky_volume_not_unbound() {
         let store = MemoryStore::new();
-        store
-            .init_cluster(&hash_token("a"), &hash_token("j"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("a")).await.unwrap();
         let a = store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "a".into(),
                 labels_json: "{}".into(),
                 arch: "aarch64".into(),
                 cpus: 4,
                 memory_mib: 8192,
-                node_token_hash: hash_token("token-a"),
             })
             .await
             .unwrap();
         let _b = store
-            .upsert_node_join(NodeJoin {
+            .upsert_local_node(NodeJoin {
                 name: "b".into(),
                 labels_json: "{}".into(),
                 arch: "aarch64".into(),
                 cpus: 4,
                 memory_mib: 8192,
-                node_token_hash: hash_token("token-b"),
             })
             .await
             .unwrap();
@@ -254,9 +242,8 @@ mod tests {
         let id = inst[0].id.clone();
         store.bind_instance_to_node(&id, &a.id).await.unwrap();
         store
-            .heartbeat_node(
+            .touch_node(
                 &a.id,
-                "token-a",
                 NodeHeartbeat {
                     cpus: 4,
                     memory_mib: 8192,

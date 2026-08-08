@@ -6,8 +6,7 @@
 //! - Never enables full Host/Private profiles (policy is create-time narrow rules).
 //! - Splice/host inject reuse: only rebuild when edge config changes.
 
-use mc2_api::agent::{FabricEdgeStatus, FabricExposeStatus, FabricObserved};
-use mc2_runtime::DesiredSandbox;
+use mc2_runtime::{DesiredSandbox, FabricEdgeStatus, FabricExposeStatus, FabricObserved};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +29,7 @@ struct ActiveSplice {
     _handle: JoinHandle<()>,
 }
 
-/// Per-agent fabric state.
+/// Per-node fabric state.
 pub struct FabricTable {
     /// instance_id → expose bindings (after sandbox create).
     exposes: HashMap<String, Vec<ExposeBinding>>,
@@ -130,8 +129,8 @@ impl FabricTable {
         if let Some(binds) = self.exposes.get(&desired.instance_id) {
             for b in binds {
                 observed.exposes.push(FabricExposeStatus {
-                    guest_port: u32::from(b.guest_port),
-                    host_port: u32::from(b.host_port),
+                    guest_port: b.guest_port,
+                    host_port: b.host_port,
                     phase: "Ready".into(),
                     message: String::new(),
                 });
@@ -139,7 +138,7 @@ impl FabricTable {
         } else if !desired.fabric.exposes.is_empty() {
             for ex in &desired.fabric.exposes {
                 observed.exposes.push(FabricExposeStatus {
-                    guest_port: u32::from(ex.guest_port),
+                    guest_port: ex.guest_port,
                     host_port: 0,
                     phase: "Failed".into(),
                     message: "expose not prepared before create".into(),
@@ -230,8 +229,8 @@ impl FabricTable {
                 .map(|b| b.host_port)
                 .unwrap_or(0);
             observed.exposes.push(FabricExposeStatus {
-                guest_port: u32::from(ex.guest_port),
-                host_port: u32::from(host),
+                guest_port: ex.guest_port,
+                host_port: host,
                 phase: "Pending".into(),
                 message: "sandbox not running".into(),
             });
@@ -239,7 +238,7 @@ impl FabricTable {
         for a in &desired.fabric.allows {
             observed.edges.push(FabricEdgeStatus {
                 to_service: a.to_service.clone(),
-                port: u32::from(a.port),
+                port: a.port,
                 phase: "Pending".into(),
                 message: "sandbox not running".into(),
             });
@@ -299,7 +298,7 @@ impl FabricTable {
         if !allow.backend_local {
             return Err(FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
-                port: u32::from(allow.port),
+                port: allow.port,
                 phase: "Failed".into(),
                 message: format!(
                     "fabric allow {}:{}: cross-node fabric not supported (backend on node {}, local instance on this node)",
@@ -316,7 +315,7 @@ impl FabricTable {
         if allow.backend_instance_id.is_empty() {
             return Err(FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
-                port: u32::from(allow.port),
+                port: allow.port,
                 phase: "Pending".into(),
                 message: format!(
                     "fabric allow {}:{}: waiting for backend instance",
@@ -333,7 +332,7 @@ impl FabricTable {
         let Some(backend_host_port) = backend_host else {
             return Err(FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
-                port: u32::from(allow.port),
+                port: allow.port,
                 phase: "Pending".into(),
                 message: format!(
                     "fabric allow {}:{}: waiting for backend expose on {}",
@@ -348,7 +347,7 @@ impl FabricTable {
         );
         let status = FabricEdgeStatus {
             to_service: allow.to_service.clone(),
-            port: u32::from(allow.port),
+            port: allow.port,
             phase: "Ready".into(),
             message: String::new(),
         };
@@ -368,7 +367,7 @@ impl FabricTable {
             Err(e) => {
                 return Err(FabricEdgeStatus {
                     to_service: allow.to_service.clone(),
-                    port: u32::from(allow.port),
+                    port: allow.port,
                     phase: "Failed".into(),
                     message: format!(
                         "fabric splice {}:{}: bind 127.0.0.1:{} failed: {e}",
@@ -416,7 +415,7 @@ impl FabricTable {
             config_key: config_key.to_string(),
             status: FabricEdgeStatus {
                 to_service: allow.to_service.clone(),
-                port: u32::from(allow.port),
+                port: allow.port,
                 phase: "Ready".into(),
                 message: String::new(),
             },
@@ -434,11 +433,10 @@ impl FabricTable {
             .allows
             .iter()
             .filter(|a| {
-                observed.edges.iter().any(|e| {
-                    e.to_service == a.to_service
-                        && e.port == u32::from(a.port)
-                        && e.phase == "Ready"
-                })
+                observed
+                    .edges
+                    .iter()
+                    .any(|e| e.to_service == a.to_service && e.port == a.port && e.phase == "Ready")
             })
             .map(|a| (a.fqdn.clone(), a.short_name.clone()))
             .collect();

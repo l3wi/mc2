@@ -1,162 +1,82 @@
-//! MicroCommandControl node agent.
+//! Local node reconcile loop: drive the embedded microsandbox runtime from
+//! the store's desired set, and write observed phases back to the store.
 //!
-//! Join + heartbeat over gRPC; reconcile desired instances via the
-//! embedded microsandbox Rust SDK (only runtime).
+//! Replaces the former `mc2-agent` gRPC client/server pair with direct calls.
 
-use anyhow::{bail, Context, Result};
-use clap::Parser;
-use mc2_api::agent::agent_service_client::AgentServiceClient;
-use mc2_api::agent::{
-    Capacity, HeartbeatRequest, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest,
-};
-mod fabric_serve;
-mod ingress_files;
-mod ssh_serve;
-
-use fabric_serve::FabricTable;
-use ingress_files::{warn_ingress_dir_unset, IngressFileWriter};
+use crate::desired::build_desired_set;
+use crate::fabric_serve::FabricTable;
+use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter};
+use crate::ssh_serve::SshServeTable;
+use anyhow::{Context, Result};
 use mc2_runtime::{
-    backoff_secs, desired_from_sync, desired_recreate_hash, MicrosandboxRuntime, NodeRuntime,
-    RestartPolicy, SandboxPhase,
+    backoff_secs, desired_recreate_hash, FabricObserved, InstanceReport, MicrosandboxRuntime,
+    NodeRuntime, RestartPolicy, SandboxPhase,
 };
-use ssh_serve::SshServeTable;
+use mc2_store::{NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{info, warn};
 
-/// Per-sandbox restart / health bookkeeping on the agent.
+/// Per-sandbox restart / health bookkeeping on the node.
 #[derive(Debug, Default)]
 struct InstanceRuntimeState {
+    spec_hash: Option<String>,
+    running_since: Option<Instant>,
     restart_count: u32,
     next_restart_ok: Option<Instant>,
     last_health: Option<Instant>,
-    running_since: Option<Instant>,
-    /// Last applied recreate hash (`desired_recreate_hash`).
-    spec_hash: Option<String>,
 }
 
-/// Arguments for `mc2 agent`.
-#[derive(Debug, Clone, Parser)]
-pub struct AgentArgs {
-    /// Control plane gRPC endpoint (`http://host:7444` or `https://host:7444`)
-    #[arg(long, env = "MC2_SERVER")]
-    pub server: Option<String>,
-
-    /// Join token from `mc2 server` bootstrap
-    #[arg(long, env = "MC2_JOIN_TOKEN")]
-    pub token: Option<String>,
-
-    /// Node name (defaults to hostname)
-    #[arg(long, env = "MC2_NODE_NAME")]
-    pub name: Option<String>,
-
-    /// Path to PEM CA cert (for https gRPC with lab self-signed CA)
-    #[arg(long, env = "MC2_TLS_CA")]
-    pub tls_ca: Option<PathBuf>,
-
-    /// Skip TLS certificate verification (lab only)
-    #[arg(long, env = "MC2_TLS_INSECURE")]
-    pub insecure: bool,
-
-    /// Heartbeat / reconcile interval seconds
-    #[arg(long, default_value_t = 10, env = "MC2_HEARTBEAT_INTERVAL_SECS")]
-    pub heartbeat_interval_secs: u64,
-
-    /// Advertise CPU capacity (default: host logical CPUs)
-    #[arg(long, env = "MC2_NODE_CPUS")]
-    pub cpus: Option<u32>,
-
-    /// Advertise memory capacity MiB (default: 8192 if unknown)
-    #[arg(long, env = "MC2_NODE_MEMORY_MIB")]
-    pub memory_mib: Option<u64>,
-
-    /// Node labels as `key=value` (repeatable)
-    #[arg(long = "label", value_name = "KEY=VALUE")]
-    pub labels: Vec<String>,
-
-    /// Directory for Traefik Ingress catalog files. Same-node BYO proxy.
-    #[arg(long, env = "MC2_INGRESS_CONFIG_DIR")]
-    pub ingress_config_dir: Option<PathBuf>,
-
-    /// Named-volume root on durable node storage (default ~/.microsandbox/volumes).
-    /// Volumes persist across sandbox recreation and are retained on stack removal.
-    #[arg(long, env = "MC2_VOLUME_DIR")]
+/// Configuration for the local node loop.
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    pub name: String,
+    pub labels_json: String,
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub reconcile_interval: Duration,
     pub volume_dir: Option<PathBuf>,
-
-    /// Log and exit without connecting
-    #[arg(long, hide = true)]
-    pub dry_run: bool,
+    pub ingress_config_dir: Option<PathBuf>,
 }
 
-/// Run the agent.
-pub async fn run(args: AgentArgs) -> Result<()> {
-    let name = args
-        .name
-        .clone()
-        .or_else(hostname)
-        .unwrap_or_else(|| "unknown".into());
+/// Register/refresh the local node row; returns its stable node_id.
+pub async fn ensure_local_node(store: Arc<dyn Store>, cfg: &NodeConfig) -> Result<String> {
+    let rec = store
+        .upsert_local_node(mc2_store::NodeJoin {
+            name: cfg.name.clone(),
+            labels_json: cfg.labels_json.clone(),
+            arch: std::env::consts::ARCH.to_string(),
+            cpus: cfg.cpus,
+            memory_mib: cfg.memory_mib,
+        })
+        .await
+        .context("upsert local node")?;
+    Ok(rec.id)
+}
 
-    let runtime: Arc<dyn NodeRuntime> = Arc::new(MicrosandboxRuntime::new(args.volume_dir.clone()));
+/// The reconcile loop. Runs until `shutdown` fires.
+pub async fn run(
+    store: Arc<dyn Store>,
+    secrets_key: Arc<SecretsKey>,
+    cfg: NodeConfig,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<()> {
+    let node_id = ensure_local_node(store.clone(), &cfg).await?;
+    let runtime: Arc<dyn NodeRuntime> = Arc::new(MicrosandboxRuntime::new(cfg.volume_dir.clone()));
 
     info!(
-        node = %name,
-        server = ?args.server,
-        has_token = args.token.is_some(),
+        node = %cfg.name,
+        node_id = %node_id,
         runtime = "microsandbox-sdk",
         ssh = "sdk",
-        ingress_dir = ?args.ingress_config_dir,
+        ingress_dir = ?cfg.ingress_config_dir,
         api = mc2_api::API_VERSION,
-        "MicroCommandControl agent starting"
+        "local node starting"
     );
 
-    let _otlp = mc2_metrics::init("mc2-agent").context("init OTLP metrics")?;
-
-    if args.dry_run {
-        info!("dry_run: not connecting");
-        return Ok(());
-    }
-
-    let server = args
-        .server
-        .clone()
-        .context("missing --server / MC2_SERVER (e.g. https://127.0.0.1:7444)")?;
-    // Join token optional when server was bootstrapped with --no-auth.
-    let join_token = args.token.clone().unwrap_or_default();
-
-    let mut client = connect_with_retry(&server, args.tls_ca.as_ref(), args.insecure)
-        .await
-        .with_context(|| format!("connect to {server}"))?;
-
-    let labels = parse_labels(&args.labels)?;
-    let cpus = args.cpus.unwrap_or_else(|| num_cpus::get() as u32);
-    let memory_mib = args.memory_mib.unwrap_or(8192);
-    let arch = std::env::consts::ARCH.to_string();
-
-    let join_resp = join_with_retry(
-        &mut client,
-        &join_token,
-        &name,
-        labels,
-        &arch,
-        cpus,
-        memory_mib,
-    )
-    .await
-    .context("Join RPC")?;
-
-    info!(
-        node_id = %join_resp.node_id,
-        name = %name,
-        cpus,
-        memory_mib,
-        arch = %arch,
-        "joined control plane"
-    );
-
-    let interval = Duration::from_secs(args.heartbeat_interval_secs.max(1));
+    let interval = cfg.reconcile_interval.max(Duration::from_secs(1));
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -165,56 +85,34 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
     let mut ssh_table = SshServeTable::new();
     let mut fabric_table = FabricTable::new();
-    let mut ingress_writer = args
+    let mut ingress_writer = cfg
         .ingress_config_dir
         .clone()
-        .map(|d| IngressFileWriter::new(d, name.clone()));
-
-    if let Err(e) = reconcile(
-        &mut client,
-        &join_resp.node_id,
-        &join_resp.node_token,
-        runtime.as_ref(),
-        &mut owned,
-        &mut rt_state,
-        &mut ssh_table,
-        &mut fabric_table,
-        ingress_writer.as_mut(),
-    )
-    .await
-    {
-        warn!(error = %e, "initial reconcile failed");
-    }
+        .map(|d| IngressFileWriter::new(d, cfg.name.clone()));
 
     loop {
         tokio::select! {
-            _ = shutdown_signal() => {
-                info!("agent shutting down");
+            _ = shutdown.recv() => {
+                info!("local node shutting down");
                 break;
             }
             _ = ticker.tick() => {
-                match client
-                    .heartbeat(HeartbeatRequest {
-                        node_id: join_resp.node_id.clone(),
-                        node_token: join_resp.node_token.clone(),
-                        capacity: Some(Capacity { cpus, memory_mib }),
-                        status: "Ready".into(),
-                    })
-                    .await
-                {
-                    Ok(resp) => {
-                        mc2_metrics::record_heartbeat();
-                        if !resp.into_inner().ok {
-                            warn!("heartbeat returned ok=false");
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "heartbeat failed"),
-                }
+                // Heartbeat: keep the node row Ready.
+                let _ = store
+                    .touch_node(
+                        &node_id,
+                        NodeHeartbeat {
+                            cpus: cfg.cpus,
+                            memory_mib: cfg.memory_mib,
+                            status: "Ready".into(),
+                        },
+                    )
+                    .await;
 
                 match reconcile(
-                    &mut client,
-                    &join_resp.node_id,
-                    &join_resp.node_token,
+                    store.clone(),
+                    secrets_key.as_ref(),
+                    &node_id,
                     runtime.as_ref(),
                     &mut owned,
                     &mut rt_state,
@@ -237,12 +135,12 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     Ok(())
 }
 
-/// Pull desired set, ensure sandboxes running, remove extras, report phases.
+/// Build desired set, ensure sandboxes running, remove extras, persist phases.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile(
-    client: &mut AgentServiceClient<Channel>,
+    store: Arc<dyn Store>,
+    secrets_key: &SecretsKey,
     node_id: &str,
-    node_token: &str,
     runtime: &dyn NodeRuntime,
     owned: &mut HashSet<String>,
     rt_state: &mut HashMap<String, InstanceRuntimeState>,
@@ -250,17 +148,9 @@ async fn reconcile(
     fabric_table: &mut FabricTable,
     ingress_writer: Option<&mut IngressFileWriter>,
 ) -> Result<()> {
-    let sync = client
-        .sync(SyncRequest {
-            node_id: node_id.into(),
-            node_token: node_token.into(),
-        })
-        .await
-        .context("Sync RPC")?
-        .into_inner();
+    let (mut desired, ingress_routes) =
+        build_desired_set(store.clone(), secrets_key, node_id).await?;
 
-    let ingress_routes = sync.ingress_routes.clone();
-    let mut desired = desired_from_sync(&sync.instances)?;
     let desired_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
 
     // Scale down / GC
@@ -273,7 +163,7 @@ async fn reconcile(
         rt_state.remove(&rid);
     }
 
-    let mut reports: Vec<InstanceStatus> = Vec::new();
+    let mut reports: Vec<InstanceReport> = Vec::new();
     let now = Instant::now();
 
     // Providers first so expose publish index is populated before client edges.
@@ -293,7 +183,7 @@ async fn reconcile(
             if now < next {
                 let ssh = ssh_table.reconcile(d, false).await;
                 let fabric = fabric_table.reconcile_not_running(d).await;
-                reports.push(InstanceStatus {
+                reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Creating".into(),
                     message: format!(
@@ -312,7 +202,7 @@ async fn reconcile(
             warn!(instance_id = %d.instance_id, error = %e, "fabric prepare_exposes failed");
             let ssh = ssh_table.reconcile(d, false).await;
             let fabric = fabric_table.reconcile_not_running(d).await;
-            reports.push(InstanceStatus {
+            reports.push(InstanceReport {
                 instance_id: d.instance_id.clone(),
                 phase: "Failed".into(),
                 message: e,
@@ -336,7 +226,7 @@ async fn reconcile(
             }
         }
         // Expose host ports are only bound at msb create. If we inherited a
-        // Running sandbox without live publish (agent restart / orphan), recreate.
+        // Running sandbox without live publish (server restart / orphan), recreate.
         if !force_recreate {
             if let Some(ports) = fabric_table.expose_host_ports(&d.instance_id) {
                 if !ports.is_empty() && !host_ports_accepting(&ports).await {
@@ -436,14 +326,6 @@ async fn reconcile(
                     }
                 }
 
-                // Track recreates from Failed path (ensure_running did work).
-                if matches!(st.phase, SandboxPhase::Creating)
-                    && state.restart_count > 0
-                    && state.next_restart_ok.is_none()
-                {
-                    // noop — counts set in handle_health_failure
-                }
-
                 let phase = match st.phase {
                     SandboxPhase::Running => "Running",
                     SandboxPhase::Creating => "Creating",
@@ -479,7 +361,7 @@ async fn reconcile(
                     phase,
                     "runtime reconciled"
                 );
-                reports.push(InstanceStatus {
+                reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: phase.into(),
                     message,
@@ -504,7 +386,7 @@ async fn reconcile(
                 }
                 let ssh = ssh_table.reconcile(d, false).await;
                 let fabric = fabric_table.reconcile_not_running(d).await;
-                reports.push(InstanceStatus {
+                reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
                     message: format!("{e:#}"),
@@ -541,22 +423,59 @@ async fn reconcile(
         warn_ingress_dir_unset(ingress_routes.len());
     }
 
-    if reports.is_empty() {
-        return Ok(());
+    // Persist observed phases directly to the store.
+    for r in &reports {
+        let _ = store
+            .update_instance_status(
+                &r.instance_id,
+                &r.phase,
+                if r.runtime_id.is_empty() {
+                    None
+                } else {
+                    Some(r.runtime_id.as_str())
+                },
+                if r.message.is_empty() {
+                    None
+                } else {
+                    Some(r.message.as_str())
+                },
+            )
+            .await;
+
+        if let Some(ref ssh) = r.ssh {
+            let _ = store
+                .update_instance_ssh_observed(
+                    &r.instance_id,
+                    &ssh.phase,
+                    if ssh.bind.is_empty() {
+                        None
+                    } else {
+                        Some(ssh.bind.as_str())
+                    },
+                    if ssh.port == 0 { None } else { Some(ssh.port) },
+                    if ssh.message.is_empty() {
+                        None
+                    } else {
+                        Some(ssh.message.as_str())
+                    },
+                )
+                .await;
+        }
+
+        if let Some(ref fabric) = r.fabric {
+            let phase = fabric_summary_phase(fabric);
+            let json = fabric_observed_json(fabric);
+            let msg = if fabric.message.is_empty() {
+                None
+            } else {
+                Some(fabric.message.as_str())
+            };
+            let _ = store
+                .update_instance_fabric_observed(&r.instance_id, &phase, &json, msg)
+                .await;
+        }
     }
 
-    let ok = client
-        .report_status(ReportStatusRequest {
-            node_id: node_id.into(),
-            node_token: node_token.into(),
-            instances: reports,
-        })
-        .await
-        .context("ReportStatus RPC")?
-        .into_inner();
-    if !ok.ok {
-        warn!("ReportStatus returned ok=false");
-    }
     Ok(())
 }
 
@@ -592,7 +511,6 @@ async fn handle_health_failure(
     }
 }
 
-/// Connect with retries so agent can start before server gRPC is listening.
 /// True if every host port accepts a TCP connect (msb publish live).
 async fn host_ports_accepting(ports: &[u16]) -> bool {
     use tokio::net::TcpStream;
@@ -611,211 +529,36 @@ async fn host_ports_accepting(ports: &[u16]) -> bool {
     true
 }
 
-async fn connect_with_retry(
-    server: &str,
-    tls_ca: Option<&PathBuf>,
-    insecure: bool,
-) -> Result<AgentServiceClient<Channel>> {
-    const ATTEMPTS: u32 = 30;
-    let mut last = None;
-    for attempt in 1..=ATTEMPTS {
-        match connect(server, tls_ca, insecure).await {
-            Ok(c) => {
-                if attempt > 1 {
-                    info!(attempt, "connected to control plane after retry");
-                }
-                return Ok(c);
-            }
-            Err(e) => {
-                last = Some(e);
-                if attempt < ATTEMPTS {
-                    let wait = Duration::from_millis(200 * u64::from(attempt.min(10)));
-                    warn!(
-                        attempt,
-                        wait_ms = wait.as_millis() as u64,
-                        error = %last.as_ref().unwrap(),
-                        "control plane connect failed; retrying"
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-            }
+fn fabric_observed_json(f: &FabricObserved) -> String {
+    serde_json::to_string(f).unwrap_or_else(|_| "{}".into())
+}
+
+fn fabric_summary_phase(f: &FabricObserved) -> String {
+    let mut has_ready = false;
+    let mut has_failed = false;
+    let mut has_pending = false;
+    for e in &f.exposes {
+        match e.phase.as_str() {
+            "Ready" => has_ready = true,
+            "Failed" => has_failed = true,
+            _ => has_pending = true,
         }
     }
-    Err(last.unwrap())
-}
-
-async fn join_with_retry(
-    client: &mut AgentServiceClient<Channel>,
-    join_token: &str,
-    name: &str,
-    labels: HashMap<String, String>,
-    arch: &str,
-    cpus: u32,
-    memory_mib: u64,
-) -> Result<mc2_api::agent::JoinResponse> {
-    const ATTEMPTS: u32 = 15;
-    let mut last = None;
-    for attempt in 1..=ATTEMPTS {
-        match client
-            .join(JoinRequest {
-                join_token: join_token.to_string(),
-                node_name: name.to_string(),
-                labels: labels.clone(),
-                arch: arch.to_string(),
-                capacity: Some(Capacity { cpus, memory_mib }),
-            })
-            .await
-        {
-            Ok(resp) => return Ok(resp.into_inner()),
-            Err(e) => {
-                last = Some(e);
-                if attempt < ATTEMPTS {
-                    let wait = Duration::from_millis(300 * u64::from(attempt.min(10)));
-                    warn!(
-                        attempt,
-                        wait_ms = wait.as_millis() as u64,
-                        error = %last.as_ref().unwrap(),
-                        "Join RPC failed; retrying"
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-            }
+    for e in &f.edges {
+        match e.phase.as_str() {
+            "Ready" => has_ready = true,
+            "Failed" => has_failed = true,
+            _ => has_pending = true,
         }
     }
-    Err(anyhow::Error::from(last.unwrap()).context("Join exhausted retries"))
-}
-
-async fn connect(
-    server: &str,
-    tls_ca: Option<&PathBuf>,
-    insecure: bool,
-) -> Result<AgentServiceClient<Channel>> {
-    let endpoint = Endpoint::from_shared(server.to_string()).context("parse server endpoint")?;
-
-    let endpoint = if server.starts_with("https://") {
-        let mut tls = ClientTlsConfig::new().domain_name(tls_domain(server));
-        if let Some(ca_path) = tls_ca {
-            let pem = std::fs::read_to_string(ca_path)
-                .with_context(|| format!("read TLS CA {}", ca_path.display()))?;
-            tls = tls.ca_certificate(Certificate::from_pem(pem));
-        } else if insecure {
-            bail!(
-                "https requires --tls-ca <ca.pem> for MC2 lab certs (see server data dir tls/ca.pem). \
-                 Or use --server http://HOST:PORT with server --grpc-plain"
-            );
-        } else {
-            bail!("https gRPC requires --tls-ca pointing at the server's tls/ca.pem");
-        }
-        endpoint.tls_config(tls).context("tls_config")?
-    } else {
-        endpoint
-    };
-
-    let channel = endpoint.connect().await.context("channel connect")?;
-    Ok(AgentServiceClient::new(channel))
-}
-
-fn tls_domain(server: &str) -> String {
-    let rest = server
-        .strip_prefix("https://")
-        .or_else(|| server.strip_prefix("http://"))
-        .unwrap_or(server);
-    rest.split(':')
-        .next()
-        .unwrap_or("localhost")
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string()
-}
-
-fn parse_labels(items: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for item in items {
-        let (k, v) = item
-            .split_once('=')
-            .with_context(|| format!("label must be KEY=VALUE, got {item}"))?;
-        map.insert(k.to_string(), v.to_string());
+    if f.exposes.is_empty() && f.edges.is_empty() {
+        return "Pending".into();
     }
-    Ok(map)
-}
-
-fn hostname() -> Option<String> {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                })
-        })
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    {
-        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("sigterm");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sig.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn dry_run_ok() {
-        let args = AgentArgs {
-            server: Some("https://127.0.0.1:7444".into()),
-            token: Some("test".into()),
-            name: Some("test-node".into()),
-            tls_ca: None,
-            insecure: false,
-            heartbeat_interval_secs: 10,
-            cpus: None,
-            memory_mib: None,
-            labels: vec![],
-            ingress_config_dir: None,
-            volume_dir: None,
-            dry_run: true,
-        };
-        run(args).await.expect("dry_run should succeed");
-    }
-
-    #[test]
-    fn parse_labels_ok() {
-        let m = parse_labels(&["role=worker".into(), "zone=a".into()]).unwrap();
-        assert_eq!(m.get("role").unwrap(), "worker");
-        assert_eq!(m.get("zone").unwrap(), "a");
-    }
-
-    #[test]
-    fn tls_domain_extract() {
-        assert_eq!(tls_domain("https://127.0.0.1:7444"), "127.0.0.1");
-        assert_eq!(tls_domain("http://localhost:7444"), "localhost");
+    match (has_failed, has_pending, has_ready) {
+        (true, _, true) => "Mixed".into(),
+        (true, _, false) => "Failed".into(),
+        (false, true, _) => "Pending".into(),
+        (false, false, true) => "Ready".into(),
+        _ => "Pending".into(),
     }
 }

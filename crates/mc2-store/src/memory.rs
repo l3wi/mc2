@@ -44,11 +44,7 @@ impl Store for MemoryStore {
         Ok(self.inner.read().await.meta.clone())
     }
 
-    async fn init_cluster(
-        &self,
-        api_token_hash: &str,
-        join_token_hash: &str,
-    ) -> Result<ClusterMeta, StoreError> {
+    async fn init_cluster(&self, api_token_hash: &str) -> Result<ClusterMeta, StoreError> {
         let mut g = self.inner.write().await;
         if g.meta.is_some() {
             return Err(StoreError::AlreadyExists("cluster".into()));
@@ -56,7 +52,6 @@ impl Store for MemoryStore {
         let meta = ClusterMeta {
             initialized: true,
             api_token_hash: api_token_hash.to_string(),
-            join_token_hash: join_token_hash.to_string(),
             created_at: Utc::now().to_rfc3339(),
         };
         g.meta = Some(meta.clone());
@@ -77,20 +72,6 @@ impl Store for MemoryStore {
         Ok(verify_token(token, &meta.api_token_hash))
     }
 
-    async fn verify_join_token(&self, token: &str) -> Result<bool, StoreError> {
-        let g = self.inner.read().await;
-        let Some(meta) = &g.meta else {
-            return Ok(false);
-        };
-        if meta.join_token_hash.is_empty() {
-            return Ok(true);
-        }
-        if token.is_empty() {
-            return Ok(false);
-        }
-        Ok(verify_token(token, &meta.join_token_hash))
-    }
-
     async fn api_auth_required(&self) -> Result<bool, StoreError> {
         Ok(self
             .inner
@@ -99,17 +80,6 @@ impl Store for MemoryStore {
             .meta
             .as_ref()
             .map(|m| !m.api_token_hash.is_empty())
-            .unwrap_or(true))
-    }
-
-    async fn join_auth_required(&self) -> Result<bool, StoreError> {
-        Ok(self
-            .inner
-            .read()
-            .await
-            .meta
-            .as_ref()
-            .map(|m| !m.join_token_hash.is_empty())
             .unwrap_or(true))
     }
 
@@ -127,7 +97,7 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn upsert_node_join(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
+    async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
         if let Some(id) = g.by_name.get(&join.name).cloned() {
@@ -136,7 +106,6 @@ impl Store for MemoryStore {
             node.arch = join.arch;
             node.cpus = join.cpus;
             node.memory_mib = join.memory_mib;
-            node.node_token_hash = join.node_token_hash;
             node.status = NodeStatus::Ready.as_str().into();
             node.last_heartbeat = Some(now);
             return Ok(node.clone());
@@ -152,27 +121,18 @@ impl Store for MemoryStore {
             status: NodeStatus::Ready.as_str().into(),
             last_heartbeat: Some(now.clone()),
             created_at: now,
-            node_token_hash: join.node_token_hash,
         };
         g.by_name.insert(join.name, id.clone());
         g.nodes.insert(id, rec.clone());
         Ok(rec)
     }
 
-    async fn heartbeat_node(
-        &self,
-        node_id: &str,
-        node_token: &str,
-        hb: NodeHeartbeat,
-    ) -> Result<NodeRecord, StoreError> {
+    async fn touch_node(&self, node_id: &str, hb: NodeHeartbeat) -> Result<NodeRecord, StoreError> {
         let mut g = self.inner.write().await;
         let node = g
             .nodes
             .get_mut(node_id)
             .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
-        if !verify_token(node_token, &node.node_token_hash) {
-            return Err(StoreError::Unauthorized);
-        }
         node.cpus = hb.cpus;
         node.memory_mib = hb.memory_mib;
         node.status = hb.status;
@@ -644,10 +604,7 @@ mod tests {
     #[tokio::test]
     async fn replicas_scale() {
         let store = MemoryStore::new();
-        store
-            .init_cluster(&hash_token("a"), &hash_token("j"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("a")).await.unwrap();
         store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
             .reconcile_service_replicas("demo", "web", 2, r#"{"image":"x"}"#)
@@ -665,10 +622,7 @@ mod tests {
     #[tokio::test]
     async fn unbind_returns_to_pending() {
         let store = MemoryStore::new();
-        store
-            .init_cluster(&hash_token("a"), &hash_token("j"))
-            .await
-            .unwrap();
+        store.init_cluster(&hash_token("a")).await.unwrap();
         store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
             .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)

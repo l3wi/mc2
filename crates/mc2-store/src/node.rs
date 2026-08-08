@@ -1,4 +1,4 @@
-//! Node records (agents registered with the control plane).
+//! Node records (single local node in v1).
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +32,7 @@ impl NodeStatus {
     }
 }
 
-/// Persisted node (agent) record.
+/// Persisted node record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub id: String,
@@ -44,12 +44,9 @@ pub struct NodeRecord {
     pub status: String,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
-    /// SHA-256 hex of node token; never returned over operator REST.
-    #[serde(skip_serializing)]
-    pub node_token_hash: String,
 }
 
-/// Inputs for join / re-join.
+/// Inputs for local-node upsert at server start.
 #[derive(Debug, Clone)]
 pub struct NodeJoin {
     pub name: String,
@@ -57,7 +54,6 @@ pub struct NodeJoin {
     pub arch: String,
     pub cpus: u32,
     pub memory_mib: u64,
-    pub node_token_hash: String,
 }
 
 /// Heartbeat capacity update.

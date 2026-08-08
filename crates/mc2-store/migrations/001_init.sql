@@ -4,7 +4,6 @@ CREATE TABLE IF NOT EXISTS cluster_meta (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     initialized INTEGER NOT NULL DEFAULT 0,
     api_token_hash TEXT NOT NULL,
-    join_token_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 

@@ -13,7 +13,7 @@ async fn cluster_meta_survives_reopen() {
         let store = SqliteStore::open(&db).await.unwrap();
         assert!(store.get_cluster_meta().await.unwrap().is_none());
         store
-            .init_cluster(&hash_token("api-persist"), &hash_token("join-persist"))
+            .init_cluster(&hash_token("api-persist"))
             .await
             .unwrap();
     }
@@ -23,7 +23,6 @@ async fn cluster_meta_survives_reopen() {
     assert!(meta.initialized);
     assert!(store.verify_api_token("api-persist").await.unwrap());
     assert!(!store.verify_api_token("wrong").await.unwrap());
-    assert!(store.verify_join_token("join-persist").await.unwrap());
 }
 
 #[tokio::test]

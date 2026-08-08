@@ -31,10 +31,10 @@ Fields:
 
 ## Node-local behavior
 
-Volumes are node-local: the agent creates them under its named-volume root
-(default `~/.microsandbox/volumes`, override with `mc2 agent --volume-dir`).
+Volumes are node-local: the server creates them under its named-volume root
+(default `~/.microsandbox/volumes`, override with `mc2 server --volume-dir`).
 MC2 resolves each volume to a namespaced identity (`mc2-<stack>--<volume>`) at
-sandbox create time, so user-facing YAML names stay unchanged. The agent
+sandbox create time, so user-facing YAML names stay unchanged. The server
 canonicalizes `--volume-dir` because the underlying mount refuses to follow
 symlinks (e.g. macOS `/tmp` → `/private/tmp`).
 
@@ -62,12 +62,12 @@ coordination is the application's responsibility.
 
 ## Run it (lab)
 
-Start the server and agent using the
-[quickstart](../../docs/guides/quickstart.md), optionally pointing the agent at
+Start the server using the
+[quickstart](../../docs/guides/quickstart.md), optionally pointing it at
 a throwaway volume root:
 
 ```bash
-mc2 agent --server ... --token ... --volume-dir /tmp/mc2-lab-volumes
+mc2 server --volume-dir /tmp/mc2-lab-volumes ...
 mc2 apply -f examples/06-persistent-volumes/stack.yaml
 ```
 

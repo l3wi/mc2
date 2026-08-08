@@ -188,7 +188,6 @@ mod tests {
             status: "Ready".into(),
             last_heartbeat: None,
             created_at: String::new(),
-            node_token_hash: String::new(),
         }
     }
 

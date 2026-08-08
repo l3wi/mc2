@@ -1,4 +1,4 @@
-//! Node runtime for MicroCommandControl agents.
+//! Node runtime for MicroCommandControl (embedded microsandbox SDK backend).
 //!
 //! Sole backend: official [`microsandbox`](https://docs.rs/microsandbox) Rust SDK.
 
@@ -14,8 +14,8 @@ pub use naming::{sandbox_name, volume_mount_plan, volume_name};
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod fabric;
 pub use fabric::{
-    fabric_expose_guest_ports, fabric_from_proto, fabric_host_allow_ports, DesiredFabric,
-    FabricAllowDesired, FabricExposeDesired,
+    fabric_expose_guest_ports, fabric_host_allow_ports, DesiredFabric, FabricAllowDesired,
+    FabricEdgeStatus, FabricExposeDesired, FabricExposeStatus, FabricObserved,
 };
 pub mod ingress {
     pub use crate::ingress_render::*;
@@ -24,7 +24,9 @@ pub use ingress_render::{
     make_route_id, normalize_path, render_catalog_json, render_traefik_dynamic,
     DesiredIngressRoute, ReadyIngressRoute,
 };
-pub use spec::{desired_from_sync, DesiredSandbox, DesiredSsh, InjectedSecret, SandboxPhase};
+pub use spec::{
+    DesiredSandbox, DesiredSsh, InjectedSecret, InstanceReport, SandboxPhase, SshObserved,
+};
 pub use spec_hash::desired_recreate_hash;
 
 use anyhow::Result;

@@ -1,7 +1,6 @@
 //! Write Traefik Ingress catalog files (D7).
 
 use anyhow::{Context, Result};
-use mc2_api::agent::IngressRouteDesired;
 use mc2_runtime::{render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, SandboxPhase};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,42 +26,20 @@ impl IngressFileWriter {
         }
     }
 
-    /// Render ready routes from Sync plan + local instance phases; write files if changed.
+    /// Render ready routes from the desired plan + local instance phases; write files if changed.
     ///
     /// `phases` maps instance_id → phase string (`Running`, …).
     pub async fn reconcile(
         &mut self,
-        routes: &[IngressRouteDesired],
+        routes: &[DesiredIngressRoute],
         phases: &HashMap<String, String>,
     ) -> Result<IngressRenderStatus> {
         let mut ready = Vec::new();
         let mut pending = Vec::new();
 
-        for r in routes {
-            let desired = DesiredIngressRoute {
-                id: r.id.clone(),
-                stack: r.stack.clone(),
-                host: r.host.clone(),
-                path: r.path.clone(),
-                path_type: r.path_type.clone(),
-                service: r.service.clone(),
-                guest_port: r.guest_port as u16,
-                host_port: r.host_port as u16,
-                bind: if r.bind.is_empty() {
-                    "127.0.0.1".into()
-                } else {
-                    r.bind.clone()
-                },
-                tls_enabled: r.tls_enabled,
-                cert_resolver: r.cert_resolver.clone(),
-                tcp: r.tcp,
-                entry_point: r.entry_point.clone(),
-                backend_instance_id: r.backend_instance_id.clone(),
-                backend_ordinal: r.backend_ordinal,
-            };
-
+        for desired in routes {
             let phase = phases
-                .get(&r.backend_instance_id)
+                .get(&desired.backend_instance_id)
                 .map(|s| s.as_str())
                 .unwrap_or("");
             let running = phase == SandboxPhase::Running.as_str() || phase == "Running";
@@ -73,7 +50,7 @@ impl IngressFileWriter {
             };
 
             if running
-                && !r.backend_instance_id.is_empty()
+                && !desired.backend_instance_id.is_empty()
                 && desired.host_port > 0
                 && port_accepting(bind_host, desired.host_port).await
             {
@@ -187,7 +164,7 @@ pub fn warn_ingress_dir_unset(route_count: usize) {
     if route_count > 0 {
         warn!(
             routes = route_count,
-            "ingress routes in Sync but --ingress-config-dir / MC2_INGRESS_CONFIG_DIR unset; not rendering files"
+            "ingress routes planned but --ingress-config-dir / MC2_INGRESS_CONFIG_DIR unset; not rendering files"
         );
     }
 }
@@ -197,8 +174,8 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    fn route(host_port: u16, instance_id: &str) -> IngressRouteDesired {
-        IngressRouteDesired {
+    fn route(host_port: u16, instance_id: &str) -> DesiredIngressRoute {
+        DesiredIngressRoute {
             id: "demo-app.local-/-web-8000".into(),
             stack: "demo".into(),
             host: "app.local".into(),
@@ -206,7 +183,7 @@ mod tests {
             path_type: "Prefix".into(),
             service: "web".into(),
             guest_port: 8000,
-            host_port: u32::from(host_port),
+            host_port,
             bind: "127.0.0.1".into(),
             tls_enabled: false,
             cert_resolver: String::new(),
@@ -328,7 +305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_route_removed_from_sync() {
+    async fn lifecycle_route_removed_from_plan() {
         let dir = tempfile::tempdir().unwrap();
         let mut writer = IngressFileWriter::new(dir.path().to_path_buf(), "n".into());
         let (listener, port) = listen_ephemeral().await;
@@ -341,7 +318,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Empty Sync routes (stack ingress deleted).
+        // Empty desired routes (stack ingress deleted).
         let st = writer.reconcile(&[], &phases).await.unwrap();
         assert_eq!(st.ready, 0);
         assert!(st.wrote);

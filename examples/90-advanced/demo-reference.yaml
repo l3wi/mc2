@@ -42,7 +42,7 @@ services:
       app: web
 
 # volumes: {}
-# Optional north–south HTTP via BYO Traefik (agent --ingress-config-dir):
+# Optional north–south HTTP via BYO Traefik (server --ingress-config-dir):
 # ingress:
 #   tls:
 #     enabled: true

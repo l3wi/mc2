@@ -1,14 +1,12 @@
-//! Integration: cluster secrets + agent injection material for sandboxes.
+//! Integration: cluster secrets + node injection material for sandboxes.
 //!
-//! CI does not boot microVMs. These tests exercise the same control-plane path a
-//! real agent uses before `Sandbox::create_detached` (set → apply → Sync secrets).
+//! CI does not boot microVMs. These tests exercise the same control-plane path
+//! the node loop uses before `Sandbox::create_detached` (set → apply → desired set).
 
-use mc2_api::agent::agent_service_client::AgentServiceClient;
-use mc2_api::agent::{Capacity, InstanceStatus, JoinRequest, ReportStatusRequest, SyncRequest};
-use mc2_runtime::desired_from_sync;
+use mc2_server::build_desired_set;
+use mc2_store::{SecretsKey, Store};
 use mc2_tests::TestCluster;
 use reqwest::StatusCode;
-use std::collections::HashMap;
 
 const SECRET_NAME: &str = "SMOKE_TOKEN";
 const SECRET_VALUE: &str = "smoke-secret-value-never-echo";
@@ -40,31 +38,8 @@ services:
     command: ["sleep", "infinity"]
 "#;
 
-async fn join_worker(
-    cluster: &TestCluster,
-) -> (
-    AgentServiceClient<tonic::transport::Channel>,
-    String,
-    String,
-) {
-    let mut agent = AgentServiceClient::connect(cluster.grpc_url.clone())
-        .await
-        .expect("grpc connect");
-    let join = agent
-        .join(JoinRequest {
-            join_token: cluster.join_token.clone(),
-            node_name: "smoke-worker".into(),
-            labels: HashMap::new(),
-            arch: "aarch64".into(),
-            capacity: Some(Capacity {
-                cpus: 4,
-                memory_mib: 8192,
-            }),
-        })
-        .await
-        .expect("join")
-        .into_inner();
-    (agent, join.node_id, join.node_token)
+fn load_key(cluster: &TestCluster) -> SecretsKey {
+    SecretsKey::load_file(&cluster.data_dir.join("secrets.key")).unwrap()
 }
 
 #[tokio::test]
@@ -109,13 +84,12 @@ async fn set_list_delete_secret_no_value_echo() {
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
 }
 
-/// Smoke: secret set → stack apply → agent Sync delivers injection material for the sandbox.
+/// Smoke: secret set → stack apply → desired set carries injection material for the sandbox.
 ///
 /// Mirrors lab path before msb `create_detached` (env + value + allowHosts).
 #[tokio::test]
-async fn secret_reaches_agent_sync_for_sandbox() {
+async fn secret_reaches_desired_set_for_sandbox() {
     let cluster = TestCluster::start().await.expect("start");
-    let (mut agent, node_id, node_token) = join_worker(&cluster).await;
 
     let put = cluster
         .client()
@@ -141,41 +115,25 @@ async fn secret_reaches_agent_sync_for_sandbox() {
     assert_eq!(body["scheduled"], 1);
     assert_eq!(body["pending"], 0);
 
-    let sync = agent
-        .sync(SyncRequest {
-            node_id: node_id.clone(),
-            node_token: node_token.clone(),
-        })
+    let key = load_key(&cluster);
+    let (desired, _) = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect("sync with resolved secrets")
-        .into_inner();
-    assert_eq!(sync.instances.len(), 1);
+        .expect("build desired set with resolved secrets");
+    assert_eq!(desired.len(), 1);
 
-    let desired = &sync.instances[0];
-    assert_eq!(desired.stack, "smoke-secrets");
-    assert_eq!(desired.service, "keep");
-    assert_eq!(
-        desired.secrets.len(),
-        1,
-        "agent must receive secret injections"
-    );
+    let d = &desired[0];
+    assert_eq!(d.stack, "smoke-secrets");
+    assert_eq!(d.service, "keep");
+    assert_eq!(d.secrets.len(), 1, "node must receive secret injections");
 
-    let inj = &desired.secrets[0];
+    let inj = &d.secrets[0];
     assert_eq!(inj.env, SECRET_ENV);
     assert_eq!(inj.value, SECRET_VALUE);
     assert_eq!(inj.allow_hosts, vec![ALLOW_HOST]);
-
-    // Same mapping the real agent uses before SDK create.
-    let work = desired_from_sync(&sync.instances).expect("desired_from_sync");
-    assert_eq!(work.len(), 1);
-    assert_eq!(work[0].secrets.len(), 1);
-    assert_eq!(work[0].secrets[0].env, SECRET_ENV);
-    assert_eq!(work[0].secrets[0].value, SECRET_VALUE);
-    assert_eq!(work[0].secrets[0].allow_hosts, vec![ALLOW_HOST]);
     assert!(
-        work[0].runtime_id.contains("smoke") || work[0].runtime_id.contains("keep"),
+        d.runtime_id.contains("smoke") || d.runtime_id.contains("keep"),
         "runtime_id={:?}",
-        work[0].runtime_id
+        d.runtime_id
     );
 
     // REST must still never expose plaintext after injection path runs.
@@ -188,20 +146,10 @@ async fn secret_reaches_agent_sync_for_sandbox() {
         .unwrap();
     assert!(!list.text().await.unwrap().contains(SECRET_VALUE));
 
-    // Report Running as a real agent would after sandbox create.
-    agent
-        .report_status(ReportStatusRequest {
-            node_id: node_id.clone(),
-            node_token: node_token.clone(),
-            instances: vec![InstanceStatus {
-                instance_id: desired.instance_id.clone(),
-                phase: "Running".into(),
-                message: "secrets smoke (injection material verified; no hypervisor)".into(),
-                runtime_id: work[0].runtime_id.clone(),
-                ssh: None,
-                fabric: None,
-            }],
-        })
+    // Report Running as the node loop would after sandbox create.
+    cluster
+        .store
+        .update_instance_status(&d.instance_id, "Running", Some(&d.runtime_id), None)
         .await
         .unwrap();
 
@@ -213,14 +161,14 @@ async fn secret_reaches_agent_sync_for_sandbox() {
     let arr = instances.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["phase"], "Running");
-    assert_eq!(arr[0]["node_id"], node_id);
+    assert_eq!(arr[0]["node_id"], cluster.local_node_id);
 }
 
-/// Missing secret is fine at apply (desired state stores refs) but Sync fails closed.
+/// Missing secret is fine at apply (desired state stores refs) but the desired
+/// set fails closed.
 #[tokio::test]
-async fn sync_fails_when_secret_missing() {
+async fn desired_set_fails_when_secret_missing() {
     let cluster = TestCluster::start().await.expect("start");
-    let (mut agent, node_id, node_token) = join_worker(&cluster).await;
 
     let yaml = r#"
 apiVersion: mc2/v1
@@ -252,32 +200,21 @@ services:
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["scheduled"], 1);
 
-    let err = agent
-        .sync(SyncRequest {
-            node_id,
-            node_token,
-        })
+    let key = load_key(&cluster);
+    let err = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect_err("sync must refuse missing secret");
-    let status = err.code();
-    assert_eq!(
-        status,
-        tonic::Code::FailedPrecondition,
-        "got {status:?}: {err}"
-    );
-    let msg = err.message().to_lowercase();
+        .expect_err("desired set must refuse missing secret");
+    let msg = format!("{err:#}").to_lowercase();
     assert!(
         msg.contains("missing_secret") || msg.contains("not found") || msg.contains("secret"),
-        "unexpected message: {}",
-        err.message()
+        "unexpected message: {msg}"
     );
 }
 
 /// Empty allowHosts must not produce inject-able material (msb requires host allowlist).
 #[tokio::test]
-async fn sync_fails_when_allow_hosts_empty() {
+async fn desired_set_fails_when_allow_hosts_empty() {
     let cluster = TestCluster::start().await.expect("start");
-    let (mut agent, node_id, node_token) = join_worker(&cluster).await;
 
     let put = cluster
         .client()
@@ -317,17 +254,10 @@ services:
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let err = agent
-        .sync(SyncRequest {
-            node_id,
-            node_token,
-        })
+    let key = load_key(&cluster);
+    let err = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect_err("sync must refuse empty allowHosts");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        err.message().to_lowercase().contains("allow"),
-        "message={}",
-        err.message()
-    );
+        .expect_err("desired set must refuse empty allowHosts");
+    let msg = format!("{err:#}").to_lowercase();
+    assert!(msg.contains("allow"), "message={msg}");
 }

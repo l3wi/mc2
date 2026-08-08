@@ -1,60 +1,51 @@
-//! MicroCommandControl server process (control plane).
+//! MicroCommandControl server process (control plane + local node).
 
 mod apply;
 mod auth;
 mod bootstrap;
+pub mod desired;
 mod fabric;
-mod grpc;
+mod fabric_serve;
 mod http;
 mod ingress;
+mod ingress_files;
+mod node;
 mod reschedule;
 mod scheduler;
 mod secrets;
 mod ssh;
-mod tls;
+mod ssh_serve;
 mod watcher;
 
 pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
-pub use grpc::AgentSvc;
+pub use desired::build_desired_set;
 pub use http::router;
 pub use reschedule::reschedule_not_ready;
 pub use secrets::{decrypt_secret, set_secret};
-pub use tls::{ensure_dev_tls, TlsPaths};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use mc2_api::agent::agent_service_server::AgentServiceServer;
 use mc2_store::{SecretsKey, SqliteStore, Store};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::{Identity, Server as GrpcServer, ServerTlsConfig};
 use tracing::info;
 
-/// Arguments for `mc2 server`.
+/// Arguments for `mc2 server` (control plane + local node in one process).
 #[derive(Debug, Clone, Parser)]
 pub struct ServerArgs {
     /// Address to bind the operator REST API
     #[arg(long, default_value = "127.0.0.1:7443", env = "MC2_BIND")]
     pub bind: String,
 
-    /// Address to bind the agent gRPC API
-    #[arg(long, default_value = "127.0.0.1:7444", env = "MC2_GRPC_BIND")]
-    pub grpc_bind: String,
-
-    /// Data directory (SQLite, tokens, TLS material)
+    /// Data directory (SQLite, tokens)
     #[arg(long, default_value = "~/.mc2", env = "MC2_DATA_DIR")]
     pub data_dir: String,
 
     /// Path to secrets encryption key (32 bytes). Default: `<data_dir>/secrets.key`
     #[arg(long, env = "MC2_SECRETS_KEY_PATH")]
     pub secrets_key_path: Option<String>,
-
-    /// Serve agent gRPC over plain h2c (no TLS). Default is TLS with lab certs in `<data_dir>/tls`.
-    #[arg(long, env = "MC2_GRPC_PLAIN", default_value_t = false)]
-    pub grpc_plain: bool,
 
     /// Seconds without heartbeat before a Ready node becomes NotReady
     #[arg(long, default_value_t = 45, env = "MC2_HEARTBEAT_GRACE_SECS")]
@@ -64,12 +55,41 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 5, env = "MC2_RESCHEDULE_INTERVAL_SECS")]
     pub reschedule_interval_secs: u64,
 
+    /// Local node name (defaults to hostname)
+    #[arg(long, env = "MC2_NODE_NAME")]
+    pub node_name: Option<String>,
+
+    /// Node labels as `key=value` (repeatable)
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
+    /// Advertise CPU capacity (default: host logical CPUs)
+    #[arg(long, env = "MC2_NODE_CPUS")]
+    pub cpus: Option<u32>,
+
+    /// Advertise memory capacity MiB (default: 8192 if unknown)
+    #[arg(long, env = "MC2_NODE_MEMORY_MIB")]
+    pub memory_mib: Option<u64>,
+
+    /// Node reconcile interval seconds
+    #[arg(long, default_value_t = 10, env = "MC2_RECONCILE_INTERVAL_SECS")]
+    pub reconcile_interval_secs: u64,
+
+    /// Directory for Traefik Ingress catalog files. Same-node BYO proxy.
+    #[arg(long, env = "MC2_INGRESS_CONFIG_DIR")]
+    pub ingress_config_dir: Option<PathBuf>,
+
+    /// Named-volume root on durable node storage (default ~/.microsandbox/volumes).
+    /// Volumes persist across sandbox recreation and are retained on stack removal.
+    #[arg(long, env = "MC2_VOLUME_DIR")]
+    pub volume_dir: Option<PathBuf>,
+
     /// Bootstrap only: init data dir + tokens + exit (no listen)
     #[arg(long)]
     pub init_only: bool,
 
-    /// Initialize without API/join tokens. REST and agent join work without
-    /// credentials (lab only). Only applies on first bootstrap of a data dir.
+    /// Initialize without an API token (lab only). Only applies on first
+    /// bootstrap of a data dir.
     #[arg(long, env = "MC2_NO_AUTH", default_value_t = false)]
     pub no_auth: bool,
 
@@ -113,7 +133,7 @@ async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
     }
 }
 
-/// Run the control plane.
+/// Run the control plane + local node.
 pub async fn run(args: ServerArgs) -> Result<()> {
     let data_dir = expand_data_dir(&args.data_dir);
     let secrets_key_path = args
@@ -122,12 +142,8 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .map(|p| expand_data_dir(p))
         .unwrap_or_else(|| data_dir.join("secrets.key"));
 
-    let use_tls = !args.grpc_plain;
-
     info!(
         bind = %args.bind,
-        grpc_bind = %args.grpc_bind,
-        grpc_tls = use_tls,
         data_dir = %data_dir.display(),
         secrets_key = %secrets_key_path.display(),
         api = mc2_api::API_VERSION,
@@ -160,29 +176,17 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             "API token  (REST Authorization: Bearer …): {}",
             plain.api_token
         );
-        eprintln!(
-            "Join token (agent --token):                {}",
-            plain.join_token
-        );
         eprintln!("Data dir: {}", data_dir.display());
         eprintln!("=========================================================================");
     } else if args.no_auth {
         if store.api_auth_required().await.unwrap_or(true) {
             info!("MC2_NO_AUTH/--no-auth ignored: cluster already has API auth configured");
         } else {
-            info!(db = %boot.db_path.display(), "open cluster (no API/join tokens)");
+            info!(db = %boot.db_path.display(), "open cluster (no API token)");
         }
     } else {
         info!(db = %boot.db_path.display(), "cluster already initialized");
     }
-
-    let tls_paths = if use_tls {
-        Some(ensure_dev_tls(&data_dir).context("ensure dev TLS")?)
-    } else {
-        // Still generate material for operators who flip TLS on later.
-        let _ = ensure_dev_tls(&data_dir);
-        None
-    };
 
     if args.init_only || args.dry_run {
         info!(
@@ -206,11 +210,6 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .with_context(|| format!("bind REST {}", args.bind))?;
     let rest_addr = rest_listener.local_addr().context("rest local_addr")?;
 
-    let grpc_addr: SocketAddr = args
-        .grpc_bind
-        .parse()
-        .with_context(|| format!("parse grpc bind {}", args.grpc_bind))?;
-
     let grace = Duration::from_secs(args.heartbeat_grace_secs);
     let store_watch = store.clone() as Arc<dyn Store>;
     tokio::spawn(async move {
@@ -231,52 +230,83 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         metrics_loop(store_metrics, Duration::from_secs(15)).await;
     });
 
-    let agent = AgentSvc {
-        store: store as Arc<dyn Store>,
-        secrets_key,
+    // Local node loop (embedded microsandbox runtime).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let node_cfg = node::NodeConfig {
+        name: args
+            .node_name
+            .clone()
+            .or_else(hostname)
+            .unwrap_or_else(|| "local".into()),
+        labels_json: serde_json::to_string(&parse_labels(&args.labels)?)
+            .unwrap_or_else(|_| "{}".into()),
+        cpus: args.cpus.unwrap_or_else(|| num_cpus::get() as u32),
+        memory_mib: args.memory_mib.unwrap_or(8192),
+        reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
+        volume_dir: args.volume_dir.clone(),
+        ingress_config_dir: args.ingress_config_dir.clone(),
     };
-    let svc = AgentServiceServer::new(agent);
+    let store_node = store.clone() as Arc<dyn Store>;
+    let node_task = tokio::spawn(async move {
+        if let Err(e) = node::run(store_node, secrets_key, node_cfg, shutdown_rx).await {
+            tracing::error!(error = %e, "local node loop failed");
+        }
+    });
+
+    let (rest_tx, rest_rx) = tokio::sync::oneshot::channel::<()>();
+    let rest_task = tokio::spawn(async move {
+        let _ = axum::serve(rest_listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rest_rx.await;
+            })
+            .await;
+    });
 
     info!(%rest_addr, "REST listening; health: GET /health, status: GET /v1/status, nodes: GET /v1/nodes");
-    if let Some(ref paths) = tls_paths {
-        info!(
-            %grpc_addr,
-            ca = %paths.ca_cert.display(),
-            "gRPC listening with TLS; agents: mc2 agent --server https://HOST:PORT --tls-ca <ca.pem>"
-        );
-    } else {
-        info!(%grpc_addr, "gRPC listening plain (h2c); agents: mc2 agent --server http://HOST:PORT");
-    }
 
-    let rest = axum::serve(rest_listener, app).with_graceful_shutdown(shutdown_signal());
-
-    let grpc = async move {
-        let mut builder = GrpcServer::builder();
-        if let Some(paths) = tls_paths {
-            let cert = std::fs::read(&paths.server_cert).context("read server cert")?;
-            let key = std::fs::read(&paths.server_key).context("read server key")?;
-            let identity = Identity::from_pem(cert, key);
-            let tls = ServerTlsConfig::new().identity(identity);
-            builder = builder.tls_config(tls).context("grpc tls_config")?;
-        }
-        builder
-            .add_service(svc)
-            .serve_with_shutdown(grpc_addr, shutdown_signal())
-            .await
-            .context("grpc serve")?;
-        Ok::<(), anyhow::Error>(())
-    };
-
-    tokio::try_join!(
-        async {
-            rest.await.context("rest serve")?;
-            Ok::<(), anyhow::Error>(())
-        },
-        grpc
-    )?;
-
+    shutdown_signal().await;
+    let _ = shutdown_tx.send(());
+    let _ = node_task.await;
+    let _ = rest_tx.send(());
+    let _ = rest_task.await;
     info!("server stopped");
     Ok(())
+}
+
+fn parse_labels(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for item in items {
+        let (k, v) = item
+            .split_once('=')
+            .with_context(|| anyhow::anyhow!("label must be KEY=VALUE, got {item}"))?;
+        map.insert(k.to_string(), v.to_string());
+    }
+    Ok(map)
+}
+
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+        })
 }
 
 async fn shutdown_signal() {
@@ -320,12 +350,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let args = ServerArgs {
             bind: "127.0.0.1:0".into(),
-            grpc_bind: "127.0.0.1:0".into(),
             data_dir: dir.path().to_string_lossy().into(),
             secrets_key_path: None,
-            grpc_plain: true,
             heartbeat_grace_secs: 45,
             reschedule_interval_secs: 5,
+            node_name: None,
+            labels: vec![],
+            cpus: None,
+            memory_mib: None,
+            reconcile_interval_secs: 10,
+            ingress_config_dir: None,
+            volume_dir: None,
             init_only: false,
             no_auth: false,
             dry_run: true,

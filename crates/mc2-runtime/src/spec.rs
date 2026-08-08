@@ -1,11 +1,9 @@
-//! Shared desired-state types for the runtime.
+//! Shared desired-state and report types for the runtime.
 
-use mc2_api::agent::DesiredInstance;
 use mc2_api::ServiceSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::fabric::{fabric_from_proto, DesiredFabric};
-use crate::sandbox_name;
+use crate::fabric::DesiredFabric;
 
 /// Phase reported to the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +30,7 @@ impl SandboxPhase {
     }
 }
 
-/// Host-side secret injection material (plaintext only on agent).
+/// Host-side secret injection material (plaintext only on the node).
 #[derive(Debug, Clone)]
 pub struct InjectedSecret {
     pub env: String,
@@ -66,58 +64,29 @@ pub struct DesiredSandbox {
     pub fabric: DesiredFabric,
 }
 
-/// Map gRPC desired instances into runtime work items.
-pub fn desired_from_sync(instances: &[DesiredInstance]) -> anyhow::Result<Vec<DesiredSandbox>> {
-    let mut out = Vec::with_capacity(instances.len());
-    for d in instances {
-        let spec: ServiceSpec = serde_json::from_str(&d.spec_json)
-            .map_err(|e| anyhow::anyhow!("parse spec for {}: {e}", d.instance_id))?;
-        let runtime_id = sandbox_name(&d.stack, &d.service, d.ordinal);
-        let secrets = d
-            .secrets
-            .iter()
-            .map(|s| InjectedSecret {
-                env: s.env.clone(),
-                value: s.value.clone(),
-                allow_hosts: s.allow_hosts.clone(),
-            })
-            .collect();
-        let ssh = d
-            .ssh
-            .as_ref()
-            .map(|s| DesiredSsh {
-                enabled: s.enabled,
-                bind: if s.bind.is_empty() {
-                    "127.0.0.1".into()
-                } else {
-                    s.bind.clone()
-                },
-                port: s.port as u16,
-                user: if s.user.is_empty() {
-                    "root".into()
-                } else {
-                    s.user.clone()
-                },
-                sftp: s.sftp,
-                authorized_public_keys: s.authorized_public_keys.clone(),
-                config_hash: s.config_hash.clone(),
-            })
-            .unwrap_or_default();
-        let fabric = fabric_from_proto(d.fabric.as_ref());
-        out.push(DesiredSandbox {
-            instance_id: d.instance_id.clone(),
-            stack: d.stack.clone(),
-            service: d.service.clone(),
-            ordinal: d.ordinal,
-            runtime_id,
-            spec,
-            secrets,
-            ssh,
-            fabric,
-        });
-    }
-    Ok(out)
+/// Observed SSH serve state for one instance (reported to the store).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshObserved {
+    pub phase: String, // Closed | Opening | Open | Failed
+    pub bind: String,
+    pub port: u16,
+    pub message: String,
 }
+
+/// One instance's reconcile report (phase + observed ssh/fabric).
+#[derive(Debug, Clone)]
+pub struct InstanceReport {
+    pub instance_id: String,
+    pub phase: String, // Pending | Scheduled | Creating | Running | Failed | Stopped
+    pub message: String,
+    pub runtime_id: String,
+    pub ssh: Option<SshObserved>,
+    pub fabric: Option<FabricObservedReport>,
+}
+
+/// Alias: fabric observed snapshot carried in an [`InstanceReport`].
+pub type FabricObservedReport = crate::fabric::FabricObserved;
 
 /// Guest command argv for the SDK `background_command` (detached run).
 pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
@@ -133,7 +102,7 @@ pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mc2_api::agent::SecretInjection;
+    use crate::sandbox_name;
 
     #[test]
     fn start_parts_default() {
@@ -160,8 +129,7 @@ mod tests {
         assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
     }
 
-    #[test]
-    fn desired_from_sync_maps_secret_injections() {
+    fn build_work_item() -> DesiredSandbox {
         let spec = ServiceSpec {
             image: "alpine:3.20".into(),
             replicas: 1,
@@ -182,72 +150,48 @@ mod tests {
             allow: vec![],
             networks: vec![],
         };
-        let inst = DesiredInstance {
-            instance_id: "i1".into(),
-            stack: "smoke-secrets".into(),
-            service: "keep".into(),
-            ordinal: 0,
-            spec_json: serde_json::to_string(&spec).unwrap(),
-            secrets: vec![SecretInjection {
-                env: "API_TOKEN".into(),
-                value: "plaintext-for-agent".into(),
-                allow_hosts: vec!["api.example.com".into()],
-            }],
-            ssh: None,
-            fabric: None,
-        };
-        let work = desired_from_sync(&[inst]).unwrap();
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].runtime_id, "smoke-secrets-keep-0");
-        assert_eq!(work[0].secrets.len(), 1);
-        assert_eq!(work[0].secrets[0].env, "API_TOKEN");
-        assert_eq!(work[0].secrets[0].value, "plaintext-for-agent");
-        assert_eq!(work[0].secrets[0].allow_hosts, vec!["api.example.com"]);
-    }
-
-    #[test]
-    fn volume_mount_plan_maps_spec_order() {
-        let spec = ServiceSpec {
-            image: "alpine:3.20".into(),
-            replicas: 1,
-            resources: Default::default(),
-            ports: vec![],
-            network: Default::default(),
-            env: Default::default(),
-            secrets: vec![],
-            volumes: vec![
-                mc2_api::VolumeMount {
-                    name: "data".into(),
-                    mount: "/data".into(),
-                },
-                mc2_api::VolumeMount {
-                    name: "cache".into(),
-                    mount: "/var/cache".into(),
-                },
-            ],
-            restart_policy: "on-failure".into(),
-            health: None,
-            labels: Default::default(),
-            command: Some(vec!["sleep".into(), "infinity".into()]),
-            node_name: None,
-            node_selector: Default::default(),
-            ssh: None,
-            expose: vec![],
-            allow: vec![],
-            networks: vec![],
-        };
-        let inst = DesiredInstance {
+        DesiredSandbox {
             instance_id: "i1".into(),
             stack: "demo".into(),
             service: "web".into(),
             ordinal: 0,
-            spec_json: serde_json::to_string(&spec).unwrap(),
-            secrets: vec![],
-            ssh: None,
-            fabric: None,
-        };
-        let work = desired_from_sync(&[inst]).unwrap();
-        let plan = crate::volume_mount_plan(&work[0]);
+            runtime_id: sandbox_name("demo", "web", 0),
+            spec,
+            secrets: vec![InjectedSecret {
+                env: "API_TOKEN".into(),
+                value: "plaintext-for-agent".into(),
+                allow_hosts: vec!["api.example.com".into()],
+            }],
+            ssh: DesiredSsh::default(),
+            fabric: DesiredFabric::default(),
+        }
+    }
+
+    #[test]
+    fn work_item_carries_secrets_and_runtime_id() {
+        let work = build_work_item();
+        assert_eq!(work.runtime_id, "demo-web-0");
+        assert_eq!(work.secrets.len(), 1);
+        assert_eq!(work.secrets[0].env, "API_TOKEN");
+        assert_eq!(work.secrets[0].value, "plaintext-for-agent");
+        assert_eq!(work.secrets[0].allow_hosts, vec!["api.example.com"]);
+    }
+
+    #[test]
+    fn volume_mount_plan_maps_spec_order() {
+        let mut work = build_work_item();
+        work.stack = "demo".into();
+        work.spec.volumes = vec![
+            mc2_api::VolumeMount {
+                name: "data".into(),
+                mount: "/data".into(),
+            },
+            mc2_api::VolumeMount {
+                name: "cache".into(),
+                mount: "/var/cache".into(),
+            },
+        ];
+        let plan = crate::volume_mount_plan(&work);
         assert_eq!(
             plan,
             vec![

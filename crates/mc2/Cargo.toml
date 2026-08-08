@@ -1,6 +1,6 @@
 [package]
 name = "mc2"
-description = "MicroCommandControl — dual-mode CLI (server | agent | operator commands)"
+description = "MicroCommandControl — single binary (server + operator CLI)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 mc2-server = { workspace = true }
-mc2-agent = { workspace = true }
+
 mc2-api = { workspace = true }
 mc2-store = { workspace = true }
 mc2-metrics = { workspace = true }

@@ -3,8 +3,7 @@
 //! No `msb` CLI subprocess. Uses `Sandbox::ssh().server_with(...).serve(stream)`
 //! over a host TCP listener (default bind 127.0.0.1, auto port when port=0).
 
-use mc2_api::agent::SshObserved;
-use mc2_runtime::DesiredSandbox;
+use mc2_runtime::{DesiredSandbox, SshObserved};
 use microsandbox::Sandbox;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,7 +11,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 struct ActiveServe {
     config_hash: String,
@@ -22,7 +21,7 @@ struct ActiveServe {
     join: JoinHandle<()>,
 }
 
-/// Per-agent map of instance_id → in-process SSH accept loop.
+/// Per-node map of instance_id → in-process SSH accept loop.
 #[derive(Default)]
 pub struct SshServeTable {
     active: HashMap<String, ActiveServe>,
@@ -64,7 +63,7 @@ impl SshServeTable {
                 return SshObserved {
                     phase: "Open".into(),
                     bind: active.bind.clone(),
-                    port: u32::from(active.port),
+                    port: active.port,
                     message: "sdk".into(),
                 };
             }
@@ -76,7 +75,7 @@ impl SshServeTable {
                 let obs = SshObserved {
                     phase: "Open".into(),
                     bind: active.bind.clone(),
-                    port: u32::from(active.port),
+                    port: active.port,
                     message: "sdk".into(),
                 };
                 info!(
@@ -107,7 +106,7 @@ impl SshServeTable {
                 let _ = tx.send(());
             }
             active.join.abort();
-            info!(instance = %instance_id, "ssh serve closed");
+            debug!(instance = %instance_id, "ssh serve closed");
         }
     }
 
@@ -115,7 +114,7 @@ impl SshServeTable {
         let stale: Vec<String> = self
             .active
             .keys()
-            .filter(|k| !keep.contains(*k))
+            .filter(|id| !keep.contains(*id))
             .cloned()
             .collect();
         for id in stale {

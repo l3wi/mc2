@@ -1,8 +1,8 @@
 # Operator-owned Traefik static config (not written by MC2).
-# Point file provider at the agent --ingress-config-dir/traefik directory.
+# Point file provider at the server --ingress-config-dir/traefik directory.
 #
 # Example:
-#   mc2 agent ... --ingress-config-dir /tmp/mc2-ingress
+#   mc2 server ... --ingress-config-dir /tmp/mc2-ingress
 #   traefik --configFile=examples/http-ingress/traefik.static.yml
 #
 # Adjust ACME email / disable TLS entrypoint for pure lab HTTP.

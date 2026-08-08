@@ -33,20 +33,21 @@ async fn status_requires_valid_bearer() {
         .unwrap();
     assert_eq!(ok, StatusCode::OK);
     assert_eq!(body["api_version"], "mc2/v1");
-    assert_eq!(body["nodes_total"], 0);
+    assert_eq!(body["nodes_total"], 1); // auto local node
     assert!(body.get("version").is_some());
 }
 
 #[tokio::test]
-async fn join_token_is_not_accepted_as_api_bearer() {
+async fn local_node_is_registered() {
     let cluster = TestCluster::start().await.expect("start cluster");
-    let (status, _) = cluster
-        .get_json("/v1/status", Some(&cluster.join_token))
+    let (status, nodes) = cluster
+        .get_json("/v1/nodes", Some(&cluster.api_token))
         .await
         .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "join token must not authorize operator REST"
-    );
+    assert_eq!(status, StatusCode::OK);
+    let arr = nodes.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], cluster.local_node_id);
+    assert_eq!(arr[0]["status"], "Ready");
+    assert!(arr[0].get("node_token_hash").is_none());
 }

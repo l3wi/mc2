@@ -1,6 +1,6 @@
 //! Fabric naming and desired-state helpers (D13).
 
-use mc2_api::agent::FabricDesired;
+use serde::Serialize;
 
 /// Runtime view of fabric plan for one sandbox.
 #[derive(Debug, Clone, Default)]
@@ -28,43 +28,31 @@ pub struct FabricAllowDesired {
     pub backend_ordinal: u32,
 }
 
-pub fn fabric_from_proto(f: Option<&FabricDesired>) -> DesiredFabric {
-    let Some(f) = f else {
-        return DesiredFabric::default();
-    };
-    DesiredFabric {
-        exposes: f
-            .exposes
-            .iter()
-            .map(|e| FabricExposeDesired {
-                guest_port: e.guest_port as u16,
-                protocol: if e.protocol.is_empty() {
-                    "tcp".into()
-                } else {
-                    e.protocol.clone()
-                },
-            })
-            .collect(),
-        allows: f
-            .allows
-            .iter()
-            .map(|a| FabricAllowDesired {
-                to_service: a.to_service.clone(),
-                port: a.port as u16,
-                protocol: if a.protocol.is_empty() {
-                    "tcp".into()
-                } else {
-                    a.protocol.clone()
-                },
-                fqdn: a.fqdn.clone(),
-                short_name: a.short_name.clone(),
-                backend_instance_id: a.backend_instance_id.clone(),
-                backend_node_id: a.backend_node_id.clone(),
-                backend_local: a.backend_local,
-                backend_ordinal: a.backend_ordinal,
-            })
-            .collect(),
-    }
+/// Observed fabric state for one instance (reported to the store).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricObserved {
+    pub exposes: Vec<FabricExposeStatus>,
+    pub edges: Vec<FabricEdgeStatus>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricExposeStatus {
+    pub guest_port: u16,
+    pub host_port: u16,
+    pub phase: String, // Pending | Ready | Failed
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricEdgeStatus {
+    pub to_service: String,
+    pub port: u16,
+    pub phase: String, // Pending | Ready | Failed
+    pub message: String,
 }
 
 /// Guest ports that need narrow Host egress allows at create time.

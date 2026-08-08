@@ -45,17 +45,13 @@ check:
     just lint
     just test
 
-# Run server (REST :7443, gRPC TLS :7444, data dir ~/.mc2)
+# Run server (REST :7443, data dir ~/.mc2; embeds the local node)
 run-server *args:
     cargo run -p mc2 -- server {{args}}
 
-# Init data dir + tokens only (no listen)
+# Init data dir + token only (no listen)
 init-server *args:
     cargo run -p mc2 -- server --init-only {{args}}
-
-# Run agent (requires --server and --token; use --tls-ca for https)
-run-agent *args:
-    cargo run -p mc2 -- agent {{args}}
 
 # Show CLI help
 help:

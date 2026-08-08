@@ -1,6 +1,6 @@
 //! Shared API surface for MicroCommandControl.
 //!
-//! Includes REST DTOs, stack YAML types, and generated gRPC types.
+//! REST DTOs and stack YAML types.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,11 +11,6 @@ pub use stack::{
     NetworkSpec, PortSpec, ResourceSpec, SecretRef, ServiceSpec, SshSpec, StackDocument,
     StackNetworkSpec, VolumeMount, VolumeSpec,
 };
-
-/// Generated `mc2.agent.v1` protobuf + tonic service traits.
-pub mod agent {
-    tonic::include_proto!("mc2.agent.v1");
-}
 
 /// Stack / API schema version string used in YAML `apiVersion`.
 pub const API_VERSION: &str = "mc2/v1";
