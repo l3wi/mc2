@@ -91,6 +91,12 @@ pub trait Store: Send + Sync {
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError>;
 
+    /// Server-level setting value (e.g. `public_hostname`), if set.
+    async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError>;
+
+    /// Upsert a server-level setting value.
+    async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError>;
+
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError>;
     async fn touch_node(&self, node_id: &str, hb: NodeHeartbeat) -> Result<NodeRecord, StoreError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
@@ -109,6 +115,10 @@ pub trait Store: Send + Sync {
     async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError>;
 
     async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError>;
+
+    /// Delete a stack and its instances (cascades ssh/fabric rows). Returns
+    /// false when the stack did not exist.
+    async fn delete_stack(&self, name: &str) -> Result<bool, StoreError>;
 
     /// Ensure instance rows 0..replicas-1 exist for (stack, service); remove higher ordinals.
     async fn reconcile_service_replicas(

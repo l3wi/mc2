@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod stack;
 pub use stack::{
-    fabric_fqdn, is_loopback_bind, make_ingress_route_id, normalize_ingress_path, parse_stack_yaml,
-    AllowSpec, ExposeSpec, HealthSpec, IngressPath, IngressRule, IngressSpec, IngressTlsSpec,
-    NetworkSpec, PortSpec, ResourceSpec, SecretRef, ServiceSpec, SshSpec, StackDocument,
+    fabric_fqdn, is_loopback_bind, make_ingress_route_id, network_fqdn, normalize_ingress_path,
+    parse_stack_yaml, ExposeSpec, HealthcheckSpec, IngressPath, IngressRule, IngressSpec,
+    IngressTlsSpec, NetworkSpec, PortSpec, SecretRef, ServiceSpec, SshSpec, StackDocument,
     StackNetworkSpec, VolumeMount, VolumeSpec,
 };
 
@@ -35,6 +35,13 @@ pub struct ClusterStatus {
     pub stacks: u32,
     pub instances: u32,
     pub message: Option<String>,
+    /// Public hostname advertised by the server (`--public-hostname`), if set.
+    #[serde(
+        rename = "publicHostname",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_hostname: Option<String>,
 }
 
 impl ClusterStatus {
@@ -47,6 +54,7 @@ impl ClusterStatus {
             stacks: 0,
             instances: 0,
             message: Some("bootstrap stub".into()),
+            public_hostname: None,
         }
     }
 }

@@ -8,7 +8,12 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use context::{load as load_config, resolve, save, ClientMode, Conn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod context;
+mod prompt;
+mod setup;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,8 +32,18 @@ struct Cli {
 enum Commands {
     /// Run the MC2 orchestrator (single process)
     Server(mc2_server::ServerArgs),
-    /// Apply a stack YAML (desired state)
-    Apply(ApplyArgs),
+    /// Bring up a stack: publish desired state and converge (idempotent)
+    Up(UpArgs),
+    /// Tear down a stack (instances + definition; volumes retained)
+    Down(DownArgs),
+    /// Tear down a stack, optionally deleting its named volumes
+    Rm(RmArgs),
+    /// Validate and print a normalized stack config
+    Config(ConfigArgs),
+    /// Run a command inside an instance's sandbox
+    Exec(ExecArgs),
+    /// Print recent sandbox logs for an instance
+    Logs(LogsArgs),
     /// Cluster status (health + version + counts)
     Status(StatusArgs),
     /// Node operations
@@ -49,6 +64,10 @@ enum Commands {
     Completions(CompletionsArgs),
     /// Show version info
     Version,
+    /// Manage named API contexts (local/remote)
+    Context(ContextCmd),
+    /// Interactive setup wizard (server / client)
+    Setup(SetupCmd),
 }
 
 #[derive(Debug, Parser)]
@@ -175,12 +194,66 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Parser)]
-struct ApplyArgs {
+struct UpArgs {
     /// Path to stack YAML. Boilerplate is optional: apiVersion, kind, and
     /// metadata.name (defaults to the file name) are filled in when missing.
     #[arg(short = 'f', long = "file")]
     file: String,
 
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct DownArgs {
+    /// Stack name
+    stack: String,
+
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct RmArgs {
+    /// Stack name
+    stack: String,
+
+    /// Also delete the stack's named volumes (default: retained)
+    #[arg(long)]
+    volumes: bool,
+
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ConfigArgs {
+    /// Path to stack YAML
+    #[arg(short = 'f', long = "file")]
+    file: String,
+}
+
+#[derive(Debug, Parser)]
+struct ExecArgs {
+    /// Instance id, or <stack>/<service>/<ordinal> (e.g. demo/web/0)
+    instance: String,
+    /// Command to run in the sandbox
+    #[arg(required = true, num_args = 1..)]
+    cmd: Vec<String>,
+    #[command(flatten)]
+    op: OperatorArgs,
+}
+
+#[derive(Debug, Parser)]
+struct LogsArgs {
+    /// Instance id, or <stack>/<service>/<ordinal> (e.g. demo/web/0)
+    instance: String,
+    /// Show only the last N entries
+    #[arg(long)]
+    tail: Option<usize>,
+    /// Keep streaming new entries as they arrive
+    #[arg(long)]
+    follow: bool,
     #[command(flatten)]
     op: OperatorArgs,
 }
@@ -200,13 +273,22 @@ enum NodeCommands {
 
 #[derive(Debug, Parser)]
 struct OperatorArgs {
-    /// Control plane REST base URL
-    #[arg(long, default_value = "http://127.0.0.1:7443", env = "MC2_API")]
+    /// Control plane REST base URL (overrides MC2_API and the current context)
+    #[arg(long, default_value = "", env = "MC2_API", hide_default_value = true)]
     api: String,
 
     /// Operator API bearer token
     #[arg(long, env = "MC2_API_KEY")]
     token: Option<String>,
+
+    /// Named context from ~/.mc2/config.toml (overrides the current context)
+    #[arg(long, env = "MC2_CONTEXT")]
+    context: Option<String>,
+
+    /// Allow plaintext http:// for a remote (non-loopback) control plane.
+    /// Prefer https:// + TLS; the operator token travels unencrypted otherwise.
+    #[arg(long)]
+    allow_insecure_http: bool,
 }
 
 /// Output format for listing commands.
@@ -287,6 +369,54 @@ struct CompletionsArgs {
     shell: clap_complete::Shell,
 }
 
+#[derive(Debug, Parser)]
+struct ContextCmd {
+    #[command(subcommand)]
+    command: ContextCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommands {
+    /// List contexts (name, URL, mode) and the current one
+    Ls,
+    /// Switch the current context
+    Use(UseContextArgs),
+    /// Create or update a context (upsert)
+    Set(SetContextArgs),
+}
+
+#[derive(Debug, Parser)]
+struct UseContextArgs {
+    /// Context name
+    name: String,
+}
+
+#[derive(Debug, Parser)]
+struct SetContextArgs {
+    /// Context name
+    name: String,
+    /// Control plane REST base URL
+    #[arg(long)]
+    api: String,
+    /// Operator API bearer token (stored in the 0600 config file)
+    #[arg(long)]
+    token: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct SetupCmd {
+    #[command(subcommand)]
+    command: Option<SetupCommands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SetupCommands {
+    /// Interactive server setup (run on the VPS)
+    Server,
+    /// Interactive client setup (connect to a server)
+    Client,
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
@@ -303,30 +433,98 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server(args) => mc2_server::run(args).await?,
 
-        Commands::Apply(args) => apply_cmd(args).await?,
-        Commands::Status(args) => status_cmd(args).await?,
+        Commands::Up(mut args) => {
+            resolve_op(&mut args.op)?;
+            up_cmd(args).await?
+        }
+        Commands::Down(mut args) => {
+            resolve_op(&mut args.op)?;
+            down_cmd(args).await?
+        }
+        Commands::Rm(mut args) => {
+            resolve_op(&mut args.op)?;
+            rm_cmd(args).await?
+        }
+        Commands::Config(args) => config_cmd(args)?,
+        Commands::Exec(mut args) => {
+            resolve_op(&mut args.op)?;
+            exec_cmd(args).await?
+        }
+        Commands::Logs(mut args) => {
+            resolve_op(&mut args.op)?;
+            logs_cmd(args).await?
+        }
+        Commands::Status(mut args) => {
+            let conn = resolve_op(&mut args.op)?;
+            status_cmd(args, &conn).await?
+        }
         Commands::Node(NodeCmd {
-            command: NodeCommands::Ls(args),
-        }) => node_ls(args).await?,
-        Commands::Ps(args) => ps_cmd(args).await?,
-        Commands::Fabric(args) => fabric_cmd(args).await?,
-        Commands::Ingress(args) => ingress_cmd(args).await?,
+            command: NodeCommands::Ls(mut args),
+        }) => {
+            resolve_op(&mut args.op)?;
+            node_ls(args).await?
+        }
+        Commands::Ps(mut args) => {
+            resolve_op(&mut args.op)?;
+            ps_cmd(args).await?
+        }
+        Commands::Fabric(mut args) => {
+            resolve_op(&mut args.op)?;
+            fabric_cmd(args).await?
+        }
+        Commands::Ingress(mut args) => {
+            resolve_op(&mut args.op)?;
+            ingress_cmd(args).await?
+        }
         Commands::Secret(SecretCmd { command }) => match command {
-            SecretCommands::Set(a) => secret_set(a).await?,
-            SecretCommands::Ls(a) => secret_ls(a).await?,
-            SecretCommands::Rm(a) => secret_rm(a).await?,
+            SecretCommands::Set(mut a) => {
+                resolve_op(&mut a.op)?;
+                secret_set(a).await?
+            }
+            SecretCommands::Ls(mut a) => {
+                resolve_op(&mut a.op)?;
+                secret_ls(a).await?
+            }
+            SecretCommands::Rm(mut a) => {
+                resolve_op(&mut a.op)?;
+                secret_rm(a).await?
+            }
         },
         Commands::Ssh(SshCmd { command }) => match command {
             SshCommands::Key(SshKeyCmd { command }) => match command {
-                SshKeyCommands::Add(a) => ssh_key_add(a).await?,
-                SshKeyCommands::Show(a) => ssh_key_show(a).await?,
-                SshKeyCommands::Ls(a) => ssh_key_ls(a).await?,
-                SshKeyCommands::Rm(a) => ssh_key_rm(a).await?,
+                SshKeyCommands::Add(mut a) => {
+                    resolve_op(&mut a.op)?;
+                    ssh_key_add(a).await?
+                }
+                SshKeyCommands::Show(mut a) => {
+                    resolve_op(&mut a.op)?;
+                    ssh_key_show(a).await?
+                }
+                SshKeyCommands::Ls(mut a) => {
+                    resolve_op(&mut a.op)?;
+                    ssh_key_ls(a).await?
+                }
+                SshKeyCommands::Rm(mut a) => {
+                    resolve_op(&mut a.op)?;
+                    ssh_key_rm(a).await?
+                }
             },
-            SshCommands::Ls(a) => ssh_endpoints_ls(a).await?,
-            SshCommands::Show(a) => ssh_instance_show(a).await?,
-            SshCommands::Open(a) => ssh_instance_open(a).await?,
-            SshCommands::Close(a) => ssh_instance_close(a).await?,
+            SshCommands::Ls(mut a) => {
+                resolve_op(&mut a.op)?;
+                ssh_endpoints_ls(a).await?
+            }
+            SshCommands::Show(mut a) => {
+                resolve_op(&mut a.op)?;
+                ssh_instance_show(a).await?
+            }
+            SshCommands::Open(mut a) => {
+                resolve_op(&mut a.op)?;
+                ssh_instance_open(a).await?
+            }
+            SshCommands::Close(mut a) => {
+                resolve_op(&mut a.op)?;
+                ssh_instance_close(a).await?
+            }
         },
         Commands::Doctor(args) => {
             let code = doctor_cmd(args)?;
@@ -335,6 +533,12 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Completions(args) => completions_cmd(args)?,
+        Commands::Context(ContextCmd { command }) => match command {
+            ContextCommands::Ls => context_ls()?,
+            ContextCommands::Use(a) => context_use(&a.name)?,
+            ContextCommands::Set(a) => context_set(&a.name, &a.api, a.token.as_deref())?,
+        },
+        Commands::Setup(args) => setup_cmd(args).await?,
         Commands::Version => {
             println!(
                 "mc2 {} — MC2 (MicroCommandControl)",
@@ -450,6 +654,113 @@ fn operator_post(
         req = req.bearer_auth(t);
     }
     req
+}
+
+/// Resolve the effective connection (flags > env > context > current > default),
+/// enforce the remote-plaintext guard, then rewrite `op` so downstream handlers
+/// see the final URL + token. Returns the resolved connection for mode-aware
+/// commands (`mc2 status`).
+fn resolve_op(op: &mut OperatorArgs) -> Result<Conn> {
+    let allow_insecure_http =
+        op.allow_insecure_http || context::env_truthy("MC2_ALLOW_INSECURE_HTTP");
+    let cfg = load_config()?;
+    let api_flag = if op.api.is_empty() {
+        None
+    } else {
+        Some(op.api.as_str())
+    };
+    let conn = resolve(
+        &cfg,
+        api_flag,
+        op.token.as_deref(),
+        op.context.as_deref(),
+        allow_insecure_http,
+    )?;
+    op.api = conn.url.clone();
+    op.token = conn.token.clone();
+    Ok(conn)
+}
+
+fn context_set(name: &str, url: &str, token: Option<&str>) -> Result<()> {
+    let mut cfg = load_config()?;
+    let url = url.trim_end_matches('/').to_string();
+    if context::mode_of(&url) == ClientMode::Remote
+        && url.to_ascii_lowercase().starts_with("http://")
+    {
+        eprintln!(
+            "warning: context '{name}' uses plaintext http:// for a remote endpoint; \
+             connecting will require --allow-insecure-http / MC2_ALLOW_INSECURE_HTTP=1"
+        );
+    }
+    cfg.set_context(name, &url, token);
+    save(&cfg)?;
+    println!("context '{name}' set ({url})");
+    Ok(())
+}
+
+fn context_use(name: &str) -> Result<()> {
+    let mut cfg = load_config()?;
+    let url = cfg
+        .contexts
+        .get(name)
+        .map(|c| c.url.clone())
+        .ok_or_else(|| {
+            let available = if cfg.contexts.is_empty() {
+                "(none configured)".to_string()
+            } else {
+                cfg.contexts.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            anyhow::anyhow!("context '{name}' not found (available: {available})")
+        })?;
+    cfg.set_current(name)?;
+    save(&cfg)?;
+    println!("using context '{name}' ({url})");
+    Ok(())
+}
+
+fn context_ls() -> Result<()> {
+    let cfg = load_config()?;
+    if cfg.contexts.is_empty() {
+        println!(
+            "No contexts configured. Default: local {}",
+            context::DEFAULT_API_URL
+        );
+        println!("Create one: mc2 context set <name> --api <url> [--token <key>]");
+        return Ok(());
+    }
+    println!("{:<3} {:<16} {:<44} MODE", "CUR", "NAME", "URL");
+    for (name, entry) in &cfg.contexts {
+        let cur = if cfg.current.as_deref() == Some(name.as_str()) {
+            "*"
+        } else {
+            ""
+        };
+        println!(
+            "{cur:<3} {name:<16} {:<44} {}",
+            entry.url,
+            context::mode_of(&entry.url).as_str()
+        );
+    }
+    match cfg.current.as_deref() {
+        None => println!(
+            "\nno current context; default: local {}",
+            context::DEFAULT_API_URL
+        ),
+        Some(name) if !cfg.contexts.contains_key(name) => {
+            println!("\ncurrent context '{name}' is not defined (config drift)")
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+async fn setup_cmd(args: SetupCmd) -> Result<()> {
+    match args.command {
+        None => setup::run().await?,
+        Some(SetupCommands::Server) => setup::run_server_wizard().await?,
+        Some(SetupCommands::Client) => setup::run_client_wizard().await?,
+    }
+    Ok(())
 }
 
 async fn secret_set(args: SecretSetArgs) -> Result<()> {
@@ -765,7 +1076,7 @@ fn urlencoding_simple(s: &str) -> String {
         .collect()
 }
 
-async fn apply_cmd(args: ApplyArgs) -> Result<()> {
+async fn up_cmd(args: UpArgs) -> Result<()> {
     // Token optional when server was bootstrapped with --no-auth.
     let raw = std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
     let yaml = fill_stack_defaults(&raw, &args.file);
@@ -779,18 +1090,198 @@ async fn apply_cmd(args: ApplyArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(api_error("apply", status, &body));
+        return Err(api_error("up", status, &body));
     }
     println!("{body}");
     Ok(())
 }
 
-/// Fill omissible boilerplate for local DX: `apiVersion`, `kind`, and
-/// `metadata.name` (derived from the file name). Only missing fields are
-/// filled; present values are never rewritten (wrong values still fail server
-/// validation loudly). Non-YAML or non-mapping input passes through for the
-/// server to reject. Note: filling re-serializes the document, dropping YAML
-/// comments — complete documents are returned verbatim.
+/// Tear down a stack (instances + definition); named volumes retained.
+async fn down_cmd(args: DownArgs) -> Result<()> {
+    let url = format!(
+        "{}/v1/stacks/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.stack)
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.delete(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
+    let status = res.status();
+    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
+        println!("stack '{}' down", args.stack);
+        return Ok(());
+    }
+    let body = res.text().await.unwrap_or_default();
+    Err(api_error("down", status, &body))
+}
+
+/// Tear down a stack; `--volumes` also deletes its named volumes.
+async fn rm_cmd(args: RmArgs) -> Result<()> {
+    let mut url = format!(
+        "{}/v1/stacks/{}",
+        args.op.api.trim_end_matches('/'),
+        urlencoding_simple(&args.stack)
+    );
+    if args.volumes {
+        url.push_str("?volumes=true");
+    }
+    let client = reqwest::Client::new();
+    let mut req = client.delete(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
+    let status = res.status();
+    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
+        if args.volumes {
+            println!("stack '{}' removed (volumes deleted)", args.stack);
+        } else {
+            println!("stack '{}' removed", args.stack);
+        }
+        return Ok(());
+    }
+    let body = res.text().await.unwrap_or_default();
+    Err(api_error("rm", status, &body))
+}
+
+/// Validate and print the normalized stack config (what `mc2 up` would send).
+fn config_cmd(args: ConfigArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
+    let yaml = fill_stack_defaults(&raw, &args.file);
+    mc2_api::parse_stack_yaml(&yaml).map_err(|e| anyhow::anyhow!("invalid stack: {e}"))?;
+    print!("{yaml}");
+    Ok(())
+}
+
+/// Run a command inside the instance's sandbox; mirror output and exit with
+/// the command's exit code. Piped stdin is forwarded to the sandbox.
+async fn exec_cmd(args: ExecArgs) -> Result<()> {
+    let base = args.op.api.trim_end_matches('/');
+    let id = resolve_instance_id(&args.op, &args.instance).await?;
+    let url = format!("{base}/v1/instances/{}/exec", urlencoding_simple(&id));
+    let stdin = {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            None
+        } else {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .context("read stdin")?;
+            Some(String::from_utf8_lossy(&buf).to_string())
+        }
+    };
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(&url)
+        .json(&serde_json::json!({ "cmd": args.cmd, "stdin": stdin }));
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.with_context(|| format!("POST {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("exec", status, &body));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    if let Some(out) = v["stdout"].as_str() {
+        print!("{out}");
+    }
+    if let Some(err) = v["stderr"].as_str() {
+        eprint!("{err}");
+    }
+    let code = v["exitCode"].as_i64().unwrap_or(0);
+    if code != 0 {
+        std::process::exit(code as i32);
+    }
+    Ok(())
+}
+
+/// Print recent sandbox logs for an instance; `--follow` streams new entries.
+async fn logs_cmd(args: LogsArgs) -> Result<()> {
+    let base = args.op.api.trim_end_matches('/');
+    let id = resolve_instance_id(&args.op, &args.instance).await?;
+    let mut url = format!("{base}/v1/instances/{}/logs", urlencoding_simple(&id));
+    let mut params: Vec<String> = Vec::new();
+    if let Some(tail) = args.tail {
+        params.push(format!("tail={tail}"));
+    }
+    if args.follow {
+        params.push("follow=true".into());
+    }
+    if !params.is_empty() {
+        url.push_str(&format!("?{}", params.join("&")));
+    }
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let res = req.send().await.with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(api_error("logs", status, &body));
+    }
+
+    if !args.follow {
+        let body = res.text().await.unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        let entries = v["entries"].as_array().cloned().unwrap_or_default();
+        if entries.is_empty() {
+            println!("No logs.");
+            return Ok(());
+        }
+        for e in entries {
+            print_log_entry(&e);
+        }
+        return Ok(());
+    }
+
+    // Follow: consume the SSE stream (`data: <json>` frames) as it arrives.
+    use futures::StreamExt;
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut saw_entry = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read log stream")?;
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    saw_entry = true;
+                    print_log_entry(&v);
+                }
+            }
+        }
+    }
+    if !saw_entry {
+        println!("No logs.");
+    }
+    Ok(())
+}
+
+fn print_log_entry(e: &serde_json::Value) {
+    let data = e["data"].as_str().unwrap_or("").trim_end();
+    if data.is_empty() {
+        return;
+    }
+    let source = e["source"].as_str().unwrap_or("?");
+    println!("[{source}] {data}");
+}
+
+/// Fill omissible compose boilerplate for local DX: a top-level `name:` when
+/// missing (derived from the file name). Only missing fields are filled;
+/// present values are never rewritten. Note: filling re-serializes the
+/// document, dropping YAML comments — complete documents are returned verbatim.
 fn fill_stack_defaults(raw: &str, file_path: &str) -> String {
     let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
         return raw.to_string();
@@ -798,59 +1289,23 @@ fn fill_stack_defaults(raw: &str, file_path: &str) -> String {
     let Some(map) = doc.as_mapping_mut() else {
         return raw.to_string();
     };
-    let mut changed = ensure_scalar(map, "apiVersion", mc2_api::API_VERSION);
-    changed |= ensure_scalar(map, "kind", "Stack");
-    changed |= ensure_stack_name(map, file_path);
+    let mut changed = false;
+    let name_key = serde_yaml::Value::String("name".into());
+    let has_name = map
+        .get(&name_key)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_name {
+        map.insert(
+            name_key,
+            serde_yaml::Value::String(stack_name_from_path(file_path)),
+        );
+        changed = true;
+    }
     if changed {
         serde_yaml::to_string(&doc).unwrap_or_else(|_| raw.to_string())
     } else {
         raw.to_string()
-    }
-}
-
-fn ensure_scalar(map: &mut serde_yaml::Mapping, key: &str, value: &str) -> bool {
-    let key = serde_yaml::Value::String(key.into());
-    if map
-        .get(&key)
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty())
-    {
-        return false;
-    }
-    map.insert(key, serde_yaml::Value::String(value.into()));
-    true
-}
-
-fn ensure_stack_name(map: &mut serde_yaml::Mapping, file_path: &str) -> bool {
-    let meta_key = serde_yaml::Value::String("metadata".into());
-    let name_key = serde_yaml::Value::String("name".into());
-    let has_name = |meta: &serde_yaml::Mapping| {
-        meta.get(&name_key)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
-    };
-    match map.get_mut(&meta_key) {
-        Some(serde_yaml::Value::Mapping(meta)) => {
-            if has_name(meta) {
-                return false;
-            }
-            meta.insert(
-                name_key,
-                serde_yaml::Value::String(stack_name_from_path(file_path)),
-            );
-            true
-        }
-        // metadata present but malformed: leave it for server validation.
-        Some(_) => false,
-        None => {
-            let mut meta = serde_yaml::Mapping::new();
-            meta.insert(
-                name_key,
-                serde_yaml::Value::String(stack_name_from_path(file_path)),
-            );
-            map.insert(meta_key, serde_yaml::Value::Mapping(meta));
-            true
-        }
     }
 }
 
@@ -986,8 +1441,8 @@ async fn node_ls(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-/// Cluster status: health + version + counts.
-async fn status_cmd(args: StatusArgs) -> Result<()> {
+/// Cluster status: health + version + counts, mode/context-aware.
+async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
     let base = args.op.api.trim_end_matches('/');
     let client = reqwest::Client::new();
     let health = operator_get(&client, &format!("{base}/health"), None)
@@ -1013,20 +1468,52 @@ async fn status_cmd(args: StatusArgs) -> Result<()> {
     if !status.is_success() {
         return Err(api_error("status", status, &body));
     }
+
     if matches!(args.output, OutputFormat::Json) {
-        println!("{body}");
+        let mut v: serde_json::Value = serde_json::from_str(&body)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("mode".into(), serde_json::json!(conn.mode.as_str()));
+            if let Some(ref ctx) = conn.context {
+                obj.insert("context".into(), serde_json::json!(ctx));
+            }
+            obj.insert(
+                "auth".into(),
+                serde_json::json!(if conn.token.is_some() {
+                    "bearer"
+                } else {
+                    "none"
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
+
     let v: serde_json::Value = serde_json::from_str(&body)?;
-    println!("mc2 {} — {}", v["version"].as_str().unwrap_or("?"), base);
-    println!("  api schema: {}", v["api_version"].as_str().unwrap_or("?"));
+    let version = v["version"].as_str().unwrap_or("?");
+    let ctx_suffix = conn
+        .context
+        .as_ref()
+        .map(|c| format!(" (context: {c})"))
+        .unwrap_or_default();
+    println!("mc2 {version} — {}: {base}{ctx_suffix}", conn.mode.as_str());
+    if conn.token.is_some() {
+        println!("  auth: bearer ✓");
+    } else {
+        println!("  auth: none");
+    }
     println!(
-        "  nodes: {}/{} ready",
-        v["nodes_ready"].as_u64().unwrap_or(0),
-        v["nodes_total"].as_u64().unwrap_or(0)
+        "  server api: {}, version {}",
+        v["api_version"].as_str().unwrap_or("?"),
+        version
     );
-    println!("  stacks: {}", v["stacks"].as_u64().unwrap_or(0));
-    println!("  instances: {}", v["instances"].as_u64().unwrap_or(0));
+    println!(
+        "  nodes: {}/{} ready · stacks: {} · instances: {}",
+        v["nodes_ready"].as_u64().unwrap_or(0),
+        v["nodes_total"].as_u64().unwrap_or(0),
+        v["stacks"].as_u64().unwrap_or(0),
+        v["instances"].as_u64().unwrap_or(0),
+    );
     if let Some(msg) = v["message"].as_str() {
         println!("  message: {msg}");
     }
@@ -1107,7 +1594,7 @@ async fn fabric_cmd(args: FabricArgs) -> Result<()> {
     }
     for edge in observed["edges"].as_array().into_iter().flatten() {
         println!(
-            "  allow {}:{} [{}]",
+            "  reach {}:{} [{}]",
             edge["toService"].as_str().unwrap_or("-"),
             edge["port"].as_u64().unwrap_or(0),
             edge["phase"].as_str().unwrap_or("-")
@@ -1198,26 +1685,24 @@ mod tests {
     }
 
     #[test]
-    fn minimal_stack_gets_boilerplate_and_passes_validation() {
+    fn minimal_stack_gets_name_and_passes_validation() {
         let raw = "services:\n  web:\n    image: alpine:3.20\n";
         let filled = fill_stack_defaults(raw, "demo.yaml");
         let doc = mc2_api::parse_stack_yaml(&filled).unwrap();
-        assert_eq!(doc.metadata.name, "demo");
-        assert_eq!(doc.api_version, mc2_api::API_VERSION);
-        assert_eq!(doc.kind, "Stack");
+        assert_eq!(doc.name, "demo");
     }
 
     #[test]
-    fn complete_stack_passes_through_verbatim() {
-        let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata:\n  name: x\nservices:\n  web:\n    image: alpine:3.20\n";
+    fn complete_compose_stack_passes_through_verbatim() {
+        let raw = "name: x\nservices:\n  web:\n    image: alpine:3.20\n";
         assert_eq!(fill_stack_defaults(raw, "whatever.yaml"), raw);
     }
 
     #[test]
-    fn metadata_without_name_gets_file_stem() {
-        let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata: {}\nservices:\n  web:\n    image: alpine:3.20\n";
+    fn name_missing_gets_file_stem() {
+        let raw = "services:\n  web:\n    image: alpine:3.20\n";
         let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(raw, "My Stack!.yaml")).unwrap();
-        assert_eq!(doc.metadata.name, "my-stack");
+        assert_eq!(doc.name, "my-stack");
     }
 
     #[test]
@@ -1228,13 +1713,16 @@ mod tests {
             "examples/01-hello-service/stack.yaml",
         ))
         .unwrap();
-        assert_eq!(doc.metadata.name, "01-hello-service");
+        assert_eq!(doc.name, "01-hello-service");
     }
 
     #[test]
-    fn wrong_api_version_is_left_for_server() {
-        let raw = "apiVersion: wrong/v9\nkind: Stack\nmetadata:\n  name: x\nservices:\n  web:\n    image: alpine\n";
-        assert_eq!(fill_stack_defaults(raw, "x.yaml"), raw);
+    fn old_k8s_form_is_rejected_at_parse() {
+        // Canonical compose parser: unknown k8s keys are rejected outright.
+        let raw = "apiVersion: mc2/v1\nkind: Stack\nmetadata:\n  name: x\nservices:\n  web:\n    image: alpine\n";
+        let filled = fill_stack_defaults(raw, "x.yaml");
+        let err = mc2_api::parse_stack_yaml(&filled).unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -1267,6 +1755,8 @@ mod tests {
         let op = OperatorArgs {
             api: "http://127.0.0.1:1".into(),
             token: None,
+            context: None,
+            allow_insecure_http: false,
         };
         // No slash → no network call, returned verbatim.
         let id = resolve_instance_id(&op, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99")

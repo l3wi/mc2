@@ -1,26 +1,18 @@
 # Example stack for MicroCommandControl (small alpine image for quick pulls).
-# Apply: mc2 apply -f examples/advanced/demo-reference.yaml --token <api-token>
+# Apply: mc2 up -f examples/advanced/demo-reference.yaml --token <api-token>
 #
 # alpine's busybox httpd serves files from / (demo page is the filesystem listing).
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: demo
-  labels:
-    env: lab
+name: demo
 
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     ports:
-      - host: 8080
-        guest: 8000
-        protocol: tcp
-        # bind defaults to 127.0.0.1
+      - "8080:8000"
+      # bind defaults to 127.0.0.1
     network:
       profiles: [public]
     env:
@@ -31,12 +23,11 @@ services:
     #     env: GITHUB_TOKEN
     #     allowHosts:
     #       - api.github.com
-    restartPolicy: on-failure
+    restart: on-failure
     # Optional app probe (agent runs via msb exec while Running):
-    # health:
-    #   kind: exec
-    #   command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
-    #   intervalSeconds: 30
+    # healthcheck:
+    #   test: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
+    #   interval: 30s
     command: ["httpd", "-f", "-p", "8000", "-h", "/"]
     labels:
       app: web

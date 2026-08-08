@@ -2,7 +2,6 @@
 
 use mc2_api::ServiceSpec;
 use mc2_store::{InstanceRecord, NodeRecord, NodeStatus};
-use serde_json::Value;
 use std::collections::HashMap;
 
 /// Pure scheduling decision for one pending instance.
@@ -40,7 +39,7 @@ pub fn pick_node(
                 .get(&n.id)
                 .copied()
                 .unwrap_or((n.cpus, n.memory_mib));
-            cpu >= spec.resources.cpus && mem >= spec.resources.memory_mib
+            (cpu as f64) >= spec.cpus && mem >= spec.mem_limit_mib
         })
         .collect();
 
@@ -48,7 +47,7 @@ pub fn pick_node(
         return None;
     }
 
-    let fabric_affinity = fabric_affinity_scores(spec, all_instances);
+    let fabric_affinity = fabric_affinity_scores(all_instances);
 
     // Spread: fewest same-service instances; then higher fabric affinity; then name.
     candidates.sort_by(|a, b| {
@@ -64,22 +63,21 @@ pub fn pick_node(
     candidates.first().map(|n| n.id.clone())
 }
 
-/// Count allow-target service instances per node (same-node fabric preference).
-fn fabric_affinity_scores(
-    spec: &ServiceSpec,
-    all_instances: &[InstanceRecord],
-) -> HashMap<String, u32> {
-    let targets: std::collections::BTreeSet<&str> =
-        spec.allow.iter().map(|a| a.to.as_str()).collect();
-    if targets.is_empty() {
-        return HashMap::new();
-    }
+/// Count fabric-peer instances per node (same-node fabric preference).
+///
+/// Full-mesh fabric: every service that exposes ports is a peer of every
+/// other service, so co-locate with exposing instances (cross-node fabric
+/// splices are unsupported).
+fn fabric_affinity_scores(all_instances: &[InstanceRecord]) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for inst in all_instances {
-        if !targets.contains(inst.service.as_str()) {
+        if inst.phase == "Failed" || inst.phase == "Stopped" || inst.phase == "Pending" {
             continue;
         }
-        if inst.phase == "Failed" || inst.phase == "Stopped" || inst.phase == "Pending" {
+        let exposes = serde_json::from_str::<ServiceSpec>(&inst.spec_json)
+            .map(|s| !s.expose.is_empty())
+            .unwrap_or(false);
+        if !exposes {
             continue;
         }
         if let Some(ref nid) = inst.node_id {
@@ -154,27 +152,21 @@ pub fn may_reschedule_on_node_loss(spec: &ServiceSpec) -> bool {
     if is_volume_sticky(spec) {
         return false;
     }
-    !spec.restart_policy.eq_ignore_ascii_case("never")
+    !spec.restart.eq_ignore_ascii_case("no")
 }
 
 fn resources_from_spec_json(spec_json: &str) -> (u32, u64) {
-    let v: Value = serde_json::from_str(spec_json).unwrap_or(Value::Null);
-    let cpus = v
-        .pointer("/resources/cpus")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(1) as u32;
-    let mem = v
-        .pointer("/resources/memoryMiB")
-        .or_else(|| v.pointer("/resources/memory_mib"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(512);
-    (cpus, mem)
+    let spec: ServiceSpec = match serde_json::from_str(spec_json) {
+        Ok(s) => s,
+        Err(_) => return (1, 512),
+    };
+    (spec.cpus.ceil() as u32, spec.mem_limit_mib)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mc2_api::ResourceSpec;
+
     use std::collections::BTreeMap;
 
     fn node(id: &str, name: &str, labels: &str, cpus: u32) -> NodeRecord {
@@ -211,25 +203,22 @@ mod tests {
         let nodes = vec![node("a", "mac", "{}", 4), node("b", "linux", "{}", 4)];
         let mut spec = ServiceSpec {
             image: "x".into(),
-            replicas: 1,
-            resources: ResourceSpec {
-                cpus: 1,
-                memory_mib: 512,
-            },
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
             env: BTreeMap::new(),
             secrets: vec![],
             volumes: vec![],
-            restart_policy: "on-failure".into(),
-            health: None,
+            restart: "on-failure".into(),
+            healthcheck: None,
             labels: BTreeMap::new(),
             command: None,
             node_name: Some("linux".into()),
             node_selector: BTreeMap::new(),
             ssh: None,
             expose: vec![],
-            allow: vec![],
             networks: vec![],
         };
         let id = pick_node(
@@ -258,11 +247,9 @@ mod tests {
     fn may_reschedule_respects_sticky_and_never() {
         let mut sticky = ServiceSpec {
             image: "x".into(),
-            replicas: 1,
-            resources: ResourceSpec {
-                cpus: 1,
-                memory_mib: 512,
-            },
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
             env: BTreeMap::new(),
@@ -271,22 +258,21 @@ mod tests {
                 name: "d".into(),
                 mount: "/data".into(),
             }],
-            restart_policy: "on-failure".into(),
-            health: None,
+            restart: "on-failure".into(),
+            healthcheck: None,
             labels: BTreeMap::new(),
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
             expose: vec![],
-            allow: vec![],
             networks: vec![],
         };
         assert!(!may_reschedule_on_node_loss(&sticky));
         sticky.volumes.clear();
-        sticky.restart_policy = "never".into();
+        sticky.restart = "no".into();
         assert!(!may_reschedule_on_node_loss(&sticky));
-        sticky.restart_policy = "on-failure".into();
+        sticky.restart = "on-failure".into();
         assert!(may_reschedule_on_node_loss(&sticky));
     }
 
@@ -297,25 +283,22 @@ mod tests {
         load.insert("a".into(), 2u32);
         let spec = ServiceSpec {
             image: "x".into(),
-            replicas: 1,
-            resources: ResourceSpec {
-                cpus: 1,
-                memory_mib: 512,
-            },
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
             env: BTreeMap::new(),
             secrets: vec![],
             volumes: vec![],
-            restart_policy: "on-failure".into(),
-            health: None,
+            restart: "on-failure".into(),
+            healthcheck: None,
             labels: BTreeMap::new(),
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
             expose: vec![],
-            allow: vec![],
             networks: vec![],
         };
         let id = pick_node(
@@ -331,35 +314,35 @@ mod tests {
     }
 
     #[test]
-    fn fabric_affinity_prefers_node_with_allow_target() {
+    fn fabric_affinity_prefers_node_with_exposing_peer() {
         let nodes = vec![node("a", "n1", "{}", 4), node("b", "n2", "{}", 4)];
         let spec = ServiceSpec {
             image: "x".into(),
-            replicas: 1,
-            resources: ResourceSpec {
-                cpus: 1,
-                memory_mib: 512,
-            },
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
             env: BTreeMap::new(),
             secrets: vec![],
             volumes: vec![],
-            restart_policy: "on-failure".into(),
-            health: None,
+            restart: "on-failure".into(),
+            healthcheck: None,
             labels: BTreeMap::new(),
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
             expose: vec![],
-            allow: vec![mc2_api::AllowSpec {
-                to: "db".into(),
-                port: 5432,
-                protocol: "tcp".into(),
-            }],
             networks: vec![],
         };
+        // db exposes a fabric port and lives on node "a" → co-locate with it.
+        let mut db_spec = spec.clone();
+        db_spec.expose = vec![mc2_api::ExposeSpec {
+            port: 5432,
+            protocol: "tcp".into(),
+            name: None,
+        }];
         let peers = vec![InstanceRecord {
             id: "db0".into(),
             stack: "demo".into(),
@@ -369,7 +352,7 @@ mod tests {
             phase: "Running".into(),
             runtime_id: Some("demo-db-0".into()),
             message: None,
-            spec_json: "{}".into(),
+            spec_json: serde_json::to_string(&db_spec).unwrap(),
             updated_at: String::new(),
         }];
         let id = pick_node(

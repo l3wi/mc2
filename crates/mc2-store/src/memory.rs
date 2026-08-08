@@ -25,6 +25,7 @@ struct Inner {
     ssh_keys: HashMap<String, SshAuthorizedKey>,
     instance_ssh: HashMap<String, InstanceSshRecord>,
     instance_fabric: HashMap<String, InstanceFabricRecord>,
+    settings: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +96,19 @@ impl Store for MemoryStore {
             stacks: g.stacks.len() as u32,
             instances: g.instances.len() as u32,
         })
+    }
+
+    async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.inner.read().await.settings.get(key).cloned())
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .await
+            .settings
+            .insert(key.to_string(), value.to_string());
+        Ok(())
     }
 
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
@@ -212,6 +226,23 @@ impl Store for MemoryStore {
 
     async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError> {
         Ok(self.inner.read().await.stacks.get(name).cloned())
+    }
+
+    async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
+        let mut g = self.inner.write().await;
+        let existed = g.stacks.remove(name).is_some();
+        let removed_ids: Vec<String> = g
+            .instances
+            .values()
+            .filter(|i| i.stack == name)
+            .map(|i| i.id.clone())
+            .collect();
+        for id in &removed_ids {
+            g.instances.remove(id);
+            g.instance_ssh.remove(id);
+            g.instance_fabric.remove(id);
+        }
+        Ok(existed)
     }
 
     async fn reconcile_service_replicas(

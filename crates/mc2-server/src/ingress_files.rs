@@ -1,7 +1,10 @@
 //! Write Traefik Ingress catalog files (D7).
 
 use anyhow::{Context, Result};
-use mc2_runtime::{render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, SandboxPhase};
+use mc2_runtime::{
+    render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, ReadyIngressRoute,
+    SandboxPhase,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -9,6 +12,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
+
+/// Server-level self-route: publish the control-plane REST API itself through
+/// the ingress catalog (remote client access, BYO Traefik TLS).
+///
+/// Unlike stack `ingress:` routes there is no instance phase involved — the
+/// readiness gate is simply that the REST port accepts a connection.
+#[derive(Debug, Clone)]
+pub struct SelfIngressRoute {
+    pub host: String,
+    pub port: u16,
+    pub tls_cert_resolver: String,
+}
+
+impl SelfIngressRoute {
+    pub fn to_ready(&self) -> ReadyIngressRoute {
+        ReadyIngressRoute {
+            id: format!("mc2-self-{}", self.host),
+            stack: "mc2".into(),
+            host: self.host.clone(),
+            path: "/".into(),
+            path_type: "Prefix".into(),
+            service: "mc2-api".into(),
+            guest_port: 0,
+            backend_host: "127.0.0.1".into(),
+            backend_port: self.port,
+            instance_id: String::new(),
+            ordinal: 0,
+            tls_enabled: true,
+            cert_resolver: self.tls_cert_resolver.clone(),
+            tcp: false,
+            entry_point: String::new(),
+        }
+    }
+}
 
 /// Manages atomic writes under `--ingress-config-dir`.
 pub struct IngressFileWriter {
@@ -28,11 +65,14 @@ impl IngressFileWriter {
 
     /// Render ready routes from the desired plan + local instance phases; write files if changed.
     ///
-    /// `phases` maps instance_id → phase string (`Running`, …).
+    /// `phases` maps instance_id → phase string (`Running`, …). `self_route`,
+    /// when set, is the always-available control-plane route (gate: REST port
+    /// accepting) independent of any stack.
     pub async fn reconcile(
         &mut self,
         routes: &[DesiredIngressRoute],
         phases: &HashMap<String, String>,
+        self_route: Option<&SelfIngressRoute>,
     ) -> Result<IngressRenderStatus> {
         let mut ready = Vec::new();
         let mut pending = Vec::new();
@@ -57,6 +97,15 @@ impl IngressFileWriter {
                 ready.push(desired.to_ready(bind_host));
             } else {
                 pending.push(desired.to_ready(bind_host));
+            }
+        }
+
+        if let Some(sr) = self_route {
+            let r = sr.to_ready();
+            if port_accepting("127.0.0.1", sr.port).await {
+                ready.push(r);
+            } else {
+                pending.push(r);
             }
         }
 
@@ -212,7 +261,7 @@ mod tests {
         let mut phases = HashMap::new();
         phases.insert("demo-web-0".into(), "Running".into());
 
-        let st = writer.reconcile(&routes, &phases).await.unwrap();
+        let st = writer.reconcile(&routes, &phases, None).await.unwrap();
         assert_eq!(st.ready, 1);
         assert_eq!(st.pending, 0);
         assert!(st.wrote);
@@ -245,7 +294,7 @@ mod tests {
         let mut phases = HashMap::new();
         phases.insert("demo-web-0".into(), "Running".into());
 
-        let st = writer.reconcile(&routes, &phases).await.unwrap();
+        let st = writer.reconcile(&routes, &phases, None).await.unwrap();
         assert_eq!(st.ready, 0);
         assert_eq!(st.pending, 1);
 
@@ -259,7 +308,7 @@ mod tests {
         let _listener = listener;
         let routes2 = vec![route(port2, "demo-web-0")];
         phases.insert("demo-web-0".into(), "Creating".into());
-        let st2 = writer.reconcile(&routes2, &phases).await.unwrap();
+        let st2 = writer.reconcile(&routes2, &phases, None).await.unwrap();
         assert_eq!(st2.ready, 0);
         assert_eq!(st2.pending, 1);
     }
@@ -274,7 +323,7 @@ mod tests {
         phases.insert("demo-web-0".into(), "Running".into());
 
         writer
-            .reconcile(&[route(port1, "demo-web-0")], &phases)
+            .reconcile(&[route(port1, "demo-web-0")], &phases, None)
             .await
             .unwrap();
         let t1 = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
@@ -285,7 +334,7 @@ mod tests {
         let (listener2, port2) = listen_ephemeral().await;
         assert_ne!(port1, port2);
         writer
-            .reconcile(&[route(port2, "demo-web-0")], &phases)
+            .reconcile(&[route(port2, "demo-web-0")], &phases, None)
             .await
             .unwrap();
         let t2 = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
@@ -295,7 +344,7 @@ mod tests {
         // Instance stopped → empty ready catalog.
         phases.insert("demo-web-0".into(), "Stopped".into());
         let st = writer
-            .reconcile(&[route(port2, "demo-web-0")], &phases)
+            .reconcile(&[route(port2, "demo-web-0")], &phases, None)
             .await
             .unwrap();
         assert_eq!(st.ready, 0);
@@ -314,12 +363,12 @@ mod tests {
         phases.insert("demo-web-0".into(), "Running".into());
 
         writer
-            .reconcile(&[route(port, "demo-web-0")], &phases)
+            .reconcile(&[route(port, "demo-web-0")], &phases, None)
             .await
             .unwrap();
 
         // Empty desired routes (stack ingress deleted).
-        let st = writer.reconcile(&[], &phases).await.unwrap();
+        let st = writer.reconcile(&[], &phases, None).await.unwrap();
         assert_eq!(st.ready, 0);
         assert!(st.wrote);
         let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
@@ -337,10 +386,76 @@ mod tests {
         phases.insert("demo-web-0".into(), "Running".into());
         let routes = vec![route(port, "demo-web-0")];
 
-        let st1 = writer.reconcile(&routes, &phases).await.unwrap();
+        let st1 = writer.reconcile(&routes, &phases, None).await.unwrap();
         assert!(st1.wrote);
-        let st2 = writer.reconcile(&routes, &phases).await.unwrap();
+        let st2 = writer.reconcile(&routes, &phases, None).await.unwrap();
         assert!(!st2.wrote);
         assert_eq!(st2.ready, 1);
+    }
+
+    #[tokio::test]
+    async fn self_route_ready_when_rest_port_live_and_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (listener, port) = listen_ephemeral().await;
+        let _listener = listener;
+
+        let mut writer = IngressFileWriter::new(dir.path().to_path_buf(), "n".into());
+        let self_route = SelfIngressRoute {
+            host: "mc2.example.com".into(),
+            port,
+            tls_cert_resolver: "le".into(),
+        };
+
+        let st = writer
+            .reconcile(&[], &HashMap::new(), Some(&self_route))
+            .await
+            .unwrap();
+        assert_eq!(st.ready, 1);
+        assert_eq!(st.pending, 0);
+        assert!(st.wrote);
+
+        let traefik = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
+        assert!(traefik.contains("Host(`mc2.example.com`)"), "{traefik}");
+        assert!(traefik.contains("websecure"), "{traefik}");
+        assert!(traefik.contains("certResolver: le"), "{traefik}");
+        assert!(
+            traefik.contains(&format!("http://127.0.0.1:{port}")),
+            "{traefik}"
+        );
+        assert!(!traefik.contains("Host(`app.local`)"), "{traefik}");
+
+        let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
+        assert!(catalog.contains("mc2.example.com"), "{catalog}");
+        assert!(catalog.contains("\"ready\": true"), "{catalog}");
+        assert!(catalog.contains("mc2-api"), "{catalog}");
+    }
+
+    #[tokio::test]
+    async fn self_route_pending_when_rest_port_down() {
+        let dir = tempfile::tempdir().unwrap();
+        // Get a free port then drop the listener so nothing accepts.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+
+        let mut writer = IngressFileWriter::new(dir.path().to_path_buf(), "n".into());
+        let self_route = SelfIngressRoute {
+            host: "mc2.example.com".into(),
+            port,
+            tls_cert_resolver: "le".into(),
+        };
+
+        let st = writer
+            .reconcile(&[], &HashMap::new(), Some(&self_route))
+            .await
+            .unwrap();
+        assert_eq!(st.ready, 0);
+        assert_eq!(st.pending, 1);
+
+        let traefik = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
+        assert!(traefik.contains("http: {}"), "{traefik}");
+        let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
+        assert!(catalog.contains("\"ready\": false"), "{catalog}");
     }
 }

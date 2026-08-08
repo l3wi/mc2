@@ -202,6 +202,30 @@ impl Store for SqliteStore {
         })
     }
 
+    async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.map(|r| r.get("value")))
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO settings (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(())
+    }
+
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
         let existing = sqlx::query(
             r#"SELECT id, name, labels_json, arch, cpus, memory_mib, status,
@@ -419,6 +443,22 @@ impl Store for SqliteStore {
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
+    }
+
+    async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
+        // Instances first (no FK from instances→stacks); cascades to
+        // instance_ssh / instance_fabric. services cascade via stacks.
+        sqlx::query("DELETE FROM instances WHERE stack = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        let res = sqlx::query("DELETE FROM stacks WHERE name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn reconcile_service_replicas(
@@ -1083,5 +1123,47 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "DB_PASS");
         assert!(store.delete_secret("DB_PASS").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_stack_removes_instances_and_cascades() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mc2.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 2, r#"{"image":"x"}"#)
+            .await
+            .unwrap();
+        let id = inst[0].id.clone();
+        store
+            .put_instance_ssh_desired(&crate::InstanceSshRecord {
+                instance_id: id.clone(),
+                has_override: true,
+                desired: true,
+                desired_bind: None,
+                desired_port: None,
+                desired_user: None,
+                desired_sftp: None,
+                desired_key_names_json: None,
+                phase: "Open".into(),
+                bind: None,
+                port: None,
+                message: None,
+                updated_at: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.get_stack("demo").await.unwrap().is_some());
+        assert_eq!(store.list_instances().await.unwrap().len(), 2);
+        assert!(store.delete_stack("demo").await.unwrap());
+        assert!(store.get_stack("demo").await.unwrap().is_none());
+        assert!(store.list_instances().await.unwrap().is_empty());
+        // ssh row cascaded away with the instance
+        assert!(store.get_instance_ssh(&id).await.unwrap().is_none());
+        // deleting again reports missing
+        assert!(!store.delete_stack("demo").await.unwrap());
     }
 }

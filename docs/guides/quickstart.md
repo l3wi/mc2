@@ -47,7 +47,7 @@ mkdir -p "$DATA"
 # Terminal 2 — operator
 export MC2_API=http://127.0.0.1:7443
 ./target/debug/mc2 node ls
-./target/debug/mc2 apply -f examples/01-hello-service/stack.yaml
+./target/debug/mc2 up -f examples/01-hello-service/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/status" | jq .
 ```
@@ -60,15 +60,19 @@ Useful server flags (all also env vars): `--node-name`, `--label KEY=VALUE`,
 
 ```bash
 ./target/debug/mc2 secret set SMOKE_TOKEN --value 'lab-only'
-./target/debug/mc2 apply -f examples/02-secrets/stack.yaml
+./target/debug/mc2 up -f examples/02-secrets/stack.yaml
 ```
 
 ### Service fabric (east–west)
 
-Compose-like multi-service connectivity without a flat pod network. Stack declares `expose` (internal listeners) and client `allow` edges; the node loop L4-splices and injects DNS (`db.<stack>.svc.mc2`).
+Compose-like multi-service connectivity without a flat pod network. A service
+declares `expose` (internal listeners); every other service that shares a
+**network** reaches it by default (default-allow, Docker-style) via the node
+loop's L4 splice + DNS (`svc.<network>.svc.mc2`). Named networks are
+server-wide, so stacks can share one.
 
 ```bash
-./target/debug/mc2 apply -f examples/03-service-fabric/stack.yaml
+./target/debug/mc2 up -f examples/03-service-fabric/stack.yaml
 ./target/debug/mc2 ps
 # Fabric status (node-reported):
 curl -s "$MC2_API/v1/instances/<client-instance-id>/fabric" | jq .
@@ -88,7 +92,7 @@ mkdir -p /tmp/mc2-ingress
 # Start the server with:
 #   --ingress-config-dir /tmp/mc2-ingress
 
-./target/debug/mc2 apply -f examples/04-http-ingress/stack.yaml
+./target/debug/mc2 up -f examples/04-http-ingress/stack.yaml
 ./target/debug/mc2 ps
 curl -s "$MC2_API/v1/ingress" | jq .
 # After instance Running and host port live:
@@ -97,7 +101,9 @@ curl -s http://127.0.0.1:18080/ | head   # direct backend
 # Point Traefik file provider at /tmp/mc2-ingress — see examples/04-http-ingress/
 ```
 
-**Defaults:** deny east–west until `allow`; same-stack only.
+**Defaults:** default-allow within a shared network (Docker-style); networks
+are server-wide. Exposed guest ports are effectively unique server-wide — the
+second service to claim an already-bound port reports a `Failed` fabric edge.
 
 ## Auth-enabled install
 
@@ -106,8 +112,83 @@ Omit `--no-auth` on first bootstrap. Save the printed **API token** (operator RE
 ```bash
 export MC2_API=http://127.0.0.1:7443
 export MC2_API_KEY='mc2at_…'
-./target/debug/mc2 apply -f examples/90-advanced/demo-reference.yaml
+./target/debug/mc2 up -f examples/90-advanced/demo-reference.yaml
 ```
+
+## Setup wizard
+
+`mc2 setup` is an interactive wizard with two trees that scaffolds config and
+prints instructions (it never starts the server or Traefik):
+
+```bash
+mc2 setup                 # choose a tree interactively
+mc2 setup server          # jump straight to the server tree
+mc2 setup client          # jump straight to the client tree
+```
+
+**Server tree** (run on the VPS): answer the prompts — bind, data dir, API key
+on/off, public hostname, cert resolver, ingress dir — and mc2 writes a
+ready-to-run default `traefik.static.yml` (next to the ingress dir, once; it
+never overwrites an existing one), prints the runnable `mc2 server …` command,
+and a numbered finish-setup checklist: bootstrap (token prints once) → start
+Traefik → DNS + ports 80/443 → then run the client tree on your laptop.
+
+**Client tree** (run locally): give a context name, the control-plane URL and
+the API key; mc2 saves and activates the context (`~/.mc2/config.toml`) and
+optionally verifies the connection with a live status check.
+
+Prompts use arrow keys; `Enter` accepts defaults. Non-TTY stdin (e.g. a script)
+fails with a friendly "run it in a terminal" message instead of hanging.
+
+## Remote management
+
+The CLI is a REST client, so the same commands manage a remote install — the
+server is just a URL swap. Two modes, reported by `mc2 status`:
+
+- **local** — loopback API (`127.0.0.1` / `localhost` / `::1`), token optional.
+- **remote** — any other host; requires https + an API key (plaintext `http://`
+  is refused unless you opt in with `--allow-insecure-http` /
+  `MC2_ALLOW_INSECURE_HTTP=1`).
+
+### 1. On the server host
+
+Bootstrap with auth (omit `--no-auth`; save the printed token), then start with
+the ingress catalog + a public hostname:
+
+```bash
+./target/debug/mc2 server \
+  --data-dir /srv/mc2 \
+  --ingress-config-dir /srv/mc2-ingress \
+  --public-hostname mc2.example.com \
+  --public-tls-cert-resolver le
+```
+
+`--public-hostname` makes the server publish a synthetic control-plane route
+through the Traefik catalog (TLS via the cert resolver, backend = the REST
+listener). Point your existing Traefik file provider at
+`/srv/mc2-ingress` and it terminates TLS for `https://mc2.example.com`. The
+hostname is persisted and served at `/v1/status` as `publicHostname`.
+
+> **Chicken-and-egg:** the client needs the route live on first setup. Get the
+> hostname working once (cert resolver + DNS), then everything below is
+> repeatable.
+
+### 2. On the client machine
+
+Save a named context once, then switch:
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context use prod
+mc2 status                      # remote: https://mc2.example.com (context: prod)
+mc2 node ls && mc2 ps
+mc2 up -f examples/01-hello-service/stack.yaml
+```
+
+Contexts live in `~/.mc2/config.toml` (mode 0600). Resolution precedence:
+`--api`/`--token` flags > `MC2_API`/`MC2_API_KEY` env > `--context`/`MC2_CONTEXT`
+> the `current` context > the loopback default. `mc2 context ls` shows each
+context with its mode.
 
 ## Metrics (OTLP)
 

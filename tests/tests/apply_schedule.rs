@@ -10,17 +10,13 @@ use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 
 const DEMO: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: demo
+name: demo
 services:
   web:
     image: python:3.12
-    replicas: 2
-    resources:
-      cpus: 1
-      memoryMiB: 512
+    scale: 2
+    cpus: 1
+    mem_limit: 512m
 "#;
 
 #[tokio::test]

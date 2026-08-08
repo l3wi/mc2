@@ -13,26 +13,18 @@ use reqwest::StatusCode;
 use std::sync::Arc;
 
 const STACK_INGRESS: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-ingress
-  labels:
-    purpose: ingress-smoke
+name: smoke-ingress
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     ports:
-      - host: 18080
-        guest: 8000
-        protocol: tcp
+      - "18080:8000"
     network:
       profiles: [public]
-    restartPolicy: on-failure
+    restart: on-failure
     command: ["sleep", "infinity"]
 ingress:
   tls:
@@ -48,18 +40,14 @@ ingress:
 "#;
 
 const STACK_INGRESS_UPDATED: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-ingress
+name: smoke-ingress
 services:
   web:
     image: alpine:3.20
-    replicas: 1
+    scale: 1
     ports:
-      - host: 19090
-        guest: 8000
-    restartPolicy: on-failure
+      - "19090:8000"
+    restart: on-failure
     command: ["sleep", "infinity"]
 ingress:
   tls:
@@ -74,36 +62,27 @@ ingress:
 "#;
 
 const STACK_NO_INGRESS: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-ingress
+name: smoke-ingress
 services:
   web:
     image: alpine:3.20
-    replicas: 1
+    scale: 1
     ports:
-      - host: 18080
-        guest: 8000
-    restartPolicy: on-failure
+      - "18080:8000"
+    restart: on-failure
     command: ["sleep", "infinity"]
 "#;
 
 const STACK_MULTI_PATH: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: multi
+name: multi
 services:
   web:
     image: alpine:3.20
-    replicas: 1
+    scale: 1
     ports:
-      - host: 18080
-        guest: 8000
-      - host: 18081
-        guest: 8001
-    restartPolicy: on-failure
+      - "18080:8000"
+      - "18081:8001"
+    restart: on-failure
     command: ["sleep", "infinity"]
 ingress:
   rules:
@@ -195,16 +174,13 @@ async fn apply_desired_routes_map_to_host_ports() {
     assert_eq!(routes[0]["nodeId"], cluster.local_node_id);
 }
 
-/// Validation smoke: missing ports / non-loopback → 400 (not 500).
+/// Validation smoke: ingress referencing a missing backend port → 400 (not 500).
 #[tokio::test]
 async fn apply_rejects_bad_ingress() {
     let cluster = TestCluster::start().await.expect("start");
 
     let missing_ports = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: bad
+name: bad
 services:
   web:
     image: alpine
@@ -227,36 +203,28 @@ ingress:
     let err = res.text().await.unwrap();
     assert!(err.contains("ports") || err.contains("guest"), "{err}");
 
-    let non_loopback = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: bad2
+    // Target-only ports (auto host allocation) are now valid.
+    let auto_port = r#"
+name: bad2
 services:
   web:
     image: alpine
     ports:
-      - host: 8080
-        guest: 8000
-        bind: 0.0.0.0
-ingress:
-  rules:
-    - host: x.local
-      paths:
-        - service: web
-          port: 8000
+      - "8000"
 "#;
     let res = cluster
         .client()
         .post(format!("{}/v1/stacks:apply", cluster.base_url))
         .bearer_auth(&cluster.api_token)
-        .json(&serde_json::json!({ "yaml": non_loopback }))
+        .json(&serde_json::json!({ "yaml": auto_port }))
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let err = res.text().await.unwrap();
-    assert!(err.contains("loopback"), "{err}");
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "target-only ports auto-allocate"
+    );
 }
 
 /// Lifecycle: host/path/port update on re-apply; remove ingress; multi-path; Running report.

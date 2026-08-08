@@ -1,13 +1,12 @@
 # Hello world — the minimal stack file.
 #
-#   mc2 apply -f examples/01-hello-service/stack.yaml
+#   mc2 up -f examples/01-hello-service/stack.yaml
 #
-# apiVersion, kind, and metadata.name are omitted: `mc2 apply` fills them
-# (name defaults to the file stem). See docs/guides/stack-yaml.md.
+# The stack `name:` is optional: `mc2 up` fills it in
+# (defaults to the file stem). See docs/guides/stack-yaml.md.
 services:
   web:
     image: python:3.12-alpine
     ports:
-      - host: 18091
-        guest: 8000
+      - "18091:8000"
     command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo 'hello world' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]

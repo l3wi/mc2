@@ -6,7 +6,7 @@
 use crate::fabric::fabric_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
-use crate::{DesiredSandbox, NodeRuntime, SandboxPhase, SandboxStatus};
+use crate::{DesiredSandbox, ExecResult, NodeRuntime, SandboxPhase, SandboxStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
@@ -16,7 +16,6 @@ use microsandbox_network::policy::{
 };
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
@@ -129,8 +128,8 @@ fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
 async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) -> Result<()> {
     ensure_local_backend(volume_dir).await?;
 
-    let cpus = desired.spec.resources.cpus.clamp(1, 255) as u8;
-    let mem = desired.spec.resources.memory_mib.min(u32::MAX as u64) as u32;
+    let cpus = (desired.spec.cpus.clamp(1.0, 255.0)) as u8;
+    let mem = desired.spec.mem_limit_mib.min(u32::MAX as u64) as u32;
 
     // Note: `.replace()` is not accepted by create_detached on local backend.
     // Callers must remove an existing sandbox first if recreation is needed.
@@ -164,11 +163,12 @@ async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) ->
         });
     }
     for p in &desired.spec.ports {
-        let bind = IpAddr::from_str(&p.bind).unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+        // Ports always publish on loopback (fabric/ingress only, BYO Traefik).
+        let bind = IpAddr::from([127, 0, 0, 1]);
         if p.protocol.eq_ignore_ascii_case("udp") {
-            b = b.port_udp_bind(bind, p.host, p.guest);
+            b = b.port_udp_bind(bind, p.published, p.target);
         } else {
-            b = b.port_bind(bind, p.host, p.guest);
+            b = b.port_bind(bind, p.published, p.target);
         }
     }
 
@@ -229,7 +229,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         ensure_local_backend(self.volume_dir.as_deref()).await?;
         let name = desired.runtime_id.as_str();
 
-        let policy = RestartPolicy::parse(&desired.spec.restart_policy);
+        let policy = RestartPolicy::parse(&desired.spec.restart);
 
         match observe(name, self.volume_dir.as_deref()).await? {
             Some(st) => {
@@ -255,9 +255,9 @@ impl NodeRuntime for MicrosandboxRuntime {
                                 runtime_id: name.into(),
                                 phase: other,
                                 message: Some(format!(
-                                    "left {} (restartPolicy={})",
+                                    "left {} (restart={})",
                                     other.as_str(),
-                                    desired.spec.restart_policy
+                                    desired.spec.restart
                                 )),
                             });
                         }
@@ -360,9 +360,21 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32> {
+        Ok(self
+            .exec_with_output(runtime_id, argv, &[])
+            .await?
+            .exit_code)
+    }
+
+    async fn exec_with_output(
+        &self,
+        runtime_id: &str,
+        argv: &[String],
+        stdin: &[u8],
+    ) -> Result<ExecResult> {
         ensure_local_backend(self.volume_dir.as_deref()).await?;
         if argv.is_empty() {
-            anyhow::bail!("exec_command: empty argv");
+            anyhow::bail!("exec: empty argv");
         }
         let handle = Sandbox::get(runtime_id)
             .await
@@ -373,18 +385,27 @@ impl NodeRuntime for MicrosandboxRuntime {
             .with_context(|| format!("SandboxHandle::connect({runtime_id}) for exec"))?;
         let cmd = argv[0].clone();
         let args: Vec<String> = argv[1..].to_vec();
-        let output = sb
-            .exec(cmd, args)
+        let input = stdin.to_vec();
+        let mut exec = sb
+            .exec_stream_with(cmd, |e| e.args(args).stdin_bytes(input))
             .await
             .with_context(|| format!("Sandbox::exec({runtime_id})"))?;
-        Ok(output.status().code)
+        let output = exec
+            .collect()
+            .await
+            .with_context(|| format!("Sandbox::exec collect({runtime_id})"))?;
+        Ok(ExecResult {
+            exit_code: output.status().code,
+            stdout: output.stdout().unwrap_or_default(),
+            stderr: output.stderr().unwrap_or_default(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mc2_api::{ResourceSpec, ServiceSpec};
+    use mc2_api::ServiceSpec;
     use std::collections::BTreeMap;
 
     #[test]
@@ -397,11 +418,9 @@ mod tests {
             runtime_id: "s-w-0".into(),
             spec: ServiceSpec {
                 image: "alpine".into(),
-                replicas: 1,
-                resources: ResourceSpec {
-                    cpus: 1,
-                    memory_mib: 256,
-                },
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 256,
                 ports: vec![],
                 network: mc2_api::stack::NetworkSpec {
                     profiles: vec!["public".into(), "host".into()],
@@ -409,15 +428,14 @@ mod tests {
                 env: BTreeMap::new(),
                 secrets: vec![],
                 volumes: vec![],
-                restart_policy: "on-failure".into(),
-                health: None,
+                restart: "on-failure".into(),
+                healthcheck: None,
                 labels: BTreeMap::new(),
                 command: None,
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
                 expose: vec![],
-                allow: vec![],
                 networks: vec![],
             },
             secrets: vec![],
@@ -440,11 +458,9 @@ mod tests {
             runtime_id: "shop-web-0".into(),
             spec: ServiceSpec {
                 image: "alpine".into(),
-                replicas: 1,
-                resources: ResourceSpec {
-                    cpus: 1,
-                    memory_mib: 256,
-                },
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 256,
                 ports: vec![],
                 network: mc2_api::stack::NetworkSpec {
                     profiles: vec!["public".into()],
@@ -452,15 +468,14 @@ mod tests {
                 env: BTreeMap::new(),
                 secrets: vec![],
                 volumes: vec![],
-                restart_policy: "on-failure".into(),
-                health: None,
+                restart: "on-failure".into(),
+                healthcheck: None,
                 labels: BTreeMap::new(),
                 command: None,
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
                 expose: vec![],
-                allow: vec![],
                 networks: vec![],
             },
             secrets: vec![],

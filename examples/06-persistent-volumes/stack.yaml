@@ -1,18 +1,12 @@
 # Persistent volumes example — one named directory volume mounted by a service.
 #
-#   mc2 apply -f examples/06-persistent-volumes/stack.yaml
+#   mc2 up -f examples/06-persistent-volumes/stack.yaml
 #
 # The volume `data` is backed by a named directory volume on the node
 # (default ~/.microsandbox/volumes, override with `mc2 server --volume-dir`).
 # Data survives sandbox recreate/restart and stack removal. CI covers
 # apply → desired-set mount material in tests/tests/volumes.rs (no hypervisor).
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-volumes
-  labels:
-    env: lab
-    purpose: volumes-smoke
+name: smoke-volumes
 
 volumes:
   data:
@@ -21,16 +15,15 @@ volumes:
 services:
   keep:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     network:
       profiles: [public]
     volumes:
       - name: data
-        mount: /data
-    restartPolicy: on-failure
+        target: /data
+    restart: on-failure
     command: ["sleep", "infinity"]
     labels:
       app: smoke-volumes

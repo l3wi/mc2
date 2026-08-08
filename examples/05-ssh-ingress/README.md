@@ -12,7 +12,7 @@ key, apply the stack, and start Traefik:
 
 ```bash
 mc2 ssh key add developer --file ~/.ssh/id_ed25519.pub
-mc2 apply -f examples/05-ssh-ingress/stack.yaml
+mc2 up -f examples/05-ssh-ingress/stack.yaml
 traefik --configFile=examples/05-ssh-ingress/traefik.static.yml
 mc2 ssh ls
 ssh -p 2200 root@127.0.0.1

@@ -1,26 +1,19 @@
 # Secrets smoke stack — set the secret first, then apply.
 #
 #   mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
-#   mc2 apply -f examples/secrets/stack.yaml
+#   mc2 up -f examples/secrets/stack.yaml
 #
 # Guest env shows a placeholder (msb host-side injection); the real value is
 # only attached on TLS to allowHosts. CI covers set → apply → agent Sync
 # material in tests/tests/secrets.rs (no hypervisor).
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-secrets
-  labels:
-    env: lab
-    purpose: secrets-smoke
+name: smoke-secrets
 
 services:
   keep:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     network:
       profiles: [public]
     secrets:
@@ -29,7 +22,7 @@ services:
         allowHosts:
           # Lab: replace with a host you can curl from the guest, or keep for inject-only smoke.
           - api.example.com
-    restartPolicy: on-failure
+    restart: on-failure
     command: ["sleep", "infinity"]
     labels:
       app: smoke-secrets

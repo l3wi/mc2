@@ -11,10 +11,10 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
     h.update(b"|");
     h.update(d.spec.image.as_bytes());
     h.update(b"|");
-    h.update(d.spec.restart_policy.as_bytes());
+    h.update(d.spec.restart.as_bytes());
     h.update(b"|");
-    h.update(d.spec.resources.cpus.to_le_bytes());
-    h.update(d.spec.resources.memory_mib.to_le_bytes());
+    h.update(d.spec.cpus.to_bits().to_le_bytes());
+    h.update(d.spec.mem_limit_mib.to_le_bytes());
 
     if let Some(ref cmd) = d.spec.command {
         for c in cmd {
@@ -26,9 +26,8 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
     }
 
     for p in &d.spec.ports {
-        h.update(p.bind.as_bytes());
-        h.update(p.host.to_le_bytes());
-        h.update(p.guest.to_le_bytes());
+        h.update(p.published.to_le_bytes());
+        h.update(p.target.to_le_bytes());
         h.update(p.protocol.as_bytes());
     }
     for p in &d.spec.network.profiles {
@@ -80,7 +79,7 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
 mod tests {
     use super::*;
     use crate::fabric::{DesiredFabric, FabricAllowDesired};
-    use mc2_api::{ResourceSpec, ServiceSpec};
+    use mc2_api::ServiceSpec;
     use std::collections::BTreeMap;
 
     fn bare(image: &str) -> DesiredSandbox {
@@ -92,25 +91,22 @@ mod tests {
             runtime_id: "s-w-0".into(),
             spec: ServiceSpec {
                 image: image.into(),
-                replicas: 1,
-                resources: ResourceSpec {
-                    cpus: 1,
-                    memory_mib: 128,
-                },
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 128,
                 ports: vec![],
                 network: Default::default(),
                 env: BTreeMap::new(),
                 secrets: vec![],
                 volumes: vec![],
-                restart_policy: "on-failure".into(),
-                health: None,
+                restart: "on-failure".into(),
+                healthcheck: None,
                 labels: BTreeMap::new(),
                 command: None,
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
                 expose: vec![],
-                allow: vec![],
                 networks: vec![],
             },
             secrets: vec![],

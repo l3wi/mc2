@@ -25,9 +25,14 @@ clap_complete = "4"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+toml = "0.8"
+url = "2"
+dialoguer = "0.11"
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

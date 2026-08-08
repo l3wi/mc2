@@ -49,6 +49,23 @@ pub trait NodeRuntime: Send + Sync {
 
     /// Run a guest command (health probes). Returns process exit code.
     async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32>;
+
+    /// Run a guest command, feeding `stdin` (may be empty), and capture its
+    /// output (`mc2 exec`).
+    async fn exec_with_output(
+        &self,
+        runtime_id: &str,
+        argv: &[String],
+        stdin: &[u8],
+    ) -> Result<ExecResult>;
+}
+
+/// Captured guest command output.
+#[derive(Debug, Clone, Default)]
+pub struct ExecResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 /// Observed sandbox state.

@@ -80,6 +80,15 @@ pub struct ServerArgs {
     #[arg(long, env = "MC2_INGRESS_CONFIG_DIR")]
     pub ingress_config_dir: Option<PathBuf>,
 
+    /// Public hostname to publish this control plane through the ingress
+    /// catalog (remote client access; TLS via Traefik).
+    #[arg(long, env = "MC2_PUBLIC_HOSTNAME")]
+    pub public_hostname: Option<String>,
+
+    /// Traefik cert resolver for the control-plane TLS route (default `le`).
+    #[arg(long, default_value = "le", env = "MC2_PUBLIC_TLS_CERT_RESOLVER")]
+    pub public_tls_cert_resolver: String,
+
     /// Named-volume root on durable node storage (default ~/.microsandbox/volumes).
     /// Volumes persist across sandbox recreation and are retained on stack removal.
     #[arg(long, env = "MC2_VOLUME_DIR")]
@@ -106,6 +115,10 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub version: &'static str,
     pub secrets_key: Arc<SecretsKey>,
+    /// Named-volume root (for `rm --volumes`); None → msb default.
+    pub volume_dir: Option<PathBuf>,
+    /// Shared microsandbox runtime (exec/logs handlers + node loop).
+    pub runtime: Arc<dyn mc2_runtime::NodeRuntime>,
 }
 
 /// Periodically export status gauges (when OTLP is enabled).
@@ -171,6 +184,13 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         .await
         .context("open store")?;
 
+    if let Some(ref host) = args.public_hostname {
+        store
+            .set_setting("public_hostname", host)
+            .await
+            .context("persist public hostname")?;
+        info!(hostname = %host, "advertising control plane through ingress catalog");
+    }
     if let Some(ref plain) = boot.fresh_credentials {
         eprintln!("=== MicroCommandControl bootstrap credentials (save these; shown once) ===");
         eprintln!(
@@ -198,11 +218,17 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         return Ok(());
     }
 
+    let runtime: Arc<dyn mc2_runtime::NodeRuntime> = Arc::new(
+        mc2_runtime::MicrosandboxRuntime::new(args.volume_dir.clone()),
+    );
+
     let state = AppState {
         store: store.clone() as Arc<dyn Store>,
         data_dir: data_dir.clone(),
         version: env!("CARGO_PKG_VERSION"),
         secrets_key: secrets_key.clone(),
+        volume_dir: args.volume_dir.clone(),
+        runtime: runtime.clone(),
     };
 
     let app = router(state);
@@ -244,12 +270,17 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         cpus: args.cpus.unwrap_or_else(|| num_cpus::get() as u32),
         memory_mib: args.memory_mib.unwrap_or(8192),
         reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
-        volume_dir: args.volume_dir.clone(),
         ingress_config_dir: args.ingress_config_dir.clone(),
+        public_hostname: args.public_hostname.clone(),
+        public_tls_cert_resolver: args.public_tls_cert_resolver.clone(),
+        rest_port: rest_addr.port(),
     };
     let store_node = store.clone() as Arc<dyn Store>;
+    let runtime_node = runtime.clone();
     let node_task = tokio::spawn(async move {
-        if let Err(e) = node::run(store_node, secrets_key, node_cfg, shutdown_rx).await {
+        if let Err(e) =
+            node::run(store_node, secrets_key, runtime_node, node_cfg, shutdown_rx).await
+        {
             tracing::error!(error = %e, "local node loop failed");
         }
     });
@@ -369,6 +400,8 @@ mod tests {
             memory_mib: None,
             reconcile_interval_secs: 10,
             ingress_config_dir: None,
+            public_hostname: None,
+            public_tls_cert_resolver: "le".into(),
             volume_dir: None,
             init_only: false,
             no_auth: false,

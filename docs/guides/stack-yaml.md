@@ -1,13 +1,17 @@
-# Stack YAML reference (`mc2/v1`)
+# Stack YAML reference
 
-The desired-state document `mc2 apply -f <file>` sends to the MC2 server.
-Compose-like shape: top-level declarations (`volumes`, `networks`) plus a
-`services` map. All keys are camelCase.
+The desired-state document `mc2 up -f <file>` sends to the MC2 server.
+**Docker Compose-shaped** — a top-level `name` plus a `services` map, with
+`volumes`, `networks`, and `ingress` as top-level declarations. The parser is
+canonical: any unrecognized key is rejected (`unknown field …`), so the old
+k8s-style `apiVersion`/`kind`/`metadata` wrapper and fields like `replicas` /
+`restartPolicy` / `resources` / `health` / `mount` are errors, not silent
+no-ops.
 
 ## Minimal file
 
-`mc2 apply` fills missing boilerplate client-side (`apiVersion`, `kind`,
-`metadata.name` from the sanitized file stem), so this is a complete stack:
+`mc2 up` fills a missing top-level `name:` from the sanitized file stem, so
+this is a complete stack:
 
 ```yaml
 services:
@@ -15,18 +19,10 @@ services:
     image: alpine:3.20
 ```
 
-Present values are never rewritten — wrong values still fail server-side
-validation. Full documents pass through verbatim.
-
 ## Complete reference example
 
 ```yaml
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: shop                     # required (else derived from file name)
-  labels:
-    env: lab
+name: shop                       # required (else derived from the file name)
 
 volumes:                         # node-local named volumes (v1: dir only)
   data:
@@ -39,39 +35,34 @@ networks:                        # logical membership groups (v1: mediated only)
 services:
   db:
     image: postgres:16
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 512
+    scale: 1
+    cpus: 1
+    mem_limit: 512m
     command: ["postgres"]
-    restartPolicy: on-failure    # always | on-failure | never
+    restart: on-failure          # no | on-failure | always | unless-stopped
     networks: [backend]
     expose:
       - port: 5432
     volumes:
       - name: data
-        mount: /var/lib/postgresql/data
-    health:
-      kind: exec                 # exec | none
-      command: ["pg_isready"]
-      intervalSeconds: 30
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 30s
     labels:
       app: db
 
   web:
     image: alpine:3.20
-    resources:
-      cpus: 1
-      memoryMiB: 256
+    cpus: 1
+    mem_limit: 256m
     network:
       profiles: [public]         # public | private | host | none
     env:
       MODE: fast
     ports:
-      - host: 8080               # host port
-        guest: 8000              # in-guest port
-        protocol: tcp            # tcp | udp
-        bind: 127.0.0.1
+      - "8080:8000"              # published:target (compose short form)
+      # long form: { target: 8000, published: 8080, protocol: tcp }
     secrets:
       - name: SMOKE_TOKEN        # secret (mc2 secret set)
         env: API_TOKEN
@@ -87,9 +78,6 @@ services:
       sftp: true
       authorizedKeys: [developer]
     networks: [backend]
-    allow:
-      - to: db
-        port: 5432
 
 ingress:                         # BYO Traefik via server file export
   tls:
@@ -101,7 +89,7 @@ ingress:                         # BYO Traefik via server file export
         - path: /
           pathType: Prefix       # Prefix | Exact
           service: web
-          port: 8000             # must match a services.web.ports[].guest
+          port: 8000             # must match a services.web.ports[].target
   tcp:
     - name: web-ssh
       entryPoint: ssh
@@ -112,67 +100,101 @@ ingress:                         # BYO Traefik via server file export
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `apiVersion` | no* | `mc2/v1` | Schema version; must equal `mc2/v1`. |
-| `kind` | no* | `Stack` | Must be `Stack`. |
-| `metadata` | no* | name from file stem | Stack identity; see below. |
+| `name` | no* | file stem | Stack name. Must not contain `--` (volume namespace separator). |
 | `services` | yes | — | Map of service name → service spec. Must be non-empty. |
 | `volumes` | no | `{}` | Declared volumes; service mounts must reference them. |
 | `networks` | no | `{}` | Logical network groups (membership only in v1). |
 | `ingress` | no | — | HTTP(S) rules + TCP routes for a BYO Traefik. |
 
-\* filled by `mc2 apply` when missing.
-
-### `metadata`
-
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `name` | yes* | file stem | Stack name. Must not contain `--` (volume namespace separator). |
-| `labels` | no | `{}` | Free-form `key: value` metadata, stored with the stack. |
+\* filled by `mc2 up` when missing.
 
 ## `services.<name>`
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
 | `image` | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). |
-| `replicas` | no | `1` | Instance count; must be ≥ 1 in v1. |
-| `resources` | no | 1 CPU / 512 MiB | See `resources` below. |
+| `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
+| `cpus` | no | `1` | vCPUs (float, e.g. `0.5`); rounded up. |
+| `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
 | `command` | no | `sleep infinity` | Guest argv. Omit to keep a shell-less image alive. |
-| `restartPolicy` | no | `on-failure` | `always` \| `on-failure` \| `never`. Drives node restart/recreate on failure. |
-| `env` | no | `{}` | Guest environment variables. |
+| `restart` | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`. Drives node restart/recreate on failure. |
+| `env` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
 | `labels` | no | `{}` | Free-form labels copied onto the sandbox. |
 | `network` | no | public | See `network` below. |
-| `ports` | no | `[]` | Host↔guest port forwards (north–south). |
+| `ports` | no | `[]` | Host↔guest port forwards (north-south; auto host port when `published` omitted). |
 | `secrets` | no | `[]` | Cluster secret injections. |
 | `volumes` | no | `[]` | Mounts of declared stack volumes. |
-| `health` | no | none | Exec health probe. |
+| `healthcheck` | no | none | Exec health probe. |
 | `ssh` | no | disabled | Host-side msb SSH front end. |
-| `expose` | no | `[]` | Fabric listeners (east–west). |
-| `allow` | no | `[]` | Fabric client edges (default deny). |
-| `networks` | no | `[]` | Membership in declared `networks`. |
+| `expose` | no | `[]` | Fabric listeners (east-west; default-allow on shared networks). |
+| `networks` | no | `[]` | Server-wide network membership (default = stack). |
 | `nodeName` | no | — | Hard pin to a node name. |
 | `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
-
-### `resources`
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `cpus` | `1` | vCPUs; clamped to 1–255 at create time. |
-| `memoryMiB` | `512` | Guest memory in MiB. |
 
 ### `network`
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Fabric `allow` ports are always allowed via narrow rules regardless of profile. |
+| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Fabric reachable ports are always allowed via narrow rules regardless of profile. |
 
 ### `ports[]`
 
+Compose syntax (north-south). Host ports always bind loopback; expose publicly
+through `ingress` or the hostname sugar below (BYO Traefik).
+
+```yaml
+ports:
+  - "5000:3001"            # published:target
+  - "3001"                 # target-only → auto-allocated host port (server picks)
+  - "mcp.example.com:3000" # hostname sugar → ingress route for that hostname (TLS, `le`)
+  - "127.0.0.1:5000:3001"  # ip:published:target (ip advisory; always loopback)
+  - "5000:3001/tcp"        # explicit protocol
+```
+
+Long form: `{ target: 3001, published: 5000, protocol: tcp, hostname: "mcp.example.com" }`.
+`published: 0` / omitted → auto host port, resolved once at apply and persisted
+(the port is stable across restarts and re-applies).
+
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `host` | yes | — | Port bound on the host. Must be non-zero for ingress backends. |
-| `guest` | yes | — | Port inside the guest. |
+| `published` | no | auto | Host port. `0`/absent → server allocates. |
+| `target` | yes | — | Port inside the guest. |
 | `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
-| `bind` | no | `127.0.0.1` | Bind address. Ingress backends must stay loopback in v1. |
+| `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). |
+
+### `expose[]` (fabric listeners)
+
+Compose list form or map form:
+
+```yaml
+expose: [5432, "6379"]        # bare ports
+# or map form for protocol/name:
+expose:
+  - port: 5432
+    name: main
+```
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `port` | yes | — | Listener port; non-zero, unique per service. |
+| `protocol` | no | `tcp` | Only `tcp` in v1. |
+| `name` | no | — | Optional listener name. |
+
+Reachable by every other service that shares a network (same or different
+stack) as `<service>.<network>.svc.mc2:<port>` (default-allow, round-robin
+across Ready replicas). Same-node only in v1. Exposed guest ports are
+**effectively unique server-wide**: each stack validates uniqueness at parse
+time, but the L4 splices all live on the shared host loopback, so a port
+already bound by another stack or network makes the later splice report
+`Failed` (unlike Docker, same-port isolation across networks isn't possible).
+
+### `networks[]`
+
+List of **server-wide** network names this service joins. Every service is
+implicitly on its stack's default network (named `<stack>`); joining a named
+network also makes it reachable from services in *other* stacks on that
+network (default-allow, `svc.<network>.svc.mc2` DNS). Networks need no
+top-level declaration — they exist server-wide on first use.
 
 ### `secrets[]`
 
@@ -187,19 +209,22 @@ ingress:                         # BYO Traefik via server file export
 | Key | Required | Description |
 | --- | --- | --- |
 | `name` | yes | A declared top-level `volumes` key. |
-| `mount` | yes | Absolute guest path; unique per service. |
+| `target` | yes | Absolute guest path; unique per service. |
 
 Mounted as node-local named directory volumes; data survives sandbox recreate
 and is retained on removal. See
 [examples/06-persistent-volumes](../../examples/06-persistent-volumes/README.md).
 
-### `health`
+### `healthcheck`
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `kind` | yes | — | `exec` (run `command` in the guest) or `none`. |
-| `command` | for `exec` | `[]` | Probe argv; must be non-empty when `kind: exec`. |
-| `intervalSeconds` | no | `30` | Probe interval. |
+| `test` | no | — | Probe command. String (`curl -f http://localhost/`) or list (`["CMD", "curl", "-f", "http://localhost/"]`); `CMD` / `CMD-SHELL` prefix is stripped. |
+| `interval` | no | `30s` | Probe interval (e.g. `30s`, `1m`). |
+
+`timeout`, `retries`, `start_period`, and `disable` are **not supported yet** —
+the canonical parser rejects them (`unknown field …`). Only `test` and
+`interval` are accepted.
 
 ### `ssh`
 
@@ -211,30 +236,6 @@ and is retained on removal. See
 | `user` | `root` | SSH username presented to the SDK. |
 | `sftp` | `true` | Enable SFTP on the session. |
 | `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh key add`). |
-
-### `expose[]` (fabric)
-
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `port` | yes | — | Listener port; non-zero, unique per service. |
-| `protocol` | no | `tcp` | Only `tcp` in v1. |
-| `name` | no | — | Optional listener name. |
-
-Reachable by other services as `<service>.<stack>.svc.mc2:<port>` once they
-`allow` it. Same-node only in v1.
-
-### `allow[]` (fabric)
-
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `to` | yes | — | Target service in this stack (not itself). |
-| `port` | yes | — | Must match a target `expose[].port`. |
-| `protocol` | no | `tcp` | Only `tcp` in v1. |
-
-### `networks[]`
-
-List of names declared under top-level `networks`. Membership is informational
-in v1 (no connectivity semantics); unknown names are rejected.
 
 ## `volumes` (top-level)
 
@@ -279,7 +280,7 @@ file export (`mc2 server --ingress-config-dir`).
 | `path` | no | `/` | Route path prefix/exact match. |
 | `pathType` | no | `Prefix` | `Prefix` or `Exact`. |
 | `service` | yes | — | Backend service in this stack. |
-| `port` | yes | — | Must equal a `ports[].guest` on that service; backend `ports` entry must be `tcp`, loopback `bind`, non-zero `host`. |
+| `port` | yes | — | Must equal a `ports[].target` on that service; backend `ports` entry must be `tcp` with a non-zero `published`. |
 
 ### `tcp[]`
 
@@ -291,14 +292,15 @@ file export (`mc2 server --ingress-config-dir`).
 
 ## Validation summary
 
-Apply returns `400` for: unsupported `apiVersion`/`kind`; empty services;
-`--` in the stack name; undeclared volume mounts or invalid volume names;
-non-`dir` volume kinds; relative or duplicate mount paths; `replicas: 0`;
-unknown `restartPolicy`/`health.kind`; non-mediated networks; unknown network
-membership; zero/duplicate `expose` ports; `allow` to missing/same service or
-unexposed port; ingress without routes; ingress paths whose backend ports are
-missing, non-tcp, non-loopback, or auto-allocated; TCP ingress targeting
-services without fixed SSH ports.
+Apply returns `400` for: unknown keys (canonical parser — k8s-style keys such
+as `apiVersion`, `kind`, `metadata`, `replicas`, `resources`, `restartPolicy`,
+`health`, `allow`, `mount`, and `host`/`guest` ports are rejected); empty
+services; a missing `name`; `--` in the stack name; undeclared volume mounts or
+invalid volume names; non-`dir` volume kinds; relative or duplicate target
+paths; `scale: 0`; unknown `restart` values; non-mediated networks;
+zero/duplicate `expose` ports; non-unique expose ports across the stack;
+ingress without routes; ingress paths whose backend ports are missing or
+non-tcp; TCP ingress targeting services without fixed SSH ports.
 
 ## Further reading
 

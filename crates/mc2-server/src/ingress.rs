@@ -29,12 +29,18 @@ pub fn build_ingress_routes_for_node(
         let Ok(doc) = parse_stack_yaml(raw_yaml) else {
             continue;
         };
-        let Some(ing) = doc.ingress.as_ref() else {
-            continue;
-        };
-        out.extend(routes_from_ingress(
+        if let Some(ing) = doc.ingress.as_ref() {
+            out.extend(routes_from_ingress(
+                stack_name,
+                ing,
+                &doc.services,
+                node_id,
+                instances,
+            ));
+        }
+        // `ports[].hostname` sugar ("mcp.example.com:3000") → routed hostname.
+        out.extend(routes_from_port_hostnames(
             stack_name,
-            ing,
             &doc.services,
             node_id,
             instances,
@@ -43,6 +49,92 @@ pub fn build_ingress_routes_for_node(
 
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// `ports` entries with a `hostname` synthesize a TLS ingress route for that
+/// hostname → the service's target port (backed by the resolved host port).
+fn routes_from_port_hostnames(
+    stack: &str,
+    services: &std::collections::BTreeMap<String, ServiceSpec>,
+    node_id: &str,
+    instances: &[InstanceRecord],
+) -> Vec<DesiredIngressRoute> {
+    let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
+    for i in instances {
+        if i.stack != stack || i.node_id.as_deref() != Some(node_id) {
+            continue;
+        }
+        by_service.entry(i.service.clone()).or_default().push(i);
+    }
+    for list in by_service.values_mut() {
+        list.sort_by_key(|i| i.ordinal);
+    }
+
+    let mut routes = Vec::new();
+    for (svc_name, svc) in services {
+        for p in &svc.ports {
+            let Some(ref host) = p.hostname else {
+                continue;
+            };
+            let backend = by_service.get(svc_name).and_then(|list| {
+                list.iter()
+                    .copied()
+                    .find(|i| i.phase == "Running")
+                    .or_else(|| {
+                        list.iter().copied().find(|i| {
+                            i.phase != "Failed" && i.phase != "Stopped" && i.phase != "Pending"
+                        })
+                    })
+                    .or_else(|| list.first().copied())
+            });
+            let (backend_instance_id, backend_ordinal) = match backend {
+                Some(b) => (b.id.clone(), b.ordinal),
+                None => (String::new(), 0),
+            };
+            routes.push(DesiredIngressRoute {
+                id: make_ingress_route_id(stack, host, "/", svc_name, p.target),
+                stack: stack.into(),
+                host: host.clone(),
+                path: "/".into(),
+                path_type: "Prefix".into(),
+                service: svc_name.clone(),
+                guest_port: p.target,
+                host_port: resolved_host_port(&by_service, svc_name, p.target, p.published),
+                bind: "127.0.0.1".into(),
+                tls_enabled: true,
+                cert_resolver: "le".into(),
+                tcp: false,
+                entry_point: String::new(),
+                backend_instance_id,
+                backend_ordinal,
+            });
+        }
+    }
+    routes
+}
+
+/// The backend host port for a route. Prefers the resolved (auto-allocated)
+/// `published` from the instance's stored spec over the raw YAML value (which
+/// is `0` for target-only / hostname-sugar ports).
+fn resolved_host_port(
+    by_service: &HashMap<String, Vec<&InstanceRecord>>,
+    service: &str,
+    target: u16,
+    fallback: u16,
+) -> u16 {
+    by_service
+        .get(service)
+        .and_then(|list| {
+            list.iter().find_map(|i| {
+                let spec: ServiceSpec = serde_json::from_str(&i.spec_json).ok()?;
+                spec.ports
+                    .iter()
+                    .find(|p| p.target == target)
+                    .map(|p| p.published)
+            })
+        })
+        .filter(|p| *p != 0)
+        .unwrap_or(fallback)
 }
 
 fn routes_from_ingress(
@@ -72,7 +164,7 @@ fn routes_from_ingress(
             let Some(svc) = services.get(&path.service) else {
                 continue;
             };
-            let Some(ps) = svc.ports.iter().find(|p| p.guest == path.port) else {
+            let Some(ps) = svc.ports.iter().find(|p| p.target == path.port) else {
                 continue;
             };
 
@@ -107,8 +199,8 @@ fn routes_from_ingress(
                 path_type: path.path_type.clone(),
                 service: path.service.clone(),
                 guest_port: path.port,
-                host_port: ps.host,
-                bind: ps.bind.clone(),
+                host_port: resolved_host_port(&by_service, &path.service, path.port, ps.published),
+                bind: "127.0.0.1".into(),
                 tls_enabled,
                 cert_resolver: cert_resolver.clone(),
                 tcp: false,
@@ -168,27 +260,27 @@ mod tests {
     fn bare_spec() -> ServiceSpec {
         ServiceSpec {
             image: "alpine".into(),
-            replicas: 1,
-            resources: Default::default(),
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
             ports: vec![PortSpec {
-                host: 8080,
-                guest: 8000,
+                published: 8080,
+                target: 8000,
                 protocol: "tcp".into(),
-                bind: "127.0.0.1".into(),
+                hostname: None,
             }],
             network: Default::default(),
             env: Default::default(),
             secrets: vec![],
             volumes: vec![],
-            restart_policy: "on-failure".into(),
-            health: None,
+            restart: "on-failure".into(),
+            healthcheck: None,
             labels: Default::default(),
             command: None,
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
             expose: vec![],
-            allow: vec![],
             networks: vec![],
         }
     }
@@ -252,16 +344,12 @@ mod tests {
     fn stack_yaml_with_ingress(host: &str, guest: u16, host_port: u16) -> String {
         format!(
             r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: demo
+name: demo
 services:
   web:
     image: alpine
     ports:
-      - host: {host_port}
-        guest: {guest}
+      - "{host_port}:{guest}"
 ingress:
   tls:
     enabled: false
@@ -321,18 +409,13 @@ ingress:
     #[test]
     fn multi_path_routes() {
         let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: demo
+name: demo
 services:
   web:
     image: alpine
     ports:
-      - host: 8080
-        guest: 8000
-      - host: 8081
-        guest: 8001
+      - "8080:8000"
+      - "8081:8001"
 ingress:
   rules:
     - host: demo.local
@@ -370,16 +453,12 @@ ingress:
     #[test]
     fn no_ingress_in_yaml_yields_empty() {
         let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: demo
+name: demo
 services:
   web:
     image: alpine
     ports:
-      - host: 8080
-        guest: 8000
+      - "8080:8000"
 "#;
         let instances = vec![InstanceRecord {
             id: "demo-web-0".into(),
@@ -396,5 +475,75 @@ services:
         let routes =
             build_ingress_routes_for_node("n1", &[("demo".into(), yaml.into())], &instances);
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn port_hostname_sugar_emits_tls_route() {
+        let yaml = r#"
+name: demo
+services:
+  web:
+    image: alpine
+    ports:
+      - "mcp.example.com:3000"
+"#;
+        let instances = vec![InstanceRecord {
+            id: "demo-web-0".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            ordinal: 0,
+            node_id: Some("n1".into()),
+            phase: "Running".into(),
+            runtime_id: None,
+            message: None,
+            spec_json: "{}".into(),
+            updated_at: String::new(),
+        }];
+        let routes =
+            build_ingress_routes_for_node("n1", &[("demo".into(), yaml.into())], &instances);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].host, "mcp.example.com");
+        assert_eq!(routes[0].guest_port, 3000);
+        assert!(routes[0].tls_enabled);
+        assert_eq!(routes[0].cert_resolver, "le");
+        assert_eq!(routes[0].backend_instance_id, "demo-web-0");
+    }
+
+    #[test]
+    fn resolved_host_port_prefers_instance_spec() {
+        // Instance spec carries the auto-allocated `published`; the raw YAML
+        // has `0` for target-only / hostname-sugar ports.
+        let inst = InstanceRecord {
+            id: "demo-web-0".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            ordinal: 0,
+            node_id: Some("n1".into()),
+            phase: "Running".into(),
+            runtime_id: None,
+            message: None,
+            spec_json: serde_json::json!({
+                "image": "alpine",
+                "scale": 1,
+                "cpus": 1.0,
+                "mem_limit": 512,
+                "restart": "no",
+                "ports": [{ "target": 3001, "published": 10023, "protocol": "tcp" }],
+                "network": {}, "env": {}, "secrets": [], "volumes": [],
+                "healthcheck": null, "labels": {}, "command": null,
+                "nodeName": null, "nodeSelector": {}, "ssh": null,
+                "expose": [], "networks": []
+            })
+            .to_string(),
+            updated_at: String::new(),
+        };
+        let by_service: HashMap<String, Vec<&InstanceRecord>> =
+            HashMap::from([("web".into(), vec![&inst])]);
+
+        assert_eq!(resolved_host_port(&by_service, "web", 3001, 0), 10023);
+        // No instance port for this target → falls back to the raw value.
+        assert_eq!(resolved_host_port(&by_service, "web", 3002, 0), 0);
+        // Missing service → fallback.
+        assert_eq!(resolved_host_port(&by_service, "other", 3001, 55), 55);
     }
 }

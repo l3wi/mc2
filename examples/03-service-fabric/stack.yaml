@@ -1,17 +1,14 @@
-# Same-node mediated fabric (D13): echo server + client via db.shop.svc.mc2 DNS.
+# Same-node mediated fabric (D13): echo server + client via echo.smoke-fabric.svc.mc2 DNS.
 #
-#   mc2 apply -f examples/service-fabric/stack.yaml
+#   mc2 up -f examples/03-service-fabric/stack.yaml
 #
-# After both Running: from the `client` sandbox (or via mc2 exec when available),
+# After both Running: from the `client` sandbox,
 #   wget -qO- http://echo.smoke-fabric.svc.mc2:8080/
 # should hit the `echo` service through the server's L4 splice.
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-fabric
-  labels:
-    env: lab
-    purpose: fabric-smoke
+#
+# Full-mesh fabric: `echo` exposes port 8080, so `client` reaches it by default
+# (Docker-style default allow within the stack) — no allow edges needed.
+name: smoke-fabric
 
 networks:
   backend:
@@ -21,10 +18,9 @@ services:
   echo:
     # python image: alpine micro rootfs may lack busybox httpd applet.
     image: python:3.12-alpine
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 256
+    scale: 1
+    cpus: 1
+    mem_limit: 256m
     network:
       profiles: [public]
     expose:
@@ -34,23 +30,18 @@ services:
       - /bin/sh
       - -c
       - "mkdir -p /tmp/www && printf 'FABRIC_OK\\n' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"
-    restartPolicy: always
+    restart: always
     labels:
       app: smoke-fabric-echo
 
   client:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     network:
       profiles: [public]
-    allow:
-      - to: echo
-        port: 8080
-        protocol: tcp
     command: ["sleep", "infinity"]
-    restartPolicy: always
+    restart: always
     labels:
       app: smoke-fabric-client

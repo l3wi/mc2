@@ -1,14 +1,23 @@
 //! Same-node mediated service fabric dataplane (D13).
 //!
 //! - **expose**: track msb loopback publish host ports (allocated at create).
-//! - **allow**: userspace L4 splice on `127.0.0.1:<service_port>` → backend publish;
-//!   inject fabric DNS names into guest `/etc/hosts` → gateway IP.
+//! - **edges**: one shared user-space L4 splice per exposed `(service, port)`
+//!   on `127.0.0.1:<port>`; each connection **round-robins** across the Ready
+//!   backend replicas (read per connection, so no restart on phase churn).
+//!   All consumers route through the injected DNS gateway → the shared splice.
+//! - DNS names injected into guest `/etc/hosts` → gateway IP.
 //! - Never enables full Host/Private profiles (policy is create-time narrow rules).
-//! - Splice/host inject reuse: only rebuild when edge config changes.
+//!
+//! Port collision note: splices share the host loopback, so exposed guest
+//! ports must be unique (validated within a stack; a cross-stack collision
+//! makes the late splice report `Failed`).
 
-use mc2_runtime::{DesiredSandbox, FabricEdgeStatus, FabricExposeStatus, FabricObserved};
+use mc2_runtime::{
+    DesiredSandbox, FabricEdgeStatus, FabricExposeStatus, FabricObserved, InstanceReport,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -22,32 +31,37 @@ struct ExposeBinding {
     host_port: u16,
 }
 
-struct ActiveSplice {
-    /// Stable key: `to_service:port → backend_instance:backend_host_port`
-    config_key: String,
-    status: FabricEdgeStatus,
-    _handle: JoinHandle<()>,
-}
+/// Shared backend registry: (service, guest_port) → ready host sockets.
+type BackendRegistry = Arc<Mutex<HashMap<(String, u16), Vec<SocketAddr>>>>;
 
 /// Per-node fabric state.
 pub struct FabricTable {
     /// instance_id → expose bindings (after sandbox create).
     exposes: HashMap<String, Vec<ExposeBinding>>,
-    /// instance_id → active client splices.
-    splices: HashMap<String, Vec<ActiveSplice>>,
     /// Shared expose index: backend instance_id → guest_port → host_port
     publish_index: Arc<Mutex<HashMap<String, HashMap<u16, u16>>>>,
     /// instance_id → last successful hosts inject key (names+gw).
     hosts_key: HashMap<String, String>,
+    /// (service, guest_port) → shared splice task (one per exposed port).
+    splices: HashMap<(String, u16), JoinHandle<()>>,
+    /// (service, guest_port) whose splice failed to bind (port collision).
+    failed_splices: HashSet<(String, u16)>,
+    /// Ready backend host sockets per (service, guest_port); read per connection.
+    backends: BackendRegistry,
+    /// Round-robin cursor across the table.
+    rr_counter: Arc<AtomicUsize>,
 }
 
 impl FabricTable {
     pub fn new() -> Self {
         Self {
             exposes: HashMap::new(),
-            splices: HashMap::new(),
             publish_index: Arc::new(Mutex::new(HashMap::new())),
             hosts_key: HashMap::new(),
+            splices: HashMap::new(),
+            failed_splices: HashSet::new(),
+            backends: Arc::new(Mutex::new(HashMap::new())),
+            rr_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -75,9 +89,9 @@ impl FabricTable {
                 .spec
                 .ports
                 .iter()
-                .find(|p| p.guest == ex.guest_port && p.protocol.eq_ignore_ascii_case("tcp"))
+                .find(|p| p.target == ex.guest_port && p.protocol.eq_ignore_ascii_case("tcp"))
             {
-                p.host
+                p.published
             } else {
                 reserve_ephemeral().await.map_err(|e| {
                     format!(
@@ -91,13 +105,13 @@ impl FabricTable {
                 .spec
                 .ports
                 .iter()
-                .any(|p| p.guest == ex.guest_port && p.protocol.eq_ignore_ascii_case("tcp"))
+                .any(|p| p.target == ex.guest_port && p.protocol.eq_ignore_ascii_case("tcp"))
             {
                 desired.spec.ports.push(mc2_api::PortSpec {
-                    host: host_port,
-                    guest: ex.guest_port,
+                    published: host_port,
+                    target: ex.guest_port,
                     protocol: "tcp".into(),
-                    bind: "127.0.0.1".into(),
+                    hostname: None,
                 });
             }
             bindings.push(ExposeBinding {
@@ -118,7 +132,94 @@ impl FabricTable {
         Ok(())
     }
 
-    /// After sandbox is Running: inject DNS hosts + ensure client splices.
+    /// Rebuild the shared backend registry and reconcile splice tasks.
+    ///
+    /// Called once per reconcile after every instance's exposes are prepared
+    /// and observed. One splice per exposed (service, port); stale splices are
+    /// aborted, new ones started, and the backends map is swapped so running
+    /// splices re-target without restarting.
+    pub async fn reconcile_splices(
+        &mut self,
+        desired: &[DesiredSandbox],
+        reports: &[InstanceReport],
+    ) {
+        let phases: HashMap<&str, &str> = reports
+            .iter()
+            .map(|r| (r.instance_id.as_str(), r.phase.as_str()))
+            .collect();
+
+        let mut new_backends: HashMap<(String, u16), Vec<SocketAddr>> = HashMap::new();
+        {
+            let idx = self.publish_index.lock().await;
+            for d in desired {
+                if d.fabric.exposes.is_empty() {
+                    continue;
+                }
+                if phases.get(d.instance_id.as_str()) != Some(&"Running") {
+                    continue;
+                }
+                let Some(hosts) = idx.get(&d.instance_id) else {
+                    continue;
+                };
+                for ex in &d.fabric.exposes {
+                    if let Some(host) = hosts.get(&ex.guest_port) {
+                        new_backends
+                            .entry((d.service.clone(), ex.guest_port))
+                            .or_default()
+                            .push(SocketAddr::from(([127, 0, 0, 1], *host)));
+                    }
+                }
+            }
+        }
+        // Deterministic round-robin order.
+        for v in new_backends.values_mut() {
+            v.sort_by_key(|a| a.port());
+        }
+
+        // Abort splices whose (service, port) is no longer served.
+        let keep: HashSet<(String, u16)> = new_backends.keys().cloned().collect();
+        let stale: Vec<(String, u16)> = self
+            .splices
+            .keys()
+            .filter(|k| !keep.contains(k))
+            .cloned()
+            .collect();
+        for k in stale {
+            if let Some(h) = self.splices.remove(&k) {
+                h.abort();
+            }
+        }
+
+        // Start missing splices.
+        for key in new_backends.keys() {
+            if self.splices.contains_key(key) {
+                continue;
+            }
+            let (service, port) = key.clone();
+            match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
+                Ok(listener) => {
+                    let backends = self.backends.clone();
+                    let counter = self.rr_counter.clone();
+                    let handle =
+                        tokio::spawn(splice_loop(listener, key.clone(), backends, counter));
+                    self.splices.insert(key.clone(), handle);
+                    self.failed_splices.remove(key);
+                    info!(service, port, "fabric shared splice started");
+                }
+                Err(e) => {
+                    warn!(service, port, error = %e, "fabric splice bind failed (port collision?)");
+                    self.failed_splices.insert(key.clone());
+                }
+            }
+        }
+
+        {
+            let mut b = self.backends.lock().await;
+            *b = new_backends;
+        }
+    }
+
+    /// After sandbox is Running: inject DNS hosts + report fabric status.
     pub async fn reconcile_running(&mut self, desired: &DesiredSandbox) -> FabricObserved {
         let mut observed = FabricObserved {
             exposes: vec![],
@@ -146,57 +247,31 @@ impl FabricTable {
             }
         }
 
-        let mut edge_results: Vec<FabricEdgeStatus> = Vec::new();
-        let mut kept: Vec<ActiveSplice> = Vec::new();
-
-        let prev = self
-            .splices
-            .remove(&desired.instance_id)
-            .unwrap_or_default();
-        let mut prev_by_key: HashMap<String, ActiveSplice> = prev
-            .into_iter()
-            .map(|s| (s.config_key.clone(), s))
-            .collect();
-
-        for allow in &desired.fabric.allows {
-            match self.plan_edge(allow).await {
-                Ok((config_key, status, need_start, backend_host_port)) => {
-                    let _ = status;
-                    if let Some(existing) = prev_by_key.remove(&config_key) {
-                        // Reuse live splice.
-                        edge_results.push(existing.status.clone());
-                        kept.push(existing);
-                        continue;
-                    }
-                    if need_start {
-                        match self
-                            .start_splice(desired, allow, &config_key, backend_host_port)
-                            .await
-                        {
-                            Ok(splice) => {
-                                edge_results.push(splice.status.clone());
-                                kept.push(splice);
-                            }
-                            Err(st) => edge_results.push(st),
-                        }
-                    } else {
-                        edge_results.push(status);
-                    }
+        let backends = self.backends.lock().await;
+        for a in &desired.fabric.allows {
+            let key = (a.to_service.clone(), a.port);
+            let (phase, message) = if self.failed_splices.contains(&key) {
+                (
+                    "Failed",
+                    "fabric splice could not bind port (collision?)".to_string(),
+                )
+            } else {
+                let has = self.splices.contains_key(&key);
+                let up = backends.get(&key).map(|v| !v.is_empty()).unwrap_or(false);
+                if has && up {
+                    ("Ready", String::new())
+                } else {
+                    ("Pending", "waiting for backend".to_string())
                 }
-                Err(st) => edge_results.push(st),
-            }
+            };
+            observed.edges.push(FabricEdgeStatus {
+                to_service: a.to_service.clone(),
+                port: a.port,
+                phase: phase.into(),
+                message,
+            });
         }
-
-        // Abort splices no longer desired.
-        for (_k, old) in prev_by_key {
-            old._handle.abort();
-        }
-
-        if !kept.is_empty() {
-            self.splices.insert(desired.instance_id.clone(), kept);
-        }
-
-        observed.edges = edge_results;
+        drop(backends);
 
         if let Err(e) = self.inject_hosts(desired, &observed).await {
             warn!(
@@ -213,11 +288,6 @@ impl FabricTable {
     }
 
     pub async fn reconcile_not_running(&mut self, desired: &DesiredSandbox) -> FabricObserved {
-        if let Some(old) = self.splices.remove(&desired.instance_id) {
-            for s in old {
-                s._handle.abort();
-            }
-        }
         self.hosts_key.remove(&desired.instance_id);
 
         let mut observed = FabricObserved::default();
@@ -253,14 +323,9 @@ impl FabricTable {
             .map(|v| v.iter().map(|b| b.host_port).collect())
     }
 
-    /// Drop splices/hosts for one instance (before force-recreate).
-    /// Clears expose bindings so the next prepare allocates fresh host ports.
+    /// Clear per-instance expose state before force-recreate. Shared splices
+    /// are untouched; `reconcile_splices` re-targets on the next cycle.
     pub async fn drop_instance(&mut self, instance_id: &str) {
-        if let Some(sp) = self.splices.remove(instance_id) {
-            for s in sp {
-                s._handle.abort();
-            }
-        }
         self.hosts_key.remove(instance_id);
         self.exposes.remove(instance_id);
         let mut idx = self.publish_index.lock().await;
@@ -271,156 +336,18 @@ impl FabricTable {
         let drop_ids: Vec<String> = self
             .exposes
             .keys()
-            .chain(self.splices.keys())
+            .chain(self.hosts_key.keys())
             .filter(|id| !keep.contains(*id))
             .cloned()
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         for id in drop_ids {
-            if let Some(sp) = self.splices.remove(&id) {
-                for s in sp {
-                    s._handle.abort();
-                }
-            }
             self.exposes.remove(&id);
             self.hosts_key.remove(&id);
             let mut idx = self.publish_index.lock().await;
             idx.remove(&id);
         }
-    }
-
-    /// Returns (config_key, status_if_not_starting, need_start, backend_host_port).
-    async fn plan_edge(
-        &self,
-        allow: &mc2_runtime::FabricAllowDesired,
-    ) -> Result<(String, FabricEdgeStatus, bool, u16), FabricEdgeStatus> {
-        if !allow.backend_local {
-            return Err(FabricEdgeStatus {
-                to_service: allow.to_service.clone(),
-                port: allow.port,
-                phase: "Failed".into(),
-                message: format!(
-                    "fabric allow {}:{}: cross-node fabric not supported (backend on node {}, local instance on this node)",
-                    allow.to_service,
-                    allow.port,
-                    if allow.backend_node_id.is_empty() {
-                        "unknown"
-                    } else {
-                        allow.backend_node_id.as_str()
-                    }
-                ),
-            });
-        }
-        if allow.backend_instance_id.is_empty() {
-            return Err(FabricEdgeStatus {
-                to_service: allow.to_service.clone(),
-                port: allow.port,
-                phase: "Pending".into(),
-                message: format!(
-                    "fabric allow {}:{}: waiting for backend instance",
-                    allow.to_service, allow.port
-                ),
-            });
-        }
-
-        let backend_host = {
-            let idx = self.publish_index.lock().await;
-            idx.get(&allow.backend_instance_id)
-                .and_then(|m| m.get(&allow.port).copied())
-        };
-        let Some(backend_host_port) = backend_host else {
-            return Err(FabricEdgeStatus {
-                to_service: allow.to_service.clone(),
-                port: allow.port,
-                phase: "Pending".into(),
-                message: format!(
-                    "fabric allow {}:{}: waiting for backend expose on {}",
-                    allow.to_service, allow.port, allow.backend_instance_id
-                ),
-            });
-        };
-
-        let config_key = format!(
-            "{}:{}→{}:{}",
-            allow.to_service, allow.port, allow.backend_instance_id, backend_host_port
-        );
-        let status = FabricEdgeStatus {
-            to_service: allow.to_service.clone(),
-            port: allow.port,
-            phase: "Ready".into(),
-            message: String::new(),
-        };
-        Ok((config_key, status, true, backend_host_port))
-    }
-
-    async fn start_splice(
-        &self,
-        desired: &DesiredSandbox,
-        allow: &mc2_runtime::FabricAllowDesired,
-        config_key: &str,
-        backend_host_port: u16,
-    ) -> Result<ActiveSplice, FabricEdgeStatus> {
-        let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], allow.port))).await
-        {
-            Ok(l) => l,
-            Err(e) => {
-                return Err(FabricEdgeStatus {
-                    to_service: allow.to_service.clone(),
-                    port: allow.port,
-                    phase: "Failed".into(),
-                    message: format!(
-                        "fabric splice {}:{}: bind 127.0.0.1:{} failed: {e}",
-                        allow.to_service, allow.port, allow.port
-                    ),
-                });
-            }
-        };
-        let listen_port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(allow.port);
-        let backend = backend_host_port;
-        let to_label = allow.to_service.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((inbound, _)) = listener.accept().await else {
-                    break;
-                };
-                let to = to_label.clone();
-                tokio::spawn(async move {
-                    let dest = SocketAddr::from(([127, 0, 0, 1], backend));
-                    match TcpStream::connect(dest).await {
-                        Ok(mut outbound) => {
-                            let mut inbound = inbound;
-                            let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
-                        }
-                        Err(e) => {
-                            debug!(error = %e, %to, backend, "fabric splice connect backend failed");
-                        }
-                    }
-                });
-            }
-        });
-
-        info!(
-            client = %desired.runtime_id,
-            to = %allow.to_service,
-            listen_port,
-            backend_host_port,
-            "fabric edge Ready"
-        );
-
-        Ok(ActiveSplice {
-            config_key: config_key.to_string(),
-            status: FabricEdgeStatus {
-                to_service: allow.to_service.clone(),
-                port: allow.port,
-                phase: "Ready".into(),
-                message: String::new(),
-            },
-            _handle: handle,
-        })
     }
 
     async fn inject_hosts(
@@ -492,9 +419,226 @@ impl FabricTable {
     }
 }
 
+/// Shared splice task: bind once, forward each connection round-robin across
+/// the current Ready backends for `key`. Reads the registry per connection so
+/// replica changes take effect without restarting the listener.
+async fn splice_loop(
+    listener: TcpListener,
+    key: (String, u16),
+    backends: BackendRegistry,
+    counter: Arc<AtomicUsize>,
+) {
+    loop {
+        let Ok((inbound, _)) = listener.accept().await else {
+            break;
+        };
+        let key = key.clone();
+        let backends = backends.clone();
+        let counter = counter.clone();
+        tokio::spawn(async move {
+            let dest = {
+                let b = backends.lock().await;
+                match b.get(&key) {
+                    Some(v) if !v.is_empty() => {
+                        let idx = counter.fetch_add(1, Ordering::Relaxed) % v.len();
+                        v[idx]
+                    }
+                    _ => return,
+                }
+            };
+            if let Ok(mut outbound) = TcpStream::connect(dest).await {
+                let mut inbound = inbound;
+                let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+            }
+        });
+    }
+}
+
 async fn reserve_ephemeral() -> std::io::Result<u16> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let p = listener.local_addr()?.port();
     drop(listener);
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mc2_runtime::{DesiredFabric, FabricAllowDesired, FabricExposeDesired};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn desired(
+        instance_id: &str,
+        service: &str,
+        guest_port: u16,
+        allow: Option<(&str, u16)>,
+    ) -> DesiredSandbox {
+        use mc2_api::ServiceSpec;
+        let mut allows = Vec::new();
+        if let Some((to, port)) = allow {
+            allows.push(FabricAllowDesired {
+                to_service: to.into(),
+                port,
+                protocol: "tcp".into(),
+                fqdn: format!("{to}.shop.svc.mc2"),
+                short_name: to.into(),
+                backend_instance_id: String::new(),
+                backend_node_id: String::new(),
+                backend_local: true,
+                backend_ordinal: 0,
+            });
+        }
+        DesiredSandbox {
+            instance_id: instance_id.into(),
+            stack: "shop".into(),
+            service: service.into(),
+            ordinal: 0,
+            runtime_id: format!("{service}-{instance_id}"),
+            spec: ServiceSpec {
+                image: "x".into(),
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 512,
+                ports: vec![],
+                network: Default::default(),
+                env: Default::default(),
+                secrets: vec![],
+                volumes: vec![],
+                restart: "on-failure".into(),
+                healthcheck: None,
+                labels: Default::default(),
+                command: None,
+                node_name: None,
+                node_selector: Default::default(),
+                ssh: None,
+                expose: vec![mc2_api::ExposeSpec {
+                    port: guest_port,
+                    protocol: "tcp".into(),
+                    name: None,
+                }],
+                networks: vec![],
+            },
+            secrets: vec![],
+            ssh: Default::default(),
+            fabric: DesiredFabric {
+                exposes: vec![FabricExposeDesired {
+                    guest_port,
+                    protocol: "tcp".into(),
+                }],
+                allows,
+            },
+        }
+    }
+
+    /// Echo backend that prefixes its own listen port, so round-robin is observable.
+    async fn echo_backend() -> u16 {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let port = port.to_string();
+                let data = port.as_bytes().to_vec();
+                tokio::spawn(async move {
+                    let _ = s.write_all(&data).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn shared_splice_round_robins_across_ready_replicas() {
+        let mut table = FabricTable::new();
+        let guest_port = reserve_ephemeral().await.unwrap();
+
+        // Two Ready "db" replicas on distinct host publish ports, same guest port.
+        let b1 = echo_backend().await;
+        let b2 = echo_backend().await;
+        let d1 = desired("i-db-0", "db", guest_port, None);
+        let d2 = desired("i-db-1", "db", guest_port, None);
+
+        // Seed the publish index + exposes as prepare_exposes would.
+        table.prepare_exposes(&mut d1.clone()).await.unwrap();
+        table.prepare_exposes(&mut d2.clone()).await.unwrap();
+        // Override host ports to our echo backends so we can observe routing.
+        {
+            let mut idx = table.publish_index.lock().await;
+            idx.insert("i-db-0".into(), HashMap::from([(guest_port, b1)]));
+            idx.insert("i-db-1".into(), HashMap::from([(guest_port, b2)]));
+        }
+        table.exposes.remove("i-db-0");
+        table.exposes.remove("i-db-1");
+
+        let reports = vec![
+            InstanceReport {
+                instance_id: "i-db-0".into(),
+                phase: "Running".into(),
+                message: String::new(),
+                runtime_id: String::new(),
+                ssh: None,
+                fabric: None,
+            },
+            InstanceReport {
+                instance_id: "i-db-1".into(),
+                phase: "Running".into(),
+                message: String::new(),
+                runtime_id: String::new(),
+                ssh: None,
+                fabric: None,
+            },
+        ];
+        table.reconcile_splices(&[d1, d2], &reports).await;
+        assert!(table.failed_splices.is_empty());
+
+        // Two connections → each lands on a different backend.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(("127.0.0.1", guest_port)).await.unwrap();
+            let mut buf = [0u8; 8];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let port: u16 = std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            seen.insert(port);
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected both replicas to receive traffic: {seen:?}"
+        );
+        assert!(seen.contains(&b1));
+        assert!(seen.contains(&b2));
+
+        table.drop_instance("i-db-0").await;
+    }
+
+    #[tokio::test]
+    async fn no_splice_when_no_ready_backend() {
+        let mut table = FabricTable::new();
+        let d = desired("i-db-0", "db", 5432, None);
+        table.prepare_exposes(&mut d.clone()).await.unwrap();
+        let reports = vec![InstanceReport {
+            instance_id: "i-db-0".into(),
+            phase: "Creating".into(),
+            message: String::new(),
+            runtime_id: String::new(),
+            ssh: None,
+            fabric: None,
+        }];
+        table.reconcile_splices(&[d], &reports).await;
+        assert!(table.splices.is_empty());
+        assert!(table.failed_splices.is_empty());
+    }
 }

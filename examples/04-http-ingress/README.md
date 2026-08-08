@@ -24,7 +24,7 @@ Apply the stack and start Traefik:
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 apply -f examples/04-http-ingress/stack.yaml
+./target/debug/mc2 up -f examples/04-http-ingress/stack.yaml
 traefik --configFile=examples/04-http-ingress/traefik.static.yml
 curl -s -H 'Host: smoke-ingress.local' http://127.0.0.1:8088/
 ```

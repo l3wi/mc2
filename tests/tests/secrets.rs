@@ -14,19 +14,13 @@ const SECRET_ENV: &str = "API_TOKEN";
 const ALLOW_HOST: &str = "api.example.com";
 
 const STACK_WITH_SECRET: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-secrets
-  labels:
-    purpose: secrets-smoke
+name: smoke-secrets
 services:
   keep:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     network:
       profiles: [public]
     secrets:
@@ -34,7 +28,7 @@ services:
         env: API_TOKEN
         allowHosts:
           - api.example.com
-    restartPolicy: on-failure
+    restart: on-failure
     command: ["sleep", "infinity"]
 "#;
 
@@ -171,17 +165,13 @@ async fn desired_set_fails_when_secret_missing() {
     let cluster = TestCluster::start().await.expect("start");
 
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: sec-missing
+name: sec-missing
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     secrets:
       - name: MISSING_SECRET
         env: TOKEN
@@ -227,17 +217,13 @@ async fn desired_set_fails_when_allow_hosts_empty() {
     assert_eq!(put.status(), StatusCode::OK);
 
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: sec-empty-hosts
+name: sec-empty-hosts
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     secrets:
       - name: SMOKE_TOKEN
         env: API_TOKEN

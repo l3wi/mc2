@@ -6,9 +6,9 @@ use crate::ingress::build_ingress_routes_for_node;
 use crate::secrets::set_secret;
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{sse::Event, IntoResponse},
     routing::{get, put},
     Json, Router,
 };
@@ -24,8 +24,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/stacks:apply", axum::routing::post(apply_stack))
+        .route("/v1/stacks/{name}", axum::routing::delete(delete_stack))
         .route("/v1/instances", get(list_instances))
         .route("/v1/instances/{id}/fabric", get(get_instance_fabric))
+        .route(
+            "/v1/instances/{id}/exec",
+            axum::routing::post(exec_instance),
+        )
+        .route("/v1/instances/{id}/logs", get(get_instance_logs))
         .route("/v1/ingress", get(list_ingress))
         .route("/v1/secrets", get(list_secrets))
         .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
@@ -74,6 +80,18 @@ async fn status(
         )
     })?;
 
+    let public_hostname = state
+        .store
+        .get_setting("public_hostname")
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "get_setting public_hostname");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "store error" })),
+            )
+        })?;
+
     Ok(Json(ClusterStatus {
         version: state.version.to_string(),
         api_version: mc2_api::API_VERSION.to_string(),
@@ -82,6 +100,7 @@ async fn status(
         stacks: counts.stacks,
         instances: counts.instances,
         message: Some("control plane up".into()),
+        public_hostname,
     }))
 }
 
@@ -153,7 +172,6 @@ fn is_stack_client_error(msg: &str) -> bool {
         || m.contains("duplicate")
         || m.contains("empty")
         || m.contains("expose")
-        || m.contains("allow")
         || m.contains("replicas")
         || m.contains("restartpolicy")
         || m.contains("apiversion")
@@ -163,6 +181,64 @@ fn is_stack_client_error(msg: &str) -> bool {
         || m.contains("yaml")
 }
 
+/// Tear down a stack: delete instances + definition. `?volumes=true` also
+/// removes the stack's named volumes (best-effort).
+async fn delete_stack(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(name): Path<String>,
+    Query(params): Query<StackDeleteQuery>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // Snapshot the YAML before deleting so `--volumes` knows the volume names.
+    let stack = state.store.get_stack(&name).await.map_err(store_err)?;
+    let Some(stack) = stack else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("stack not found: {name}") })),
+        ));
+    };
+
+    if !state.store.delete_stack(&name).await.map_err(store_err)? {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("stack not found: {name}") })),
+        ));
+    }
+
+    if params.volumes {
+        if let Ok(doc) = mc2_api::parse_stack_yaml(&stack.raw_yaml) {
+            let root = volume_root(state.volume_dir.as_deref());
+            for vol in doc.volumes.keys() {
+                let vpath = root.join(mc2_runtime::volume_name(&name, vol));
+                if vpath.exists() {
+                    match std::fs::remove_dir_all(&vpath) {
+                        Ok(()) => tracing::info!(path = %vpath.display(), "removed named volume"),
+                        Err(e) => tracing::warn!(
+                            path = %vpath.display(),
+                            error = %e,
+                            "remove named volume failed (best-effort)"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Resolve the named-volume root: `--volume-dir` if set, else the msb default.
+fn volume_root(volume_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    volume_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| crate::expand_data_dir("~/.microsandbox/volumes"))
+}
+
+#[derive(Debug, Deserialize)]
+struct StackDeleteQuery {
+    #[serde(default)]
+    volumes: bool,
+}
 async fn list_instances(
     State(state): State<AppState>,
     _auth: AuthUser,
@@ -205,6 +281,177 @@ async fn get_instance_fabric(
             Json(json!({ "error": e.to_string() })),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecBody {
+    cmd: Vec<String>,
+    #[serde(default)]
+    stdin: Option<String>,
+}
+
+/// Run a command inside the instance's sandbox and return captured output.
+async fn exec_instance(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<ExecBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if body.cmd.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cmd must not be empty" })),
+        ));
+    }
+    let inst = state.store.get_instance(&id).await.map_err(store_err)?;
+    let Some(inst) = inst else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("instance not found: {id}") })),
+        ));
+    };
+    let Some(runtime_id) = inst.runtime_id.as_deref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("instance {id} has no sandbox runtime yet") })),
+        ));
+    };
+    let stdin = body.stdin.unwrap_or_default().into_bytes();
+    match state
+        .runtime
+        .exec_with_output(runtime_id, &body.cmd, &stdin)
+        .await
+    {
+        Ok(out) => Ok(Json(json!({
+            "instanceId": id,
+            "exitCode": out.exit_code,
+            "stdout": out.stdout,
+            "stderr": out.stderr,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+    #[serde(default)]
+    follow: bool,
+}
+
+/// Recent sandbox logs (runtime / exec / kernel) for an instance. With
+/// `follow=true`, returns an SSE stream (tail snapshot first, then new entries
+/// as they arrive).
+async fn get_instance_logs(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+    Query(params): Query<LogsQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    use axum::response::sse::Sse;
+    use futures::stream::{self, StreamExt};
+
+    let inst = state.store.get_instance(&id).await.map_err(store_err)?;
+    let Some(inst) = inst else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("instance not found: {id}") })),
+        ));
+    };
+    let Some(runtime_id) = inst.runtime_id.as_deref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("instance {id} has no sandbox runtime yet") })),
+        ));
+    };
+
+    if !params.follow {
+        let opts = microsandbox::logs::LogOptions {
+            tail: params.tail,
+            ..Default::default()
+        };
+        return match microsandbox::logs::read_logs(runtime_id, &opts).await {
+            Ok(entries) => {
+                let list: Vec<serde_json::Value> =
+                    entries.into_iter().map(|e| entry_json(&e)).collect();
+                Ok(Json(json!({ "instanceId": id, "entries": list })).into_response())
+            }
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )),
+        };
+    }
+
+    // Follow: tail snapshot (if requested), then resume from its cursor.
+    let mut past_events: Vec<Event> = Vec::new();
+    let resume = if let Some(n) = params.tail {
+        let opts = microsandbox::logs::LogOptions {
+            tail: Some(n),
+            ..Default::default()
+        };
+        match microsandbox::logs::read_logs(runtime_id, &opts).await {
+            Ok(entries) => {
+                let cursor = entries.last().map(|e| e.cursor.clone());
+                for e in entries {
+                    past_events.push(entry_event(&e));
+                }
+                cursor
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": e.to_string() })),
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let start = match resume {
+        Some(cursor) => microsandbox::logs::LogStreamStart::From(cursor),
+        None => microsandbox::logs::LogStreamStart::Beginning,
+    };
+    let stream_opts = microsandbox::logs::LogStreamOptions {
+        start,
+        follow: true,
+        ..Default::default()
+    };
+    let live = match microsandbox::logs::log_stream(runtime_id, &stream_opts).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            ))
+        }
+    };
+
+    let entries: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
+        stream::iter(past_events)
+            .map(Ok::<Event, std::convert::Infallible>)
+            .chain(live.filter_map(|r| async move {
+                r.ok()
+                    .map(|e| Ok::<Event, std::convert::Infallible>(entry_event(&e)))
+            }))
+            .boxed();
+    Ok(Sse::new(entries).into_response())
+}
+
+fn entry_json(e: &microsandbox::logs::LogEntry) -> serde_json::Value {
+    json!({
+        "timestamp": e.timestamp.to_rfc3339(),
+        "source": format!("{:?}", e.source).to_ascii_lowercase(),
+        "data": String::from_utf8_lossy(&e.data),
+    })
+}
+
+fn entry_event(e: &microsandbox::logs::LogEntry) -> Event {
+    Event::default().data(entry_json(e).to_string())
 }
 
 /// Desired Ingress routes derived from stack YAML + instance placement (D7).
@@ -605,22 +852,64 @@ mod tests {
     use mc2_store::{hash_token, MemoryStore, NodeJoin, Store};
     use tower::ServiceExt;
 
+    /// Minimal NodeRuntime stub: exec returns a canned result; the rest are
+    /// unused by the REST handlers under test.
+    struct MockRuntime;
+
+    #[async_trait::async_trait]
+    impl mc2_runtime::NodeRuntime for MockRuntime {
+        async fn ensure_running(
+            &self,
+            _d: &mc2_runtime::DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            unreachable!("not exercised")
+        }
+        async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
+            unreachable!("not exercised")
+        }
+        async fn status(&self, _id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            unreachable!("not exercised")
+        }
+        async fn list(&self) -> anyhow::Result<Vec<String>> {
+            unreachable!("not exercised")
+        }
+        async fn exec_command(&self, _id: &str, _argv: &[String]) -> anyhow::Result<i32> {
+            Ok(7)
+        }
+        async fn exec_with_output(
+            &self,
+            _id: &str,
+            _argv: &[String],
+            _stdin: &[u8],
+        ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            Ok(mc2_runtime::ExecResult {
+                exit_code: 7,
+                stdout: "hello out".into(),
+                stderr: "hello err".into(),
+            })
+        }
+    }
+
     fn test_state(store: std::sync::Arc<dyn Store>) -> AppState {
-        AppState {
+        let mut state = AppState {
             store,
             data_dir: std::path::PathBuf::from("/tmp/mc2-test"),
             version: "0.1.0-test",
             secrets_key: std::sync::Arc::new(mc2_store::SecretsKey::from_bytes([1u8; 32])),
-        }
+            volume_dir: None,
+            runtime: std::sync::Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
+        };
+        state.runtime = std::sync::Arc::new(MockRuntime);
+        state
     }
 
     #[test]
     fn stack_client_errors_map_to_400_keywords() {
         assert!(is_stack_client_error(
-            "service b: allow to a:9 requires that service to expose port 9"
+            "service web: duplicate expose.port 8080"
         ));
         assert!(is_stack_client_error(
-            "service web: allow.to \"nosuch\" is not a service in this stack"
+            "service web: expose protocol must be tcp in v1 (got udp)"
         ));
         assert!(is_stack_client_error("invalid stack YAML: ..."));
         assert!(!is_stack_client_error("database locked"));
@@ -634,18 +923,13 @@ mod tests {
         let app = router(test_state(store));
         let body = serde_json::json!({
             "yaml": r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: bad
+name: bad
 services:
   a:
     image: alpine
-  b:
-    image: alpine
-    allow:
-      - to: a
-        port: 9
+    expose:
+      - port: 8080
+      - port: 8080
 "#
         });
         let res = app
@@ -733,6 +1017,30 @@ services:
     }
 
     #[tokio::test]
+    async fn status_reports_public_hostname() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store
+            .set_setting("public_hostname", "mc2.example.com")
+            .await
+            .unwrap();
+        let app = router(test_state(store));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["publicHostname"], "mc2.example.com");
+    }
+
+    #[tokio::test]
     async fn list_nodes_returns_joined() {
         let store = MemoryStore::new();
         store.init_cluster(&hash_token("secret")).await.unwrap();
@@ -765,5 +1073,237 @@ services:
         assert_eq!(v[0]["name"], "n1");
         assert_eq!(v[0]["status"], "Ready");
         assert!(v[0].get("node_token_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_stack_tears_down_and_reports_missing() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        store
+            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+            .await
+            .unwrap();
+        let app = router(test_state(store.clone()));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/stacks/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(store.get_stack("demo").await.unwrap().is_none());
+        assert!(store.list_instances().await.unwrap().is_empty());
+
+        let res2 = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/stacks/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_stack_volumes_removes_named_volume_dirs() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        let yaml = r#"
+name: demo
+volumes:
+  data:
+    kind: dir
+services:
+  web:
+    image: alpine
+    volumes:
+      - name: data
+        target: /data
+"#;
+        store.upsert_stack("demo", "{}", yaml).await.unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let volume_path = root.path().join("mc2-demo--data");
+        std::fs::create_dir_all(volume_path.join("sub")).unwrap();
+        std::fs::write(volume_path.join("sub/keep.txt"), "x").unwrap();
+
+        let mut state = test_state(store);
+        state.volume_dir = Some(root.path().to_path_buf());
+        let app = router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/stacks/demo?volumes=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !root.path().join("mc2-demo--data").exists(),
+            "volume dir removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_reads_sandbox_entries() {
+        // MSB_HOME is process-global but only this test reads it (no other
+        // mc2-server test touches the SDK log registry).
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("MSB_HOME", home.path());
+        let name = "demo-web-0";
+        let log_dir = home.path().join("sandboxes").join(name).join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("exec.log"),
+            r#"{"t":"2026-01-01T00:00:00Z","s":"stdout","d":"hello from sandbox","id":1}
+"#,
+        )
+        .unwrap();
+
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 1, r#"{}"#)
+            .await
+            .unwrap();
+        store
+            .update_instance_status(&inst[0].id, "Running", Some(name), None)
+            .await
+            .unwrap();
+
+        let app = router(test_state(store));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/instances/{}/logs?tail=5", inst[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{v}");
+        assert!(
+            entries[0]["data"]
+                .as_str()
+                .unwrap()
+                .contains("hello from sandbox"),
+            "{v}"
+        );
+
+        std::env::remove_var("MSB_HOME");
+    }
+
+    #[tokio::test]
+    async fn exec_runs_command_and_reports_errors() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas("demo", "web", 1, r#"{}"#)
+            .await
+            .unwrap();
+        store
+            .update_instance_status(&inst[0].id, "Running", Some("demo-web-0"), None)
+            .await
+            .unwrap();
+        let app = router(test_state(store));
+
+        // Success: mirrors canned output + exit code.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/instances/{}/exec", inst[0].id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "cmd": ["echo", "hi"] })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["exitCode"], 7);
+        assert_eq!(v["stdout"], "hello out");
+
+        // Empty command → 400.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/instances/{}/exec", inst[0].id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "cmd": [] })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Missing instance → 404.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/instances/00000000-0000-0000-0000-000000000000/exec")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "cmd": ["ls"] })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Instance with no runtime yet → 400.
+        let store2 = MemoryStore::new();
+        store2.init_cluster("").await.unwrap();
+        store2.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let pending = store2
+            .reconcile_service_replicas("demo", "web", 1, r#"{}"#)
+            .await
+            .unwrap();
+        let app2 = router(test_state(store2));
+        let res = app2
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/instances/{}/exec", pending[0].id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "cmd": ["ls"] })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

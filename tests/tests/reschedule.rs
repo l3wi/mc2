@@ -10,18 +10,14 @@ use reqwest::StatusCode;
 use std::sync::Arc;
 
 const WEB: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: resched
+name: resched
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
-    restartPolicy: on-failure
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
+    restart: on-failure
     command: ["sleep", "infinity"]
 "#;
 
@@ -104,24 +100,20 @@ async fn sticky_volume_stays_on_not_ready_node() {
     let node_id = cluster.local_node_id.clone();
 
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: sticky-resched
+name: sticky-resched
 volumes:
   data:
     kind: dir
 services:
   db:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     volumes:
       - name: data
-        mount: /data
-    restartPolicy: on-failure
+        target: /data
+    restart: on-failure
     command: ["sleep", "infinity"]
 "#;
     let res = cluster

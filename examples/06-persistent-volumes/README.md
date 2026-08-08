@@ -17,7 +17,7 @@ services:
     image: alpine:3.20
     volumes:
       - name: data
-        mount: /data
+        target: /data
 ```
 
 Fields:
@@ -27,7 +27,7 @@ Fields:
   supported in v1 (directory-backed named volumes; disk images, quotas, and
   snapshots are not yet available).
 - `services.<svc>.volumes[].name` — a declared volume name.
-- `services.<svc>.volumes[].mount` — absolute guest path; unique per service.
+- `services.<svc>.volumes[].target` — absolute guest path; unique per service.
 
 ## Node-local behavior
 
@@ -68,7 +68,7 @@ a throwaway volume root:
 
 ```bash
 mc2 server --volume-dir /tmp/mc2-lab-volumes ...
-mc2 apply -f examples/06-persistent-volumes/stack.yaml
+mc2 up -f examples/06-persistent-volumes/stack.yaml
 ```
 
 Then verify persistence:

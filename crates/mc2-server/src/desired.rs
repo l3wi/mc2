@@ -55,7 +55,7 @@ pub async fn build_desired_set(
             .await
             .with_context(|| format!("resolve ssh for {}", i.id))?;
 
-        let fabric = if spec.expose.is_empty() && spec.allow.is_empty() {
+        let fabric = if spec.expose.is_empty() {
             DesiredFabric::default()
         } else {
             build_fabric_desired(&i, &spec, &all_instances)

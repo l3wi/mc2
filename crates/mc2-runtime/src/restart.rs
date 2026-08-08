@@ -1,8 +1,8 @@
-//! restartPolicy evaluation (node-local sandbox lifecycle).
+//! `restart` policy evaluation (node-local sandbox lifecycle).
 
 use crate::SandboxPhase;
 
-/// Normalized restart policy from stack YAML.
+/// Normalized restart policy from stack YAML (compose values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     Always,
@@ -13,8 +13,8 @@ pub enum RestartPolicy {
 impl RestartPolicy {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "always" => Self::Always,
-            "never" => Self::Never,
+            "always" | "unless-stopped" => Self::Always,
+            "no" | "never" => Self::Never,
             _ => Self::OnFailure, // default + unknown → on-failure
         }
     }

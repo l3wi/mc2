@@ -57,9 +57,9 @@ pub struct FabricEdgeStatus {
 
 /// Guest ports that need narrow Host egress allows at create time.
 ///
-/// Includes all declared allow ports (even if backend is not yet local) so a
-/// later co-location does not require sandbox recreate. Cross-node remains
-/// failed at the splice layer.
+/// Includes all mesh edge ports (even if backend is not yet local) so a later
+/// co-location does not require sandbox recreate. Cross-node remains failed at
+/// the splice layer.
 pub fn fabric_host_allow_ports(fabric: &DesiredFabric) -> Vec<u16> {
     let mut ports: Vec<u16> = fabric.allows.iter().map(|a| a.port).collect();
     ports.sort_unstable();

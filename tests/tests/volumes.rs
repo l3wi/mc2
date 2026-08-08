@@ -10,28 +10,22 @@ use mc2_tests::TestCluster;
 use reqwest::StatusCode;
 
 const STACK_WITH_VOLUME: &str = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: smoke-volumes
-  labels:
-    purpose: volumes-smoke
+name: smoke-volumes
 volumes:
   data:
     kind: dir
 services:
   keep:
     image: alpine:3.20
-    replicas: 1
-    resources:
-      cpus: 1
-      memoryMiB: 128
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     network:
       profiles: [public]
     volumes:
       - name: data
-        mount: /data
-    restartPolicy: on-failure
+        target: /data
+    restart: on-failure
     command: ["sleep", "infinity"]
 "#;
 
@@ -67,7 +61,7 @@ async fn apply_persists_volume_mounts_and_schedules_sticky() {
     // msb names. Resolution happens node-side at create time.
     let spec_json = arr[0]["spec_json"].as_str().unwrap();
     assert!(spec_json.contains("\"name\":\"data\""), "{spec_json}");
-    assert!(spec_json.contains("\"mount\":\"/data\""), "{spec_json}");
+    assert!(spec_json.contains("\"target\":\"/data\""), "{spec_json}");
     assert!(!spec_json.contains("smoke-volumes--"), "{spec_json}");
 }
 
@@ -107,10 +101,7 @@ async fn apply_rejects_undeclared_volume() {
     let cluster = TestCluster::start().await.expect("start");
 
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: vol-missing
+name: vol-missing
 volumes:
   data:
     kind: dir
@@ -119,7 +110,7 @@ services:
     image: alpine:3.20
     volumes:
       - name: other
-        mount: /data
+        target: /data
 "#;
     let res = cluster
         .client()

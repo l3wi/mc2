@@ -5,12 +5,12 @@
 
 use crate::desired::build_desired_set;
 use crate::fabric_serve::FabricTable;
-use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter};
+use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter, SelfIngressRoute};
 use crate::ssh_serve::SshServeTable;
 use anyhow::{Context, Result};
 use mc2_runtime::{
-    backoff_secs, desired_recreate_hash, FabricObserved, InstanceReport, MicrosandboxRuntime,
-    NodeRuntime, RestartPolicy, SandboxPhase,
+    backoff_secs, desired_recreate_hash, FabricObserved, InstanceReport, NodeRuntime,
+    RestartPolicy, SandboxPhase,
 };
 use mc2_store::{NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
@@ -37,8 +37,13 @@ pub struct NodeConfig {
     pub cpus: u32,
     pub memory_mib: u64,
     pub reconcile_interval: Duration,
-    pub volume_dir: Option<PathBuf>,
     pub ingress_config_dir: Option<PathBuf>,
+    /// Public hostname to publish the control plane through the ingress catalog.
+    pub public_hostname: Option<String>,
+    /// Traefik cert resolver for the control-plane TLS route.
+    pub public_tls_cert_resolver: String,
+    /// REST listener port (backend for the control-plane self-route).
+    pub rest_port: u16,
 }
 
 /// Register/refresh the local node row; returns its stable node_id.
@@ -60,11 +65,17 @@ pub async fn ensure_local_node(store: Arc<dyn Store>, cfg: &NodeConfig) -> Resul
 pub async fn run(
     store: Arc<dyn Store>,
     secrets_key: Arc<SecretsKey>,
+    runtime: Arc<dyn NodeRuntime>,
     cfg: NodeConfig,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
     let node_id = ensure_local_node(store.clone(), &cfg).await?;
-    let runtime: Arc<dyn NodeRuntime> = Arc::new(MicrosandboxRuntime::new(cfg.volume_dir.clone()));
+
+    let self_route = cfg.public_hostname.as_ref().map(|host| SelfIngressRoute {
+        host: host.clone(),
+        port: cfg.rest_port,
+        tls_cert_resolver: cfg.public_tls_cert_resolver.clone(),
+    });
 
     info!(
         node = %cfg.name,
@@ -119,6 +130,7 @@ pub async fn run(
                     &mut ssh_table,
                     &mut fabric_table,
                     ingress_writer.as_mut(),
+                    self_route.as_ref(),
                 )
                 .await
                 {
@@ -147,6 +159,7 @@ async fn reconcile(
     ssh_table: &mut SshServeTable,
     fabric_table: &mut FabricTable,
     ingress_writer: Option<&mut IngressFileWriter>,
+    self_route: Option<&SelfIngressRoute>,
 ) -> Result<()> {
     let (mut desired, ingress_routes) =
         build_desired_set(store.clone(), secrets_key, node_id).await?;
@@ -175,7 +188,7 @@ async fn reconcile(
     });
 
     for d in &mut desired {
-        let policy = RestartPolicy::parse(&d.spec.restart_policy);
+        let policy = RestartPolicy::parse(&d.spec.restart);
         let state = rt_state.entry(d.runtime_id.clone()).or_default();
 
         // Backoff gate before ensure_running when we recently recreated.
@@ -274,51 +287,53 @@ async fn reconcile(
 
                 // Exec health when Running.
                 if st.phase == SandboxPhase::Running {
-                    if let Some(ref health) = d.spec.health {
-                        if health.kind.eq_ignore_ascii_case("exec") && !health.command.is_empty() {
-                            let interval =
-                                Duration::from_secs(u64::from(health.interval_seconds.max(1)));
-                            let due = state
-                                .last_health
-                                .map(|t| now.duration_since(t) >= interval)
-                                .unwrap_or(true);
-                            if due {
-                                state.last_health = Some(now);
-                                match runtime.exec_command(&d.runtime_id, &health.command).await {
-                                    Ok(0) => {
-                                        // healthy
-                                    }
-                                    Ok(code) => {
-                                        warn!(
-                                            runtime_id = %d.runtime_id,
-                                            code,
-                                            "health exec failed"
-                                        );
-                                        st = handle_health_failure(
-                                            runtime,
-                                            d,
-                                            policy,
-                                            state,
-                                            now,
-                                            format!("health: exit {code}"),
-                                        )
-                                        .await;
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            runtime_id = %d.runtime_id,
-                                            error = %e,
-                                            "health exec error"
-                                        );
-                                        st = handle_health_failure(
-                                            runtime,
-                                            d,
-                                            policy,
-                                            state,
-                                            now,
-                                            format!("health: {e:#}"),
-                                        )
-                                        .await;
+                    if let Some(ref health) = d.spec.healthcheck {
+                        if let Some(ref command) = health.test {
+                            if !command.is_empty() {
+                                let interval =
+                                    Duration::from_secs(u64::from(health.interval_seconds.max(1)));
+                                let due = state
+                                    .last_health
+                                    .map(|t| now.duration_since(t) >= interval)
+                                    .unwrap_or(true);
+                                if due {
+                                    state.last_health = Some(now);
+                                    match runtime.exec_command(&d.runtime_id, command).await {
+                                        Ok(0) => {
+                                            // healthy
+                                        }
+                                        Ok(code) => {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                code,
+                                                "health exec failed"
+                                            );
+                                            st = handle_health_failure(
+                                                runtime,
+                                                d,
+                                                policy,
+                                                state,
+                                                now,
+                                                format!("health: exit {code}"),
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                error = %e,
+                                                "health exec error"
+                                            );
+                                            st = handle_health_failure(
+                                                runtime,
+                                                d,
+                                                policy,
+                                                state,
+                                                now,
+                                                format!("health: {e:#}"),
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -400,6 +415,10 @@ async fn reconcile(
 
     let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
     ssh_table.close_missing(&keep_ids).await;
+    // Rebuild shared fabric splices from the current desired set + observed phases.
+    fabric_table
+        .reconcile_splices(desired.as_slice(), &reports)
+        .await;
     fabric_table.close_missing(&keep_ids).await;
 
     // Ingress file catalog (same-node BYO Traefik).
@@ -408,7 +427,7 @@ async fn reconcile(
         phases.insert(r.instance_id.clone(), r.phase.clone());
     }
     if let Some(writer) = ingress_writer {
-        match writer.reconcile(&ingress_routes, &phases).await {
+        match writer.reconcile(&ingress_routes, &phases, self_route).await {
             Ok(st) if st.wrote => {
                 info!(
                     ready = st.ready,

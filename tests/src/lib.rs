@@ -69,6 +69,8 @@ impl TestCluster {
             data_dir: data_dir.clone(),
             version: env!("CARGO_PKG_VERSION"),
             secrets_key,
+            volume_dir: None,
+            runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
         };
 
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

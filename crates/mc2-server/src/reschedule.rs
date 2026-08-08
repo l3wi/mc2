@@ -38,13 +38,13 @@ pub async fn reschedule_not_ready(store: Arc<dyn Store>) -> Result<(u32, u32)> {
             };
 
             if !may_reschedule_on_node_loss(&spec) {
-                if spec.restart_policy.eq_ignore_ascii_case("never") {
+                if spec.restart.eq_ignore_ascii_case("no") {
                     let _ = store
                         .update_instance_status(
                             &inst.id,
                             "Failed",
                             None,
-                            Some("node lost; restartPolicy=never"),
+                            Some("node lost; restart=no"),
                         )
                         .await;
                 } else {
@@ -118,9 +118,10 @@ mod tests {
     fn on_failure_spec() -> String {
         serde_json::json!({
             "image": "alpine",
-            "replicas": 1,
-            "resources": { "cpus": 1, "memoryMiB": 128 },
-            "restartPolicy": "on-failure",
+            "scale": 1,
+            "cpus": 1.0,
+            "mem_limit": 128,
+            "restart": "on-failure",
             "volumes": []
         })
         .to_string()
@@ -129,10 +130,11 @@ mod tests {
     fn sticky_spec() -> String {
         serde_json::json!({
             "image": "alpine",
-            "replicas": 1,
-            "resources": { "cpus": 1, "memoryMiB": 128 },
-            "restartPolicy": "on-failure",
-            "volumes": [{ "name": "data", "mount": "/data" }]
+            "scale": 1,
+            "cpus": 1.0,
+            "mem_limit": 128,
+            "restart": "on-failure",
+            "volumes": [{ "name": "data", "target": "/data" }]
         })
         .to_string()
     }

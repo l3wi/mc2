@@ -74,15 +74,13 @@ async fn instance_ssh_put_requires_keys_and_can_close() {
 
     // Apply so we have an instance (auto local node picks it up).
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: sshdemo
+name: sshdemo
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources: { cpus: 1, memoryMiB: 128 }
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     command: ["sleep", "infinity"]
 "#;
     let apply = cluster
@@ -170,15 +168,13 @@ async fn node_observed_ssh_roundtrip_through_rest() {
     assert_eq!(put_key.status(), StatusCode::OK);
 
     let yaml = r#"
-apiVersion: mc2/v1
-kind: Stack
-metadata:
-  name: sshobs
+name: sshobs
 services:
   web:
     image: alpine:3.20
-    replicas: 1
-    resources: { cpus: 1, memoryMiB: 128 }
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
     command: ["sleep", "infinity"]
 "#;
     let apply = cluster
