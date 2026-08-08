@@ -23,6 +23,9 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 - `--volume-dir` and `--ingress-config-dir` are now `mc2 server` flags.
 - Multi-node is deferred; the seams (`build_desired_set` + store report
   writes) stay pure functions so a remote transport can wrap them later.
+- OTLP metrics: `mc2.agent.reconciles` / `mc2.agent.reconcile_errors`
+  renamed to `mc2.node.*`; the `mc2.agent.heartbeats` counter is gone
+  (heartbeats are now store touches, not RPCs).
 
 ### Stack YAML defaults (DX)
 

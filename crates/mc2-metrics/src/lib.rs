@@ -21,7 +21,6 @@ static METRICS: OnceLock<Mc2Metrics> = OnceLock::new();
 /// Process-level meters (lazy; empty if OTLP not configured).
 #[derive(Clone)]
 pub struct Mc2Metrics {
-    pub heartbeats: Counter<u64>,
     pub reconciles: Counter<u64>,
     pub reconcile_errors: Counter<u64>,
     pub applies: Counter<u64>,
@@ -35,17 +34,13 @@ pub struct Mc2Metrics {
 impl Mc2Metrics {
     fn new(meter: Meter) -> Self {
         Self {
-            heartbeats: meter
-                .u64_counter("mc2.agent.heartbeats")
-                .with_description("Agent heartbeat RPCs sent")
-                .build(),
             reconciles: meter
-                .u64_counter("mc2.agent.reconciles")
-                .with_description("Agent reconcile loops completed")
+                .u64_counter("mc2.node.reconciles")
+                .with_description("Local node reconcile loops completed")
                 .build(),
             reconcile_errors: meter
-                .u64_counter("mc2.agent.reconcile_errors")
-                .with_description("Agent reconcile failures")
+                .u64_counter("mc2.node.reconcile_errors")
+                .with_description("Local node reconcile failures")
                 .build(),
             applies: meter
                 .u64_counter("mc2.server.applies")
@@ -147,12 +142,6 @@ pub fn metrics() -> Option<&'static Mc2Metrics> {
     METRICS.get()
 }
 
-pub fn record_heartbeat() {
-    if let Some(m) = metrics() {
-        m.heartbeats.add(1, &[]);
-    }
-}
-
 pub fn record_reconcile(ok: bool) {
     if let Some(m) = metrics() {
         m.reconciles.add(1, &[]);
@@ -210,7 +199,6 @@ mod tests {
 
     #[test]
     fn record_helpers_do_not_panic_without_init() {
-        record_heartbeat();
         record_reconcile(true);
         record_apply();
         record_schedule_binds(2);

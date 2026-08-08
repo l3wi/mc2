@@ -68,7 +68,7 @@ services:
     env:
       MODE: fast
     ports:
-      - host: 8080               # agent host port
+      - host: 8080               # host port
         guest: 8000              # in-guest port
         protocol: tcp            # tcp | udp
         bind: 127.0.0.1
@@ -91,7 +91,7 @@ services:
       - to: db
         port: 5432
 
-ingress:                         # BYO Traefik via agent file export
+ingress:                         # BYO Traefik via server file export
   tls:
     enabled: true
     certResolver: le
@@ -137,7 +137,7 @@ ingress:                         # BYO Traefik via agent file export
 | `replicas` | no | `1` | Instance count; must be ≥ 1 in v1. |
 | `resources` | no | 1 CPU / 512 MiB | See `resources` below. |
 | `command` | no | `sleep infinity` | Guest argv. Omit to keep a shell-less image alive. |
-| `restartPolicy` | no | `on-failure` | `always` \| `on-failure` \| `never`. Drives agent restart/recreate on failure. |
+| `restartPolicy` | no | `on-failure` | `always` \| `on-failure` \| `never`. Drives node restart/recreate on failure. |
 | `env` | no | `{}` | Guest environment variables. |
 | `labels` | no | `{}` | Free-form labels copied onto the sandbox. |
 | `network` | no | public | See `network` below. |
@@ -169,7 +169,7 @@ ingress:                         # BYO Traefik via agent file export
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `host` | yes | — | Port bound on the agent host. Must be non-zero for ingress backends. |
+| `host` | yes | — | Port bound on the host. Must be non-zero for ingress backends. |
 | `guest` | yes | — | Port inside the guest. |
 | `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
 | `bind` | no | `127.0.0.1` | Bind address. Ingress backends must stay loopback in v1. |
@@ -180,7 +180,7 @@ ingress:                         # BYO Traefik via agent file export
 | --- | --- | --- | --- |
 | `name` | yes | — | Cluster secret name (`mc2 secret set <name>`). |
 | `env` | yes | — | Guest env var receiving the value (placeholder until injected). |
-| `allowHosts` | no | `[]` | Hosts the real value is attached to. Empty → Sync fails closed. |
+| `allowHosts` | no | `[]` | Hosts the real value is attached to. Empty → the desired set fails closed. |
 
 ### `volumes[]` (mounts)
 
@@ -244,7 +244,7 @@ in v1 (no connectivity semantics); unknown names are rejected.
 
 Volume names must match `[a-z0-9][a-z0-9._-]*` and must not contain `--`.
 Resolved per-stack to `mc2-<stack>--<volume>` at sandbox create time; stored
-under the agent's named-volume root (`--volume-dir`, default
+under the server's named-volume root (`mc2 server --volume-dir`, default
 `~/.microsandbox/volumes`).
 
 ## `networks` (top-level)
@@ -255,8 +255,8 @@ under the agent's named-volume root (`--volume-dir`, default
 
 ## `ingress`
 
-Requires at least one of `rules` or `tcp`. Consumed by the agent's Traefik
-file export (`--ingress-config-dir`).
+Requires at least one of `rules` or `tcp`. Consumed by the server's Traefik
+file export (`mc2 server --ingress-config-dir`).
 
 ### `tls`
 

@@ -4,7 +4,7 @@
 #
 # After both Running: from the `client` sandbox (or via mc2 exec when available),
 #   wget -qO- http://echo.smoke-fabric.svc.mc2:8080/
-# should hit the `echo` service through the agent L4 splice.
+# should hit the `echo` service through the server's L4 splice.
 apiVersion: mc2/v1
 kind: Stack
 metadata:

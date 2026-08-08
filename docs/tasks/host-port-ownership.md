@@ -1,14 +1,14 @@
 # Task: MC2-owned host ports (persisted, sequential, BYO override)
 
-Status: **APPROVED — implementing 2026-08-07**
-Date: 2026-08-07
+Status: **PROPOSED (re-scoped after the single-process merge, 2026-08-08) — needs re-approval**
+Date: 2026-08-07 (updated 2026-08-08)
 
 ## Context
 
 `services.<svc>.ports[].host` was a required, user-picked host port. That
-breaks three ways: replicas collide on one node; the control plane cannot
-know what the host already uses (lab hit Docker owning 18080); ingress
-validation needed fixed ports just to name backends.
+breaks three ways: replicas collide on one node; MC2 cannot know what the
+host already uses (lab hit Docker owning 18080); ingress validation needed
+fixed ports just to name backends.
 
 Decision (user-approved): **MC2 owns host ports.** Omit `host:` → MC2
 allocates sequentially from a base (default 6100), **persists the allocation
@@ -16,11 +16,15 @@ per instance in SQLite**, and keeps it static until the instance is removed —
 re-applying the stack reuses the same ports. Explicit `host:` is a BYO
 override and fails closed on bind collision.
 
+> **Re-scoped 2026-08-08** after the single-process merge
+> (`single-process-merge.md`): the scheduler, allocator, and node reconcile
+> loop now run in one process, so the "is this port free?" check is a direct
+> host bind-probe — no heartbeat/report channel needed. The earlier
+> `occupied_ports` design (and the proto that carried it) is obsolete.
+
 ## Design (approved)
 
-### Allocation is server-side and persisted
-
-The allocation must survive agent restarts and re-applies, so the control
+The allocation must survive server restarts and re-applies, so the control
 plane owns it — SQLite table keyed by instance:
 
 ```sql
@@ -40,23 +44,24 @@ allocate(instance, node):
   else scan host_port from --port-base (default 6100):
     skip: rows allocated to other instances on this node
     skip: explicit host: overrides on this node
-    skip: ports the node reported occupied (heartbeat)
+    skip: ports currently occupied on the host (direct bind-probe)
     first candidate wins → INSERT
   exhausted base..base+10000 → instance Failed: "no free host port"
 ```
 
 The resolved port is written into the instance's `spec_json` (the runtime
-contract the agent receives); the user-facing stack YAML is never rewritten.
-`spec_hash` includes ports, so a changed allocation forces recreate — and
-since allocations are stable, normal reconciles never churn.
+contract the node loop reconciles); the user-facing stack YAML is never
+rewritten. `spec_hash` includes ports, so a changed allocation forces
+recreate — and since allocations are stable, normal reconciles never churn.
 
 ### The "check the host" step
 
-The server cannot probe node ports, so the host check travels the existing
-report channel: each `HeartbeatRequest` carries `occupied_ports` (the agent's
-live binds — sandbox publishes, fabric splices, ssh listeners). The allocator
-skips them. External squatters between allocation and bind → msb create fails
-→ instance `Failed` (fail closed, same as overrides).
+Single process means the allocator runs **on the host it schedules for**, so
+it bind-probes candidates directly (TCP bind + immediate release). The DB
+skip-list above prevents handing out a port that is allocated-but-not-yet-bound
+to another instance; the probe catches everything else (Docker, other services).
+External squatters that grab a port between allocation and msb create → msb
+create fails → instance `Failed` (fail closed, same as overrides).
 
 ### Lifecycle
 
@@ -65,8 +70,9 @@ skips them. External squatters between allocation and bind → msb create fails
 - **Removal**: instance row deleted ⇒ allocation rows deleted ⇒ port free.
 - **Reschedule to another node** (non-sticky, node loss): allocation is
   re-issued on the new node (ports are node-local; this is the one case where
-  a port can move).
-- **Agent restart**: allocations live server-side; nothing to re-probe.
+  a port can move). Single-node v1: degenerate (no peer node to move to).
+- **Server restart**: allocations live in SQLite; the bind-probe + DB
+  skip-list re-derive the free set, so nothing to re-probe from memory.
 
 ### Schema & CLI
 
@@ -85,11 +91,9 @@ allocated port from `spec_json`.
 
 | Crate | Change |
 | --- | --- |
-| `proto` | `HeartbeatRequest.occupied_ports` |
 | `mc2-api` | `PortSpec.host: Option<u16>`; explicit must be non-zero; ingress backend needs only `guest` + loopback bind |
-| `mc2-store` | migration `006_port_allocations.sql`; alloc CRUD; node occupied-ports; `update_instance_spec` |
-| `mc2-server` | `--port-base` flag; allocator invoked at bind time and on re-apply for bound instances; heartbeat stores occupied ports; ingress route host from `spec_json` |
-| `mc2-agent` | report `occupied_ports` on heartbeat |
+| `mc2-store` | migration `002_port_allocations.sql`; alloc CRUD; `update_instance_spec` |
+| `mc2-server` | `--port-base` flag; allocator invoked at bind time and on re-apply for bound instances; direct host bind-probe; ingress route host from `spec_json` |
 | `mc2` CLI | `ps` prints guest→host mapping |
 
 ## Tests
@@ -99,8 +103,8 @@ allocated port from `spec_json`.
   ingress without host OK), `spec_hash` stable under identical allocation.
 - **Integration**: apply with omitted host → scheduled instance `spec_json`
   carries port ≥ base; re-apply → same port; explicit override preserved;
-  heartbeat occupied ports shift the next allocation.
-- **Lab**: replicas get consecutive ports; agent restart keeps ports;
+  a live listener on a candidate shifts the next allocation.
+- **Lab**: replicas get consecutive ports; server restart keeps ports;
   explicit port on busy port → `Failed`; `mc2 ps` shows mapping.
 
 ## Acceptance criteria
@@ -120,4 +124,5 @@ allocated port from `spec_json`.
 
 ## Handover notes (append as completed)
 
-- (pending)
+- Not started. Re-scoped 2026-08-08 for the single-process architecture;
+  awaiting re-approval before implementation.

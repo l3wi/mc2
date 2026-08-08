@@ -1,8 +1,8 @@
 # Persistent volumes
 
-Named directory volumes that live on the agent node and survive sandbox
+Named directory volumes that live on the node and survive sandbox
 recreate, restart, and stack removal. Verified end to end on a hypervisor-
-capable agent host; CI covers the apply → agent Sync contract without a VM
+capable host; CI covers the apply → desired-set contract without a VM
 (`tests/tests/volumes.rs`).
 
 ## Stack configuration
@@ -78,7 +78,7 @@ Then verify persistence:
 cargo run -p mc2-runtime --example msb_shell -- smoke-volumes-keep-0 \
   'echo hi > /data/marker'
 
-# 2. Remove the sandbox; the agent recreates it on the next reconcile
+# 2. Remove the sandbox; the server recreates it on the next reconcile
 #    (MC2 has no stack-delete command yet — removal is per-sandbox).
 cargo run -p mc2-runtime --example msb_rm -- smoke-volumes-keep-0
 

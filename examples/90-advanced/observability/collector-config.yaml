@@ -26,7 +26,7 @@ receivers:
 processors:
   batch:
     timeout: 5s
-  # Attribute service.name: mc2-server | mc2-agent | msb-metrics
+  # Attribute service.name: mc2-server | msb-metrics
   resource:
     attributes:
       - key: collector

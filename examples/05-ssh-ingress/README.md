@@ -1,13 +1,13 @@
 # SSH ingress
 
-This example has been verified end to end with a real microsandbox agent and
-Traefik TCP forwarding. It requires a local SSH key and a hypervisor-capable
-agent host.
+This example has been verified end to end with a real microsandbox host
+and Traefik TCP forwarding. It requires a local SSH key and a hypervisor-
+capable machine.
 
 ## Run it
 
-Start the server and agent using the [quickstart](../../docs/guides/quickstart.md),
-with the agent writing its catalog to `/tmp/mc2-ssh-ingress/`. Register a public
+Start the server using the [quickstart](../../docs/guides/quickstart.md),
+with `--ingress-config-dir /tmp/mc2-ssh-ingress/`. Register a public
 key, apply the stack, and start Traefik:
 
 ```bash
@@ -19,7 +19,7 @@ ssh -p 2200 root@127.0.0.1
 ```
 
 The connection should reach the service through Traefik. `mc2 ssh ls` reports
-the direct MC2 listener, which is useful for distinguishing SSH or agent issues
+the direct MC2 listener, which is useful for distinguishing SSH or node issues
 from Traefik issues.
 
 ## Stack configuration
@@ -45,9 +45,9 @@ ingress:
 SSH fields:
 
 - `enabled` — turns the host-side microsandbox SSH server on.
-- `bind` — address used by the agent’s local SSH listener. Keep this at
+- `bind` — address used by the host-side SSH listener. Keep this at
   `127.0.0.1` unless the listener must be reachable directly from the network.
-- `port` — agent-side backend port. It must be a fixed nonzero port when used
+- `port` — host-side backend port. It must be a fixed nonzero port when used
   by TCP ingress; `0` auto-allocation is not supported for this route.
 - `user` — SSH username presented to the microsandbox SDK; this example uses
   `root`.
@@ -70,5 +70,5 @@ The two ports are intentionally different:
 Traefik :2200  →  MC2 SSH listener 127.0.0.1:2222  →  microsandbox
 ```
 
-The static Traefik file defines the public entrypoint and the agent writes the
+The static Traefik file defines the public entrypoint and the server writes the
 dynamic TCP route under `/tmp/mc2-ssh-ingress/traefik/`.
