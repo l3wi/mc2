@@ -2,7 +2,7 @@
 
 use crate::fabric::build_fabric_desired;
 use crate::ingress::build_ingress_routes_for_node;
-use crate::secrets::resolve_injections;
+use crate::secrets::{filter_secret_refs, resolve_injections};
 use crate::ssh::resolve_ssh_desired;
 use anyhow::{Context, Result};
 use mc2_api::ServiceSpec;
@@ -11,6 +11,7 @@ use mc2_runtime::{
 };
 use mc2_store::{SecretsKey, Store};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Desired set for the local node: every instance bound to `node_id` with
 /// secrets / ssh / fabric resolved, plus the node's ingress route plan.
@@ -39,7 +40,17 @@ pub async fn build_desired_set(
         let spec: ServiceSpec = serde_json::from_str(&i.spec_json)
             .map_err(|e| anyhow::anyhow!("parse service spec for {}: {e}", i.id))?;
 
-        let resolved = resolve_injections(store.clone(), secrets_key, &spec.secrets)
+        // Explicit `environment:` overrides `secrets[].env` on a name collision:
+        // overridden secrets are not resolved (and thus not decrypted/required).
+        let (secret_refs, dropped) = filter_secret_refs(&spec.secrets, &spec.env);
+        if !dropped.is_empty() {
+            warn!(
+                service = %i.service,
+                env_vars = ?dropped,
+                "environment overrides secrets[].env for these vars"
+            );
+        }
+        let resolved = resolve_injections(store.clone(), secrets_key, &secret_refs)
             .await
             .with_context(|| format!("resolve secrets for {}", i.id))?;
         let secrets = resolved

@@ -252,6 +252,18 @@ impl Store for MemoryStore {
         replicas: u32,
         spec_json: &str,
     ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let specs: Vec<String> = (0..replicas).map(|_| spec_json.to_string()).collect();
+        self.reconcile_service_replicas_multi(stack, service, &specs)
+            .await
+    }
+
+    async fn reconcile_service_replicas_multi(
+        &self,
+        stack: &str,
+        service: &str,
+        spec_jsons: &[String],
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let replicas = spec_jsons.len() as u32;
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
         let mut by_ord: HashMap<u32, InstanceRecord> = g
@@ -274,9 +286,10 @@ impl Store for MemoryStore {
         }
 
         // scale up / refresh spec
-        for ord in 0..replicas {
+        for (ord, spec_json) in spec_jsons.iter().enumerate() {
+            let ord = ord as u32;
             if let Some(existing) = by_ord.get_mut(&ord) {
-                existing.spec_json = spec_json.into();
+                existing.spec_json = spec_json.clone();
                 existing.updated_at = now.clone();
                 g.instances.insert(existing.id.clone(), existing.clone());
             } else {
@@ -290,7 +303,8 @@ impl Store for MemoryStore {
                     phase: InstancePhase::Pending.as_str().into(),
                     runtime_id: None,
                     message: None,
-                    spec_json: spec_json.into(),
+                    spec_json: spec_json.clone(),
+                    healthy: false,
                     updated_at: now.clone(),
                 };
                 g.instances.insert(id, rec.clone());
@@ -386,6 +400,21 @@ impl Store for MemoryStore {
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
         Ok(self.inner.read().await.instances.get(instance_id).cloned())
+    }
+
+    async fn update_instance_health(
+        &self,
+        instance_id: &str,
+        healthy: bool,
+    ) -> Result<InstanceRecord, StoreError> {
+        let mut g = self.inner.write().await;
+        let inst = g
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))?;
+        inst.healthy = healthy;
+        inst.updated_at = Utc::now().to_rfc3339();
+        Ok(inst.clone())
     }
 
     async fn put_secret_blob(

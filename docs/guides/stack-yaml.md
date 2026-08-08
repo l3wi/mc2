@@ -58,7 +58,7 @@ services:
     mem_limit: 256m
     network:
       profiles: [public]         # public | private | host | none
-    env:
+    environment:
       MODE: fast
     ports:
       - "8080:8000"              # published:target (compose short form)
@@ -116,9 +116,10 @@ ingress:                         # BYO Traefik via server file export
 | `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
 | `cpus` | no | `1` | vCPUs (float, e.g. `0.5`); rounded up. |
 | `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
-| `command` | no | `sleep infinity` | Guest argv. Omit to keep a shell-less image alive. |
+| `command` | no | `sleep infinity` | Guest argv. List (`["echo", "hi"]`) or string (`echo "hi there"`, split shell-like). Omit to keep a shell-less image alive. |
 | `restart` | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`. Drives node restart/recreate on failure. |
-| `env` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
+| `environment` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
+| `depends_on` | no | `{}` | Startup ordering: list (`[db]`) or map (`{db: {condition: service_healthy}}`). Conditions: `service_started` (default) \| `service_healthy` (requires the dependency to declare a healthcheck). |
 | `labels` | no | `{}` | Free-form labels copied onto the sandbox. |
 | `network` | no | public | See `network` below. |
 | `ports` | no | `[]` | Host↔guest port forwards (north-south; auto host port when `published` omitted). |
@@ -204,6 +205,14 @@ top-level declaration — they exist server-wide on first use.
 | `env` | yes | — | Guest env var receiving the value (placeholder until injected). |
 | `allowHosts` | no | `[]` | Hosts the real value is attached to. Empty → the desired set fails closed. |
 
+Precedence: an explicit `environment:` entry **overrides** `secrets[].env` with
+the same name — the colliding secret is dropped (not decrypted) and the env
+value wins. A warning is logged per service on collision.
+
+See [Environment variables vs secrets](./secrets.md) for how `environment:`
+(direct injection) differs from `secrets[].env` (encrypted, host-gated msb
+secrets), and the server-wide scoping.
+
 ### `volumes[]` (mounts)
 
 | Key | Required | Description |
@@ -221,10 +230,49 @@ and is retained on removal. See
 | --- | --- | --- | --- |
 | `test` | no | — | Probe command. String (`curl -f http://localhost/`) or list (`["CMD", "curl", "-f", "http://localhost/"]`); `CMD` / `CMD-SHELL` prefix is stripped. |
 | `interval` | no | `30s` | Probe interval (e.g. `30s`, `1m`). |
+| `timeout` | no | `0` | Per-probe timeout (e.g. `5s`). `0` = no timeout. |
+| `retries` | no | `3` | Consecutive failures before the service is marked unhealthy / restarted. |
+| `start_period` | no | `0` | Grace period after start during which probe failures are ignored. |
+| `disable` | no | `false` | `true` disables the healthcheck entirely. |
 
-`timeout`, `retries`, `start_period`, and `disable` are **not supported yet** —
-the canonical parser rejects them (`unknown field …`). Only `test` and
-`interval` are accepted.
+When running, the node `exec`s `test` every `interval`. A passing probe sets
+the instance healthy (which gates `depends_on: {condition: service_healthy}`);
+`retries` consecutive failures past `start_period` mark it unhealthy — with
+`restart` set the sandbox is removed and recreated, otherwise it reports
+`Failed`.
+
+### `depends_on` (startup ordering)
+
+Compose syntax. Ordering only — dependencies are started first, dependents wait.
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  web:
+    image: alpine
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+- List form (`depends_on: [db]`) means `condition: service_started`.
+- `service_healthy` requires the dependency to declare a (non-disabled) healthcheck.
+- References must name services in the same stack; cycles are rejected at parse time.
+
+### `scale` + published ports
+
+When `scale > 1` and a service declares published ports, each replica gets a
+distinct host port: a fixed `published: P` becomes the block `P, P+1, …, P+N-1`
+(ordinal 0 keeps `P`); a target-only (`"3001"` / hostname-sugar) port gets a
+distinct auto-allocated port per replica. Allocations are stable across
+re-applies. Ingress routes for a scaled service target replica 0's port.
 
 ### `ssh`
 
@@ -294,13 +342,15 @@ file export (`mc2 server --ingress-config-dir`).
 
 Apply returns `400` for: unknown keys (canonical parser — k8s-style keys such
 as `apiVersion`, `kind`, `metadata`, `replicas`, `resources`, `restartPolicy`,
-`health`, `allow`, `mount`, and `host`/`guest` ports are rejected); empty
-services; a missing `name`; `--` in the stack name; undeclared volume mounts or
-invalid volume names; non-`dir` volume kinds; relative or duplicate target
-paths; `scale: 0`; unknown `restart` values; non-mediated networks;
+`health`, `allow`, `mount`, `env`, and `host`/`guest` ports are rejected);
+empty services; a missing `name`; `--` in the stack name; undeclared volume
+mounts or invalid volume names; non-`dir` volume kinds; relative or duplicate
+target paths; `scale: 0`; unknown `restart` values; non-mediated networks;
 zero/duplicate `expose` ports; non-unique expose ports across the stack;
 ingress without routes; ingress paths whose backend ports are missing or
-non-tcp; TCP ingress targeting services without fixed SSH ports.
+non-tcp; TCP ingress targeting services without fixed SSH ports;
+`depends_on` references to services outside the stack, unknown conditions, or
+cycles; `service_healthy` dependencies without a declared healthcheck.
 
 ## Further reading
 

@@ -53,7 +53,7 @@ just test-unit
 just test-integration
 ```
 
-**Testing:** [docs/guides/testing.md](docs/guides/testing.md) · **Quickstart:** [docs/guides/quickstart.md](docs/guides/quickstart.md)
+**Testing:** [docs/guides/testing.md](docs/guides/testing.md) · **Quickstart:** [docs/guides/quickstart.md](docs/guides/quickstart.md) · **Secrets:** [docs/guides/secrets.md](docs/guides/secrets.md)
 
 ## Binary modes
 
@@ -110,7 +110,7 @@ One binary: orchestrator and operator CLI.
 ```text
 mc2/
   crates/           # Rust workspace (mc2 bin, server, api, store, runtime, metrics)
-  docs/guides/      # Operator guides (quickstart, testing)
+  docs/guides/      # Operator guides (quickstart, testing, secrets)
   examples/         # Stack YAML, ingress, OTEL samples
   justfile          # build, test, check, run-server
 ```

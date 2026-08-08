@@ -8,6 +8,7 @@ use crate::fabric_serve::FabricTable;
 use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter, SelfIngressRoute};
 use crate::ssh_serve::SshServeTable;
 use anyhow::{Context, Result};
+use mc2_api::HealthcheckSpec;
 use mc2_runtime::{
     backoff_secs, desired_recreate_hash, FabricObserved, InstanceReport, NodeRuntime,
     RestartPolicy, SandboxPhase,
@@ -27,6 +28,17 @@ struct InstanceRuntimeState {
     restart_count: u32,
     next_restart_ok: Option<Instant>,
     last_health: Option<Instant>,
+    /// Healthcheck passed at least once since the last (re)create.
+    health_ok: bool,
+    /// Consecutive health-probe failures (reset on success).
+    health_failures: u32,
+}
+
+/// Aggregate liveness of one service within a stack, used to gate `depends_on`.
+#[derive(Debug, Clone, Default)]
+struct ServiceLive {
+    running: bool,
+    healthy: bool,
 }
 
 /// Configuration for the local node loop.
@@ -187,9 +199,42 @@ async fn reconcile(
             .then_with(|| a.service.cmp(&b.service))
     });
 
+    // Seed per-(stack, service) liveness from the store; updated live below as
+    // this cycle reports phases / health, so in-cycle dependencies start fast.
+    let mut live: HashMap<(String, String), ServiceLive> = HashMap::new();
+    for inst in store
+        .list_instances()
+        .await
+        .context("list instances for deps")?
+    {
+        let key = (inst.stack, inst.service);
+        let entry = live.entry(key).or_default();
+        if inst.phase == "Running" {
+            entry.running = true;
+            entry.healthy = entry.healthy || inst.healthy;
+        }
+    }
+
     for d in &mut desired {
         let policy = RestartPolicy::parse(&d.spec.restart);
         let state = rt_state.entry(d.runtime_id.clone()).or_default();
+
+        // Compose `depends_on` startup gate: skip ensure_running until every
+        // dependency is Running (service_started) or Running+healthy
+        // (service_healthy). Deps live in the same stack.
+        if !d.spec.depends_on.is_empty() {
+            if let Some(waiting) = waiting_deps(d, &live) {
+                reports.push(InstanceReport {
+                    instance_id: d.instance_id.clone(),
+                    phase: "Pending".into(),
+                    message: format!("depends_on: waiting for {waiting}"),
+                    runtime_id: d.runtime_id.clone(),
+                    ssh: None,
+                    fabric: None,
+                });
+                continue;
+            }
+        }
 
         // Backoff gate before ensure_running when we recently recreated.
         if let Some(next) = state.next_restart_ok {
@@ -207,6 +252,7 @@ async fn reconcile(
                     ssh: Some(ssh),
                     fabric: Some(fabric),
                 });
+                apply_live(&mut live, d, "Creating", false);
                 continue;
             }
         }
@@ -223,6 +269,7 @@ async fn reconcile(
                 ssh: Some(ssh),
                 fabric: Some(fabric),
             });
+            apply_live(&mut live, d, "Failed", false);
             continue;
         }
 
@@ -264,6 +311,9 @@ async fn reconcile(
             owned.remove(&d.runtime_id);
             state.spec_hash = None;
             state.running_since = None;
+            state.health_ok = false;
+            state.health_failures = 0;
+            state.last_health = None;
         }
 
         match runtime.ensure_running(d).await {
@@ -285,28 +335,47 @@ async fn reconcile(
                     state.running_since = None;
                 }
 
-                // Exec health when Running.
+                // Exec health when Running (compose `healthcheck` semantics:
+                // interval / timeout / retries / start_period / disable).
                 if st.phase == SandboxPhase::Running {
                     if let Some(ref health) = d.spec.healthcheck {
-                        if let Some(ref command) = health.test {
-                            if !command.is_empty() {
-                                let interval =
-                                    Duration::from_secs(u64::from(health.interval_seconds.max(1)));
-                                let due = state
-                                    .last_health
-                                    .map(|t| now.duration_since(t) >= interval)
-                                    .unwrap_or(true);
-                                if due {
-                                    state.last_health = Some(now);
-                                    match runtime.exec_command(&d.runtime_id, command).await {
-                                        Ok(0) => {
-                                            // healthy
-                                        }
-                                        Ok(code) => {
+                        if health_active(health) {
+                            let interval =
+                                Duration::from_secs(u64::from(health.interval_seconds.max(1)));
+                            let due = state
+                                .last_health
+                                .map(|t| now.duration_since(t) >= interval)
+                                .unwrap_or(true);
+                            if due {
+                                state.last_health = Some(now);
+                                let in_start_period = health.start_period_seconds > 0
+                                    && state.running_since.is_some_and(|since| {
+                                        now.duration_since(since)
+                                            < Duration::from_secs(u64::from(
+                                                health.start_period_seconds,
+                                            ))
+                                    });
+                                match run_health_probe(runtime, &d.runtime_id, health).await {
+                                    Ok(0) => {
+                                        state.health_failures = 0;
+                                        state.health_ok = true;
+                                    }
+                                    Ok(code) => {
+                                        state.health_failures =
+                                            state.health_failures.saturating_add(1);
+                                        state.health_ok = false;
+                                        if in_start_period {
                                             warn!(
                                                 runtime_id = %d.runtime_id,
                                                 code,
-                                                "health exec failed"
+                                                "health probe failed (within start_period; ignored)"
+                                            );
+                                        } else if state.health_failures >= health.retries.max(1) {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                code,
+                                                failures = state.health_failures,
+                                                "health exec failed past retries"
                                             );
                                             st = handle_health_failure(
                                                 runtime,
@@ -317,12 +386,31 @@ async fn reconcile(
                                                 format!("health: exit {code}"),
                                             )
                                             .await;
+                                        } else {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                code,
+                                                failures = state.health_failures,
+                                                "health exec failed"
+                                            );
                                         }
-                                        Err(e) => {
+                                    }
+                                    Err(e) => {
+                                        state.health_failures =
+                                            state.health_failures.saturating_add(1);
+                                        state.health_ok = false;
+                                        if in_start_period {
                                             warn!(
                                                 runtime_id = %d.runtime_id,
                                                 error = %e,
-                                                "health exec error"
+                                                "health probe error (within start_period; ignored)"
+                                            );
+                                        } else if state.health_failures >= health.retries.max(1) {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                error = %e,
+                                                failures = state.health_failures,
+                                                "health exec error past retries"
                                             );
                                             st = handle_health_failure(
                                                 runtime,
@@ -330,9 +418,16 @@ async fn reconcile(
                                                 policy,
                                                 state,
                                                 now,
-                                                format!("health: {e:#}"),
+                                                format!("health: {e}"),
                                             )
                                             .await;
+                                        } else {
+                                            warn!(
+                                                runtime_id = %d.runtime_id,
+                                                error = %e,
+                                                failures = state.health_failures,
+                                                "health exec error"
+                                            );
                                         }
                                     }
                                 }
@@ -384,6 +479,7 @@ async fn reconcile(
                     ssh: Some(ssh),
                     fabric: Some(fabric),
                 });
+                apply_live(&mut live, d, phase, state.health_ok);
             }
             Err(e) => {
                 warn!(
@@ -409,6 +505,7 @@ async fn reconcile(
                     ssh: Some(ssh),
                     fabric: Some(fabric),
                 });
+                apply_live(&mut live, d, "Failed", false);
             }
         }
     }
@@ -460,6 +557,13 @@ async fn reconcile(
                 },
             )
             .await;
+
+        // Healthcheck signal (drives depends_on: service_healthy).
+        if let Some(hstate) = rt_state.get(&r.runtime_id) {
+            let _ = store
+                .update_instance_health(&r.instance_id, hstate.health_ok)
+                .await;
+        }
 
         if let Some(ref ssh) = r.ssh {
             let _ = store
@@ -530,6 +634,69 @@ async fn handle_health_failure(
     }
 }
 
+/// True when a healthcheck should actually run (not disabled, has a test).
+fn health_active(h: &HealthcheckSpec) -> bool {
+    !h.disable && h.test.as_ref().is_some_and(|t| !t.is_empty())
+}
+
+/// Run one health probe, honoring the compose `timeout` (0 = no timeout).
+/// Returns the guest exit code, or an Err (probe error / timeout).
+async fn run_health_probe(
+    runtime: &dyn NodeRuntime,
+    runtime_id: &str,
+    health: &HealthcheckSpec,
+) -> anyhow::Result<i32> {
+    let command = health.test.as_ref().expect("active healthcheck has a test");
+    let fut = runtime.exec_command(runtime_id, command);
+    if health.timeout_seconds == 0 {
+        return fut.await;
+    }
+    match tokio::time::timeout(Duration::from_secs(u64::from(health.timeout_seconds)), fut).await {
+        Ok(res) => res,
+        Err(_) => anyhow::bail!("health probe timed out"),
+    }
+}
+
+/// Compose `depends_on` gate: `Some(...)` lists the unsatisfied dependencies
+/// (and their conditions); `None` means all are satisfied and the instance may start.
+fn waiting_deps(
+    d: &mc2_runtime::DesiredSandbox,
+    live: &HashMap<(String, String), ServiceLive>,
+) -> Option<String> {
+    let mut waiting: Vec<String> = Vec::new();
+    for (dep, spec) in &d.spec.depends_on {
+        let key = (d.stack.clone(), dep.clone());
+        let state = live.get(&key);
+        let cond = spec.condition.trim().to_ascii_lowercase();
+        let satisfied = match cond.as_str() {
+            "service_healthy" => state.is_some_and(|s| s.running && s.healthy),
+            _ => state.is_some_and(|s| s.running),
+        };
+        if !satisfied {
+            waiting.push(format!("{dep} ({cond})"));
+        }
+    }
+    if waiting.is_empty() {
+        None
+    } else {
+        Some(waiting.join(", "))
+    }
+}
+
+/// Reflect an instance's observed phase into the service-liveness map.
+fn apply_live(
+    live: &mut HashMap<(String, String), ServiceLive>,
+    d: &mc2_runtime::DesiredSandbox,
+    phase: &str,
+    healthy: bool,
+) {
+    let entry = live
+        .entry((d.stack.clone(), d.service.clone()))
+        .or_default();
+    entry.running = phase == "Running";
+    entry.healthy = healthy;
+}
+
 /// True if every host port accepts a TCP connect (msb publish live).
 async fn host_ports_accepting(ports: &[u16]) -> bool {
     use tokio::net::TcpStream;
@@ -579,5 +746,107 @@ fn fabric_summary_phase(f: &FabricObserved) -> String {
         (false, true, _) => "Pending".into(),
         (false, false, true) => "Ready".into(),
         _ => "Pending".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn sandbox(
+        depends_on: BTreeMap<String, mc2_api::DependsOnSpec>,
+    ) -> mc2_runtime::DesiredSandbox {
+        mc2_runtime::DesiredSandbox {
+            instance_id: "i1".into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            ordinal: 0,
+            runtime_id: "demo-web-0".into(),
+            spec: mc2_api::ServiceSpec {
+                image: "alpine".into(),
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 512,
+                ports: vec![],
+                network: Default::default(),
+                env: BTreeMap::new(),
+                secrets: vec![],
+                volumes: vec![],
+                restart: "no".into(),
+                healthcheck: None,
+                labels: BTreeMap::new(),
+                command: None,
+                node_name: None,
+                node_selector: BTreeMap::new(),
+                ssh: None,
+                expose: vec![],
+                networks: vec![],
+                depends_on,
+            },
+            secrets: vec![],
+            ssh: Default::default(),
+            fabric: Default::default(),
+        }
+    }
+
+    fn dep(name: &str, condition: &str) -> BTreeMap<String, mc2_api::DependsOnSpec> {
+        BTreeMap::from([(
+            name.to_string(),
+            mc2_api::DependsOnSpec {
+                condition: condition.into(),
+            },
+        )])
+    }
+
+    fn live(
+        stack: &str,
+        service: &str,
+        running: bool,
+        healthy: bool,
+    ) -> HashMap<(String, String), ServiceLive> {
+        let mut m = HashMap::new();
+        m.insert(
+            (stack.to_string(), service.to_string()),
+            ServiceLive { running, healthy },
+        );
+        m
+    }
+
+    #[test]
+    fn service_started_gates_on_running() {
+        let d = sandbox(dep("db", "service_started"));
+        assert!(waiting_deps(&d, &live("demo", "db", false, false)).is_some());
+        assert!(waiting_deps(&d, &live("demo", "db", true, false)).is_none());
+    }
+
+    #[test]
+    fn service_healthy_requires_running_and_healthy() {
+        let d = sandbox(dep("db", "service_healthy"));
+        assert!(waiting_deps(&d, &live("demo", "db", true, false)).is_some());
+        assert!(waiting_deps(&d, &live("demo", "db", false, true)).is_some());
+        assert!(waiting_deps(&d, &live("demo", "db", true, true)).is_none());
+    }
+
+    #[test]
+    fn waiting_message_lists_unsatisfied_deps() {
+        let mut deps = dep("db", "service_healthy");
+        deps.insert("cache".into(), mc2_api::DependsOnSpec::service_started());
+        let d = sandbox(deps);
+        let msg = waiting_deps(&d, &live("demo", "db", true, false)).unwrap();
+        assert!(msg.contains("db (service_healthy)"), "{msg}");
+        assert!(msg.contains("cache (service_started)"), "{msg}");
+    }
+
+    #[test]
+    fn apply_live_tracks_running_and_healthy() {
+        let mut m = HashMap::new();
+        let d = sandbox(BTreeMap::new());
+        apply_live(&mut m, &d, "Running", true);
+        assert!(m[&("demo".into(), "web".into())].running);
+        assert!(m[&("demo".into(), "web".into())].healthy);
+        apply_live(&mut m, &d, "Failed", false);
+        assert!(!m[&("demo".into(), "web".into())].running);
+        assert!(!m[&("demo".into(), "web".into())].healthy);
     }
 }

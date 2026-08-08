@@ -170,6 +170,7 @@ fn is_stack_client_error(msg: &str) -> bool {
         || m.contains("not a service")
         || m.contains("not defined")
         || m.contains("duplicate")
+        || m.contains("conflict")
         || m.contains("empty")
         || m.contains("expose")
         || m.contains("replicas")
@@ -910,6 +911,9 @@ mod tests {
         ));
         assert!(is_stack_client_error(
             "service web: expose protocol must be tcp in v1 (got udp)"
+        ));
+        assert!(is_stack_client_error(
+            "published host port 5001 conflicts with another allocation in this stack"
         ));
         assert!(is_stack_client_error("invalid stack YAML: ..."));
         assert!(!is_stack_client_error("database locked"));

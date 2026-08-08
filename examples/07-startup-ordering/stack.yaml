@@ -1,0 +1,47 @@
+# Compose startup ordering: db (healthy) -> web. Also exercises per-replica
+# published ports (scale 3 on web) and the `environment` key.
+#
+#   mc2 up -f examples/07-startup-ordering/stack.yaml
+#
+# `web` stays Pending (depends_on: waiting for db (service_healthy)) until the
+# DB's healthcheck passes, then converges to Running.
+name: startup-ordering
+
+services:
+  db:
+    image: postgres:16
+    scale: 1
+    cpus: 1
+    mem_limit: 256m
+    network:
+      profiles: [public]
+    expose:
+      - port: 5432
+    environment:
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  web:
+    image: python:3.12-alpine
+    scale: 3
+    cpus: 1
+    mem_limit: 128m
+    network:
+      profiles: [public]
+    ports:
+      - "8080:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - "printf 'WEB_OK\\n' > /tmp/index.html && cd /tmp && exec python -m http.server 8000"
+    restart: on-failure

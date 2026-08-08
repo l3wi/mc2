@@ -108,6 +108,7 @@ mod tests {
                 ssh: None,
                 expose: vec![],
                 networks: vec![],
+                depends_on: BTreeMap::new(),
             },
             secrets: vec![],
             ssh: Default::default(),

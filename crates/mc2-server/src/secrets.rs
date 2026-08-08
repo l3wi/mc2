@@ -3,7 +3,27 @@
 use anyhow::{Context, Result};
 use mc2_api::SecretRef;
 use mc2_store::{SecretMeta, SecretsKey, Store};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Secret refs to actually inject: explicit `environment:` overrides
+/// `secrets[].env` on a name collision (env wins). Returns the refs to inject
+/// and the names of dropped colliding env vars (for a warning).
+pub fn filter_secret_refs<'a>(
+    refs: &'a [SecretRef],
+    env: &BTreeMap<String, String>,
+) -> (Vec<&'a SecretRef>, Vec<&'a str>) {
+    let mut to_inject: Vec<&'a SecretRef> = Vec::new();
+    let mut dropped: Vec<&'a str> = Vec::new();
+    for r in refs {
+        if env.contains_key(&r.env) {
+            dropped.push(r.env.as_str());
+        } else {
+            to_inject.push(r);
+        }
+    }
+    (to_inject, dropped)
+}
 
 /// Encrypt and store a secret value by name.
 pub async fn set_secret(
@@ -43,7 +63,7 @@ pub async fn decrypt_secret(store: Arc<dyn Store>, key: &SecretsKey, name: &str)
 pub async fn resolve_injections(
     store: Arc<dyn Store>,
     key: &SecretsKey,
-    refs: &[SecretRef],
+    refs: &[&SecretRef],
 ) -> Result<Vec<ResolvedInjection>> {
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
@@ -71,4 +91,54 @@ pub struct ResolvedInjection {
     pub env: String,
     pub value: String,
     pub allow_hosts: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn refs() -> Vec<SecretRef> {
+        vec![
+            SecretRef {
+                name: "TOKEN".into(),
+                env: "API_TOKEN".into(),
+                allow_hosts: vec!["api.example.com".into()],
+            },
+            SecretRef {
+                name: "DB_PASS".into(),
+                env: "DB_PASS".into(),
+                allow_hosts: vec!["db.example.com".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn environment_overrides_colliding_secret_env() {
+        let r = refs();
+        let env = BTreeMap::from([("API_TOKEN".to_string(), "inline".to_string())]);
+        let (to_inject, dropped) = filter_secret_refs(&r, &env);
+        assert_eq!(dropped, vec!["API_TOKEN"]);
+        assert_eq!(to_inject.len(), 1);
+        assert_eq!(to_inject[0].name, "DB_PASS");
+        assert_eq!(to_inject[0].env, "DB_PASS");
+    }
+
+    #[test]
+    fn no_collision_injects_all() {
+        let r = refs();
+        let env = BTreeMap::new();
+        let (to_inject, dropped) = filter_secret_refs(&r, &env);
+        assert!(dropped.is_empty());
+        assert_eq!(to_inject.len(), 2);
+    }
+
+    #[test]
+    fn collision_only_on_exact_env_name() {
+        let r = refs();
+        let env = BTreeMap::from([("API_TOKEN_X".to_string(), "1".to_string())]);
+        let (to_inject, dropped) = filter_secret_refs(&r, &env);
+        assert!(dropped.is_empty());
+        assert_eq!(to_inject.len(), 2);
+    }
 }

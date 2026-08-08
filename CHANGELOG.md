@@ -4,6 +4,31 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Compose parity round 2 — `environment`, string `command`, full `healthcheck`, `depends_on`, per-replica ports
+
+- **`environment:` replaces `env:`** as the guest env key (map or `KEY=VALUE`
+  list). The old `env:` key is rejected by the canonical parser. An explicit
+  `environment:` entry overrides a colliding `secrets[].env` (env wins; the
+  secret is dropped, not decrypted).
+- **`command` string form**: `command: 'echo "hi there"'` is split shell-like
+  (quotes + backslash escapes) into argv; list form still works.
+- **`healthcheck` full field set**: `timeout`, `retries` (default 3),
+  `start_period`, `disable` — alongside `test` and `interval`. The node runs
+  probes with a per-probe timeout, ignores failures during `start_period`, and
+  only marks the service unhealthy after `retries` consecutive failures.
+- **`depends_on`** startup ordering: list form (`[db]`) or map form
+  (`{db: {condition: service_healthy}}`). `service_healthy` waits until the
+  dependency's healthcheck passes (new persisted `instances.healthy` signal).
+  Cross-stack refs, unknown conditions, and cycles are rejected at parse time.
+- **`scale` + published ports**: per-replica host-port allocation — a fixed
+  `published: P` becomes the block `P, P+1, …, P+N-1`; target-only ports get a
+  distinct auto port per replica. Stable across re-applies.
+- Cross-service published-host-port conflicts are now rejected at apply (400);
+  published host ports are effectively unique server-wide.
+- Docs: new [Environment variables vs secrets](docs/guides/secrets.md) guide
+  clarifies the direct-`environment` vs host-gated `secrets[].env` mechanisms
+  and the server-wide (not per-stack) scoping of the secret store.
+
 ### `mc2 exec` + `mc2 logs` (see inside VMs)
 
 - **`mc2 exec <instance> <cmd…>`** runs a command inside the instance's

@@ -218,3 +218,4 @@ MC2 exports orchestrator + node metrics (`mc2.server.*`, `mc2.node.*`). Sandbox 
 
 - [Testing](./testing.md)
 - [Stack YAML reference](./stack-yaml.md)
+- [Environment variables vs secrets](./secrets.md)

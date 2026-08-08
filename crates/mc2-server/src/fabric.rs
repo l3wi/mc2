@@ -144,6 +144,7 @@ pub fn build_fabric_desired(
 mod tests {
     use super::*;
     use mc2_api::ExposeSpec;
+    use std::collections::BTreeMap;
 
     fn bare_spec() -> ServiceSpec {
         ServiceSpec {
@@ -165,6 +166,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         }
     }
 
@@ -196,6 +198,7 @@ mod tests {
             runtime_id: None,
             message: None,
             spec_json: serde_json::to_string(spec).unwrap(),
+            healthy: false,
             updated_at: "".into(),
         }
     }

@@ -194,6 +194,7 @@ mod tests {
             runtime_id: None,
             message: None,
             spec_json: r#"{"resources":{"cpus":1,"memoryMiB":512}}"#.into(),
+            healthy: false,
             updated_at: String::new(),
         }
     }
@@ -220,6 +221,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         let id = pick_node(
             &pending("web"),
@@ -267,6 +269,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         assert!(!may_reschedule_on_node_loss(&sticky));
         sticky.volumes.clear();
@@ -300,6 +303,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         let id = pick_node(
             &pending("web"),
@@ -335,6 +339,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         // db exposes a fabric port and lives on node "a" → co-locate with it.
         let mut db_spec = spec.clone();
@@ -353,6 +358,7 @@ mod tests {
             runtime_id: Some("demo-db-0".into()),
             message: None,
             spec_json: serde_json::to_string(&db_spec).unwrap(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let id = pick_node(

@@ -58,5 +58,7 @@ pub struct InstanceRecord {
     pub runtime_id: Option<String>,
     pub message: Option<String>,
     pub spec_json: String,
+    /// Healthcheck passed at least once since the last (re)create.
+    pub healthy: bool,
     pub updated_at: String,
 }

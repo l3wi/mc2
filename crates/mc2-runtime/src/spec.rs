@@ -103,6 +103,7 @@ pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::sandbox_name;
+    use std::collections::BTreeMap;
 
     #[test]
     fn start_parts_default() {
@@ -125,6 +126,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         assert_eq!(start_command_parts(&spec), vec!["sleep", "infinity"]);
     }
@@ -149,6 +151,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         DesiredSandbox {
             instance_id: "i1".into(),

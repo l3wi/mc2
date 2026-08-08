@@ -15,7 +15,7 @@ services:
       # bind defaults to 127.0.0.1
     network:
       profiles: [public]
-    env:
+    environment:
       APP_ENV: lab
     # Cluster secrets (set with `mc2 secret set NAME --value …`), then reference:
     # secrets:

@@ -465,6 +465,7 @@ async fn reserve_ephemeral() -> std::io::Result<u16> {
 mod tests {
     use super::*;
     use mc2_runtime::{DesiredFabric, FabricAllowDesired, FabricExposeDesired};
+    use std::collections::BTreeMap;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -518,6 +519,7 @@ mod tests {
                     name: None,
                 }],
                 networks: vec![],
+                depends_on: BTreeMap::new(),
             },
             secrets: vec![],
             ssh: Default::default(),

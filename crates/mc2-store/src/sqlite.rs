@@ -101,6 +101,7 @@ impl SqliteStore {
             runtime_id: row.get("runtime_id"),
             message: row.get("message"),
             spec_json: row.get("spec_json"),
+            healthy: row.get::<i64, _>("healthy") != 0,
             updated_at: row.get("updated_at"),
         }
     }
@@ -468,6 +469,18 @@ impl Store for SqliteStore {
         replicas: u32,
         spec_json: &str,
     ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let specs: Vec<String> = (0..replicas).map(|_| spec_json.to_string()).collect();
+        self.reconcile_service_replicas_multi(stack, service, &specs)
+            .await
+    }
+
+    async fn reconcile_service_replicas_multi(
+        &self,
+        stack: &str,
+        service: &str,
+        spec_jsons: &[String],
+    ) -> Result<Vec<InstanceRecord>, StoreError> {
+        let replicas = spec_jsons.len() as u32;
         let now = Utc::now().to_rfc3339();
         sqlx::query(r#"DELETE FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal >= ?3"#)
             .bind(stack)
@@ -477,7 +490,8 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
 
-        for ord in 0..replicas {
+        for (ord, spec_json) in spec_jsons.iter().enumerate() {
+            let ord = ord as u32;
             let existing = sqlx::query(
                 r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
             )
@@ -519,7 +533,7 @@ impl Store for SqliteStore {
         }
 
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
                FROM instances WHERE stack = ?1 AND service = ?2 ORDER BY ordinal"#,
         )
         .bind(stack)
@@ -533,7 +547,7 @@ impl Store for SqliteStore {
 
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
                FROM instances ORDER BY stack, service, ordinal"#,
         )
         .fetch_all(&self.pool)
@@ -547,7 +561,7 @@ impl Store for SqliteStore {
         node_id: &str,
     ) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
                FROM instances WHERE node_id = ?1"#,
         )
         .bind(node_id)
@@ -559,7 +573,7 @@ impl Store for SqliteStore {
 
     async fn list_pending_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
                FROM instances WHERE phase = 'Pending' AND node_id IS NULL"#,
         )
         .fetch_all(&self.pool)
@@ -637,7 +651,7 @@ impl Store for SqliteStore {
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
         let row = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
                FROM instances WHERE id = ?1"#,
         )
         .bind(instance_id)
@@ -645,6 +659,28 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
         Ok(row.as_ref().map(Self::map_instance))
+    }
+
+    async fn update_instance_health(
+        &self,
+        instance_id: &str,
+        healthy: bool,
+    ) -> Result<InstanceRecord, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let res =
+            sqlx::query(r#"UPDATE instances SET healthy = ?1, updated_at = ?2 WHERE id = ?3"#)
+                .bind(if healthy { 1i64 } else { 0 })
+                .bind(&now)
+                .bind(instance_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(instance_id.into()));
+        }
+        self.get_instance(instance_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
     }
 
     async fn put_secret_blob(

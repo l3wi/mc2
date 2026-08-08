@@ -43,6 +43,7 @@ dropped; complete files pass through verbatim. Full key reference:
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.
 - [Persistent volumes](./06-persistent-volumes/) — mount a node-local named volume that survives sandbox recreate.
+- [Startup ordering](./07-startup-ordering/) — `depends_on` with `service_healthy`, healthcheck tuning, and per-replica published ports at `scale > 1`.
 
 ## Advanced
 

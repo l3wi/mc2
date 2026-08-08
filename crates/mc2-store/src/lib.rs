@@ -129,6 +129,15 @@ pub trait Store: Send + Sync {
         spec_json: &str,
     ) -> Result<Vec<InstanceRecord>, StoreError>;
 
+    /// Same as [`Store::reconcile_service_replicas`] but with a per-ordinal spec
+    /// (index = ordinal). Required for `scale > 1` with per-replica published ports.
+    async fn reconcile_service_replicas_multi(
+        &self,
+        stack: &str,
+        service: &str,
+        spec_jsons: &[String],
+    ) -> Result<Vec<InstanceRecord>, StoreError>;
+
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError>;
 
     async fn list_instances_for_node(
@@ -156,6 +165,13 @@ pub trait Store: Send + Sync {
     ) -> Result<InstanceRecord, StoreError>;
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError>;
+
+    /// Persist the healthcheck-passed signal for an instance (depends_on: service_healthy).
+    async fn update_instance_health(
+        &self,
+        instance_id: &str,
+        healthy: bool,
+    ) -> Result<InstanceRecord, StoreError>;
 
     // --- secrets (Phase 5) ---
 

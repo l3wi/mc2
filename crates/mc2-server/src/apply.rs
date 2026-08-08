@@ -17,55 +17,82 @@ pub struct ApplyResult {
     pub pending: u32,
 }
 
-/// Resolve `ports` entries with `published: 0` (target-only / hostname sugar)
-/// to concrete, stable host ports, persisted in the stored spec so ingress
-/// routes and the desired set see a fixed backend port across restarts.
-/// Reuses an existing allocation for the same (stack, service, target) so
-/// re-applies keep the same port.
-async fn resolve_auto_ports(
+/// Resolve `ports` with `published: 0` (target-only / hostname sugar) and
+/// `scale > 1` fixed ports to concrete, stable host ports, producing one
+/// [`ServiceSpec`] per replica (index = ordinal). Persisted in the stored spec
+/// so ingress routes and the desired set see fixed backend ports across restarts.
+///
+/// Allocation rules:
+/// - Fixed `published: P`: replica `i` gets `P + i` (a contiguous block). Reuses
+///   the previous allocation for the same (ordinal, target) when present.
+/// - Auto (`published: 0`): replica `i` gets a distinct free port from the
+///   10000+ pool, reusing the previous per-(ordinal, target) allocation.
+async fn resolve_replica_ports(
     store: &dyn Store,
     stack: &str,
     service: &str,
-    spec: &mut ServiceSpec,
-) -> Result<()> {
+    base: &ServiceSpec,
+) -> Result<Vec<ServiceSpec>> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let mut used: BTreeSet<u16> = BTreeSet::new();
-    let mut existing: BTreeMap<u16, u16> = BTreeMap::new(); // target → published
+    let scale = base.scale.max(1);
+    let mut used_by_others: BTreeSet<u16> = BTreeSet::new();
+    let mut existing: BTreeMap<(u32, u16), u16> = BTreeMap::new(); // (ordinal, target) → published
     for inst in store.list_instances().await? {
-        if inst.stack != stack || inst.service != service {
-            continue;
-        }
         let Ok(s) = serde_json::from_str::<ServiceSpec>(&inst.spec_json) else {
             continue;
         };
         for p in s.ports {
-            if p.published != 0 {
-                used.insert(p.published);
-                if p.target != 0 {
-                    existing.insert(p.target, p.published);
-                }
+            if p.published == 0 {
+                continue;
+            }
+            if inst.stack != stack || inst.service != service {
+                used_by_others.insert(p.published);
+            } else if p.target != 0 {
+                existing.insert((inst.ordinal, p.target), p.published);
             }
         }
     }
 
-    for p in spec.ports.iter_mut() {
-        if p.published != 0 {
-            continue;
-        }
-        let port = match existing.get(&p.target) {
-            Some(&port) => port,
-            None => {
-                let port = (10000..=u16::MAX)
-                    .find(|cand| !used.contains(cand))
-                    .context("no free host port for auto-allocation")?;
-                used.insert(port);
-                port
+    // Ports already allocated to this service (reusable), plus the ports we
+    // assign during this pass.
+    let mut local: BTreeSet<u16> = existing.values().copied().collect();
+
+    let mut out = Vec::with_capacity(scale as usize);
+    for ord in 0..scale {
+        let mut spec = base.clone();
+        for p in spec.ports.iter_mut() {
+            if p.published != 0 {
+                let cand = u16::try_from(u32::from(p.published) + ord).with_context(|| {
+                    format!(
+                        "published port {} + replica {ord} exceeds the host port range",
+                        p.published
+                    )
+                })?;
+                let reuse = existing.contains_key(&(ord, p.target));
+                if used_by_others.contains(&cand) || (!reuse && local.contains(&cand)) {
+                    anyhow::bail!(
+                        "published host port {cand} (from {} + replica {ord}) conflicts \
+                         with another allocation in this stack",
+                        p.published
+                    );
+                }
+                local.insert(cand);
+                p.published = cand;
+            } else {
+                let port = match existing.get(&(ord, p.target)) {
+                    Some(&port) => port,
+                    None => (10000..=u16::MAX)
+                        .find(|cand| !used_by_others.contains(cand) && !local.contains(cand))
+                        .context("no free host port for auto-allocation")?,
+                };
+                local.insert(port);
+                p.published = port;
             }
-        };
-        p.published = port;
+        }
+        out.push(spec);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Apply a stack document from YAML text.
@@ -86,14 +113,15 @@ pub async fn apply_stack(
 
     let mut total_instances = 0u32;
     for (svc_name, spec) in &doc.services {
-        let mut spec = spec.clone();
-        // Resolve `ports` with published=0 (target-only / hostname sugar) to
-        // concrete host ports and persist them, so ingress routes and the
-        // desired set see a stable backend port across reconciles/restarts.
-        resolve_auto_ports(store.as_ref(), &doc.name, svc_name, &mut spec).await?;
-        let spec_json = serde_json::to_string(&spec).context("serialize service spec")?;
+        // Resolve per-replica host ports (fixed blocks + auto) and persist them,
+        // so ingress routes and the desired set see stable backend ports.
+        let specs = resolve_replica_ports(store.as_ref(), &doc.name, svc_name, spec).await?;
+        let spec_jsons = specs
+            .iter()
+            .map(|s| serde_json::to_string(s).context("serialize service spec"))
+            .collect::<Result<Vec<String>>>()?;
         let inst = store
-            .reconcile_service_replicas(&doc.name, svc_name, spec.scale, &spec_json)
+            .reconcile_service_replicas_multi(&doc.name, svc_name, &spec_jsons)
             .await
             .with_context(|| format!("reconcile {svc_name}"))?;
         total_instances += inst.len() as u32;
@@ -188,6 +216,7 @@ mod tests {
     use super::*;
     use mc2_api::PortSpec;
     use mc2_store::MemoryStore;
+    use std::collections::BTreeMap;
 
     fn spec_with_auto_port(target: u16) -> ServiceSpec {
         ServiceSpec {
@@ -214,6 +243,36 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
+        }
+    }
+
+    fn spec_with_fixed_port(published: u16, target: u16, scale: u32) -> ServiceSpec {
+        ServiceSpec {
+            image: "alpine".into(),
+            scale,
+            cpus: 1.0,
+            mem_limit_mib: 512,
+            ports: vec![PortSpec {
+                published,
+                target,
+                protocol: "tcp".into(),
+                hostname: None,
+            }],
+            network: Default::default(),
+            env: Default::default(),
+            secrets: vec![],
+            volumes: vec![],
+            restart: "no".into(),
+            healthcheck: None,
+            labels: Default::default(),
+            command: None,
+            node_name: None,
+            node_selector: Default::default(),
+            ssh: None,
+            expose: vec![],
+            networks: vec![],
+            depends_on: BTreeMap::new(),
         }
     }
 
@@ -224,11 +283,12 @@ mod tests {
         store.upsert_stack("demo", "{}", "yaml").await.unwrap();
 
         // First apply: target-only → concrete host port from the 10000+ range.
-        let mut spec = spec_with_auto_port(3001);
-        resolve_auto_ports(store.as_ref(), "demo", "web", &mut spec)
-            .await
-            .unwrap();
-        let first = spec.ports[0].published;
+        let specs =
+            resolve_replica_ports(store.as_ref(), "demo", "web", &spec_with_auto_port(3001))
+                .await
+                .unwrap();
+        assert_eq!(specs.len(), 1);
+        let first = specs[0].ports[0].published;
         assert!(
             first >= 10000,
             "auto host port should come from the free range"
@@ -237,25 +297,88 @@ mod tests {
 
         // Persist the resolved spec (as apply would) so re-apply reuses it.
         store
-            .reconcile_service_replicas("demo", "web", 1, &serde_json::to_string(&spec).unwrap())
+            .reconcile_service_replicas(
+                "demo",
+                "web",
+                1,
+                &serde_json::to_string(&specs[0]).unwrap(),
+            )
             .await
             .unwrap();
 
         // Re-apply with the same target-only port → same host port (stable).
-        let mut again = spec_with_auto_port(3001);
-        resolve_auto_ports(store.as_ref(), "demo", "web", &mut again)
-            .await
-            .unwrap();
+        let again =
+            resolve_replica_ports(store.as_ref(), "demo", "web", &spec_with_auto_port(3001))
+                .await
+                .unwrap();
         assert_eq!(
-            again.ports[0].published, first,
+            again[0].ports[0].published, first,
             "re-apply must reuse the allocation"
         );
 
         // A different target gets a different free port, avoiding the used one.
-        let mut other = spec_with_auto_port(3002);
-        resolve_auto_ports(store.as_ref(), "demo", "web", &mut other)
+        let other =
+            resolve_replica_ports(store.as_ref(), "demo", "web", &spec_with_auto_port(3002))
+                .await
+                .unwrap();
+        assert_ne!(other[0].ports[0].published, first);
+    }
+
+    #[tokio::test]
+    async fn scaled_fixed_port_gets_a_distinct_block_per_replica() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+
+        let specs = resolve_replica_ports(
+            store.as_ref(),
+            "demo",
+            "web",
+            &spec_with_fixed_port(5000, 3000, 3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(specs.len(), 3);
+        let host_ports: Vec<u16> = specs.iter().map(|s| s.ports[0].published).collect();
+        assert_eq!(host_ports, vec![5000, 5001, 5002]);
+    }
+
+    #[tokio::test]
+    async fn scaled_auto_ports_are_distinct_and_reused_per_replica() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+
+        let mut base = spec_with_auto_port(3000);
+        base.scale = 3;
+        let specs = resolve_replica_ports(store.as_ref(), "demo", "web", &base)
             .await
             .unwrap();
-        assert_ne!(other.ports[0].published, first);
+        assert_eq!(specs.len(), 3);
+        let ports: Vec<u16> = specs.iter().map(|s| s.ports[0].published).collect();
+        let mut uniq = ports.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "each replica must get a distinct host port");
+
+        // Persist and re-apply → the same per-replica ports are reused.
+        let jsons: Vec<String> = specs
+            .iter()
+            .map(|s| serde_json::to_string(s).unwrap())
+            .collect();
+        store
+            .reconcile_service_replicas_multi("demo", "web", &jsons)
+            .await
+            .unwrap();
+        let again = resolve_replica_ports(store.as_ref(), "demo", "web", &base)
+            .await
+            .unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .map(|s| s.ports[0].published)
+                .collect::<Vec<_>>(),
+            ports
+        );
     }
 }

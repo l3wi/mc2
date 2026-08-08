@@ -256,6 +256,7 @@ fn routes_from_ingress(
 mod tests {
     use super::*;
     use mc2_api::{IngressPath, IngressRule, IngressSpec, IngressTlsSpec, PortSpec};
+    use std::collections::BTreeMap;
 
     fn bare_spec() -> ServiceSpec {
         ServiceSpec {
@@ -282,6 +283,7 @@ mod tests {
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         }
     }
 
@@ -317,6 +319,7 @@ mod tests {
                 runtime_id: None,
                 message: None,
                 spec_json: "{}".into(),
+                healthy: false,
                 updated_at: String::new(),
             },
             InstanceRecord {
@@ -329,6 +332,7 @@ mod tests {
                 runtime_id: None,
                 message: None,
                 spec_json: "{}".into(),
+                healthy: false,
                 updated_at: String::new(),
             },
         ];
@@ -376,6 +380,7 @@ ingress:
             runtime_id: None,
             message: None,
             spec_json: "{}".into(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
@@ -395,6 +400,7 @@ ingress:
             runtime_id: None,
             message: None,
             spec_json: "{}".into(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
@@ -437,6 +443,7 @@ ingress:
             runtime_id: None,
             message: None,
             spec_json: "{}".into(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let routes =
@@ -470,6 +477,7 @@ services:
             runtime_id: None,
             message: None,
             spec_json: "{}".into(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let routes =
@@ -497,6 +505,7 @@ services:
             runtime_id: None,
             message: None,
             spec_json: "{}".into(),
+            healthy: false,
             updated_at: String::new(),
         }];
         let routes =
@@ -529,12 +538,13 @@ services:
                 "mem_limit": 512,
                 "restart": "no",
                 "ports": [{ "target": 3001, "published": 10023, "protocol": "tcp" }],
-                "network": {}, "env": {}, "secrets": [], "volumes": [],
-                "healthcheck": null, "labels": {}, "command": null,
+                "network": {}, "environment": {}, "secrets": [], "volumes": [],
+                "healthcheck": null, "labels": {}, "command": null, "depends_on": {},
                 "nodeName": null, "nodeSelector": {}, "ssh": null,
                 "expose": [], "networks": []
             })
             .to_string(),
+            healthy: false,
             updated_at: String::new(),
         };
         let by_service: HashMap<String, Vec<&InstanceRecord>> =

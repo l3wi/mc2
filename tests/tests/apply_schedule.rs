@@ -92,3 +92,65 @@ async fn apply_without_nodes_leaves_pending() {
     assert_eq!(body["scheduled"], 0);
     assert_eq!(body["pending"], 2);
 }
+
+#[tokio::test]
+async fn scaled_ports_persist_per_replica_with_environment_key() {
+    let cluster = TestCluster::start().await.expect("start");
+    let yaml = r#"
+name: scaled
+services:
+  web:
+    image: python:3.12
+    scale: 3
+    cpus: 1
+    mem_limit: 512m
+    environment:
+      MODE: lab
+    ports:
+      - "5000:3000"
+      - "3001"
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    expose: [5432]
+    healthcheck:
+      test: ["pg_isready"]
+"#;
+    let url = format!("{}/v1/stacks:apply", cluster.base_url);
+    let res = cluster
+        .client()
+        .post(&url)
+        .bearer_auth(&cluster.api_token)
+        .json(&serde_json::json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["instances"], 4);
+
+    // Per-replica specs carry distinct published ports; `environment` (not `env`).
+    let instances = cluster.store.list_instances().await.unwrap();
+    let web: Vec<_> = instances.iter().filter(|i| i.service == "web").collect();
+    assert_eq!(web.len(), 3);
+    let mut fixed_ports: Vec<u16> = Vec::new();
+    let mut auto_ports: Vec<u16> = Vec::new();
+    for inst in &web {
+        let spec: mc2_api::ServiceSpec = serde_json::from_str(&inst.spec_json).unwrap();
+        assert_eq!(spec.env.get("MODE").unwrap(), "lab");
+        assert_eq!(spec.depends_on.len(), 1);
+        fixed_ports.push(spec.ports[0].published);
+        auto_ports.push(spec.ports[1].published);
+    }
+    assert_eq!(fixed_ports, vec![5000, 5001, 5002]);
+    let mut uniq_auto = auto_ports.clone();
+    uniq_auto.sort_unstable();
+    uniq_auto.dedup();
+    assert_eq!(
+        uniq_auto.len(),
+        3,
+        "auto host ports must be distinct per replica"
+    );
+    assert!(auto_ports.iter().all(|p| *p >= 10000));
+}

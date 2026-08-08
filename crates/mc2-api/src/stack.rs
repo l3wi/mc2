@@ -122,7 +122,9 @@ pub struct ServiceSpec {
     pub ports: Vec<PortSpec>,
     #[serde(default)]
     pub network: NetworkSpec,
-    #[serde(default, deserialize_with = "de_env")]
+    /// Compose `environment` (map or `KEY=VALUE` list). Internal field stays
+    /// `env`; the YAML/JSON key is `environment` (compose vocabulary).
+    #[serde(default, rename = "environment", deserialize_with = "de_env")]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secrets: Vec<SecretRef>,
@@ -135,8 +137,14 @@ pub struct ServiceSpec {
     pub healthcheck: Option<HealthcheckSpec>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    #[serde(default)]
+    /// Compose `command`: list form (`["echo", "hi"]`) or string form
+    /// (`"echo hi"`, split with shell-like quoting).
+    #[serde(default, deserialize_with = "de_command")]
     pub command: Option<Vec<String>>,
+    /// Compose `depends_on`: list form (`[db]`) or map form
+    /// (`{db: {condition: service_healthy}}`). Startup ordering only.
+    #[serde(default, rename = "depends_on", deserialize_with = "de_depends_on")]
+    pub depends_on: BTreeMap<String, DependsOnSpec>,
     /// Hard pin to a node name.
     #[serde(default)]
     pub node_name: Option<String>,
@@ -287,7 +295,7 @@ where
     d.deserialize_any(V)
 }
 
-/// Accept compose `env` as a map or a `KEY=VALUE` list.
+/// Accept compose `environment` as a map or a `KEY=VALUE` list.
 fn de_env<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -305,13 +313,140 @@ where
             let mut out = BTreeMap::new();
             for item in items {
                 let (k, v) = item.split_once('=').ok_or_else(|| {
-                    Error::custom(format!("env entry {item:?} must be KEY=VALUE"))
+                    Error::custom(format!("environment entry {item:?} must be KEY=VALUE"))
                 })?;
                 out.insert(k.to_string(), v.to_string());
             }
             Ok(out)
         }
     }
+}
+
+/// Accept compose `command` as a string (split with shell-like quoting) or a
+/// sequence. Compose splits string commands but does not run them via a shell.
+fn de_command<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Cmd {
+        Str(String),
+        Seq(Vec<String>),
+    }
+    Ok(match Option::<Cmd>::deserialize(d)? {
+        Some(Cmd::Seq(seq)) => Some(seq),
+        Some(Cmd::Str(s)) => {
+            let parts = split_command_string(&s);
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts)
+            }
+        }
+        None => None,
+    })
+}
+
+/// Shell-like word splitting for string `command` values: single/double quotes
+/// and backslash escapes, whitespace separates words (POSIX-ish, no shell ops).
+// Note: clippy wants `for nc in chars.by_ref()` for the quote loops, but the
+// double-quote branch needs to consume escaped characters via `chars.next()`,
+// which a `for` borrow would reject — `while let` is intentional here.
+#[allow(clippy::while_let_on_iterator)]
+pub fn split_command_string(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                while let Some(nc) = chars.next() {
+                    if nc == '\'' {
+                        break;
+                    }
+                    cur.push(nc);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(nc) = chars.next() {
+                    match nc {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(esc) = chars.next() {
+                                cur.push(esc);
+                            } else {
+                                cur.push('\\');
+                            }
+                        }
+                        c => cur.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                } else {
+                    cur.push('\\');
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Accept compose `depends_on` as a list (`[db]`) or a map
+/// (`{db: {condition: service_healthy}}`).
+fn de_depends_on<'de, D>(d: D) -> Result<BTreeMap<String, DependsOnSpec>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Str(String),
+        Map(DependsOnSpec),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Deps {
+        Map(BTreeMap<String, Value>),
+        List(Vec<String>),
+    }
+    Ok(match Option::<Deps>::deserialize(d)? {
+        Some(Deps::List(items)) => items
+            .into_iter()
+            .map(|name| (name, DependsOnSpec::service_started()))
+            .collect(),
+        Some(Deps::Map(map)) => map
+            .into_iter()
+            .map(|(name, v)| {
+                let spec = match v {
+                    Value::Str(_s) => DependsOnSpec::service_started(),
+                    Value::Map(m) => m,
+                };
+                (name, spec)
+            })
+            .collect(),
+        None => BTreeMap::new(),
+    })
 }
 
 /// Exec healthcheck (compose `healthcheck`).
@@ -328,6 +463,40 @@ pub struct HealthcheckSpec {
         deserialize_with = "de_interval"
     )]
     pub interval_seconds: u32,
+    /// Per-probe timeout in seconds (compose `timeout`, e.g. `5s`). 0 = no timeout.
+    #[serde(default, rename = "timeout", deserialize_with = "de_duration")]
+    pub timeout_seconds: u32,
+    /// Consecutive failures before the service is marked unhealthy (compose `retries`).
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+    /// Startup grace period in seconds (compose `start_period`): probe failures
+    /// within this window after start do not count toward `retries`.
+    #[serde(default, rename = "start_period", deserialize_with = "de_duration")]
+    pub start_period_seconds: u32,
+    /// Compose `disable: true` → no healthcheck runs.
+    #[serde(default)]
+    pub disable: bool,
+}
+
+/// Compose `depends_on` condition entry (map form).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DependsOnSpec {
+    /// `service_started` (default) or `service_healthy`.
+    #[serde(default = "default_dep_condition")]
+    pub condition: String,
+}
+
+impl DependsOnSpec {
+    pub fn service_started() -> Self {
+        Self {
+            condition: "service_started".into(),
+        }
+    }
+}
+
+fn default_dep_condition() -> String {
+    "service_started".into()
 }
 
 fn de_healthcheck_test<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
@@ -393,6 +562,46 @@ where
 
 fn default_health_interval() -> u32 {
     30
+}
+
+fn default_health_retries() -> u32 {
+    3
+}
+
+/// Parse a compose duration (`30s`, `1m`, `2h`, bare seconds) → seconds.
+/// Unlike `de_interval`, `0` is allowed (no timeout / no grace period).
+fn de_duration<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = u32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a duration (e.g. 30s) or seconds")
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<u32, E> {
+            Ok(v.min(u32::MAX as u64) as u32)
+        }
+        fn visit_str<E: Error>(self, s: &str) -> Result<u32, E> {
+            let s = s.trim().to_ascii_lowercase();
+            let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+                (n, 0.001)
+            } else if let Some(n) = s.strip_suffix('s') {
+                (n, 1.0)
+            } else if let Some(n) = s.strip_suffix('m') {
+                (n, 60.0)
+            } else if let Some(n) = s.strip_suffix('h') {
+                (n, 3600.0)
+            } else {
+                (s.as_str(), 1.0)
+            };
+            let val: f64 = num.trim().parse().map_err(E::custom)?;
+            Ok((val * mult).max(0.0).round() as u32)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 /// Port mapping (compose `ports`), north-south. `published: 0` = auto host
@@ -555,6 +764,7 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
         ));
     }
     validate_volumes(doc)?;
+    validate_depends_on(doc)?;
     if let Some(ref ing) = doc.ingress {
         validate_ingress(doc, ing)?;
     }
@@ -585,11 +795,13 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
             ));
         }
         if let Some(ref hc) = svc.healthcheck {
-            if let Some(ref test) = hc.test {
-                if test.is_empty() {
-                    return Err(format!(
-                        "service {name}: healthcheck.test command must not be empty"
-                    ));
+            if !hc.disable {
+                if let Some(ref test) = hc.test {
+                    if test.is_empty() {
+                        return Err(format!(
+                            "service {name}: healthcheck.test command must not be empty"
+                        ));
+                    }
                 }
             }
         }
@@ -629,8 +841,72 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
     Ok(())
 }
 
-/// Node-local persistent volumes (v1): declared `dir` volumes, absolute unique
-/// mounts, names safe for the msb volume namespace `mc2-{stack}--{volume}`.
+/// Compose `depends_on`: references must exist in-stack, conditions must be
+/// supported (`service_started` | `service_healthy`), and the graph must be acyclic.
+fn validate_depends_on(doc: &StackDocument) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    for (svc_name, svc) in &doc.services {
+        for (dep, spec) in &svc.depends_on {
+            if !doc.services.contains_key(dep) {
+                return Err(format!(
+                    "service {svc_name}: depends_on {:?} is not a service in this stack",
+                    dep
+                ));
+            }
+            let cond = spec.condition.trim().to_ascii_lowercase();
+            if !matches!(cond.as_str(), "service_started" | "service_healthy") {
+                return Err(format!(
+                    "service {svc_name}: depends_on {dep} condition must be service_started|service_healthy (got {:?})",
+                    spec.condition
+                ));
+            }
+            if cond == "service_healthy" {
+                let has_hc = doc.services[dep]
+                    .healthcheck
+                    .as_ref()
+                    .is_some_and(|h| !h.disable && h.test.is_some());
+                if !has_hc {
+                    return Err(format!(
+                        "service {svc_name}: depends_on {dep} condition service_healthy \
+                         requires {dep} to declare a healthcheck"
+                    ));
+                }
+            }
+        }
+    }
+
+    // DFS cycle detection (1 = on stack, 2 = done).
+    let mut color: BTreeMap<&str, u8> = BTreeMap::new();
+    fn visit<'a>(
+        name: &'a str,
+        doc: &'a StackDocument,
+        color: &mut BTreeMap<&'a str, u8>,
+        stack: &mut Vec<&'a str>,
+    ) -> Result<(), String> {
+        match color.get(name) {
+            Some(&1) => {
+                let mut chain: Vec<&str> = stack.clone();
+                chain.push(name);
+                return Err(format!("depends_on cycle detected: {}", chain.join(" -> ")));
+            }
+            Some(&2) => return Ok(()),
+            _ => {}
+        }
+        color.insert(name, 1);
+        stack.push(name);
+        for dep in doc.services[name].depends_on.keys() {
+            visit(dep, doc, color, stack)?;
+        }
+        stack.pop();
+        color.insert(name, 2);
+        Ok(())
+    }
+    for name in doc.services.keys() {
+        visit(name, doc, &mut color, &mut Vec::new())?;
+    }
+    Ok(())
+}
 fn validate_volumes(doc: &StackDocument) -> Result<(), String> {
     for (name, vol) in &doc.volumes {
         if !valid_volume_name(name) {
@@ -1079,6 +1355,7 @@ services:
             ssh: None,
             expose: vec![],
             networks: vec![],
+            depends_on: BTreeMap::new(),
         };
         assert_eq!(s.cpus, 1.0);
         assert_eq!(s.mem_limit_mib, 512);
@@ -1151,5 +1428,209 @@ services:
         ))
         .unwrap_err();
         assert!(err.contains("duplicate volume mount path"), "{err}");
+    }
+
+    #[test]
+    fn environment_accepts_map_and_list() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    environment:
+      DEBUG: "1"
+      PATH: /usr/bin
+    command: ["sleep", "infinity"]
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        let env = &doc.services["web"].env;
+        assert_eq!(env.get("DEBUG").unwrap(), "1");
+        assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
+
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    environment:
+      - A=1
+      - B=two
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(doc.services["web"].env.get("A").unwrap(), "1");
+        assert_eq!(doc.services["web"].env.get("B").unwrap(), "two");
+    }
+
+    #[test]
+    fn old_env_key_rejected() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    env:
+      A: "1"
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("env") || err.contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn command_string_form_is_split_shell_like() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    command: 'echo "hi there" --flag value'
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(
+            doc.services["web"].command,
+            Some(vec![
+                "echo".to_string(),
+                "hi there".to_string(),
+                "--flag".to_string(),
+                "value".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn split_command_string_handles_quotes_and_escapes() {
+        assert_eq!(split_command_string(""), Vec::<String>::new());
+        assert_eq!(split_command_string("   "), Vec::<String>::new());
+        assert_eq!(split_command_string("a b c"), vec!["a", "b", "c"]);
+        assert_eq!(
+            split_command_string(r#"x 'single word' y"#),
+            vec!["x", "single word", "y"]
+        );
+        assert_eq!(
+            split_command_string(r#"a "sp ace" b"#),
+            vec!["a", "sp ace", "b"]
+        );
+        assert_eq!(split_command_string(r#"eve\n"#), vec!["even"]);
+        assert_eq!(split_command_string(r#"quote\"d"#), vec![r#"quote"d"#]);
+    }
+
+    #[test]
+    fn healthcheck_full_field_set() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 2
+      start_period: 15s
+  admin:
+    image: busybox
+    healthcheck:
+      disable: true
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        let h = doc.services["web"].healthcheck.clone().unwrap();
+        assert_eq!(h.interval_seconds, 10);
+        assert_eq!(h.timeout_seconds, 5);
+        assert_eq!(h.retries, 2);
+        assert_eq!(h.start_period_seconds, 15);
+        assert!(!h.disable);
+        assert!(doc.services["admin"].healthcheck.clone().unwrap().disable);
+        // Defaults when omitted.
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    healthcheck:
+      test: ["true"]
+"#;
+        let h = parse_stack_yaml(yaml).unwrap().services["web"]
+            .healthcheck
+            .clone()
+            .unwrap();
+        assert_eq!(h.retries, 3);
+        assert_eq!(h.timeout_seconds, 0);
+        assert_eq!(h.start_period_seconds, 0);
+    }
+
+    #[test]
+    fn depends_on_list_and_map_forms() {
+        let yaml = r#"
+name: x
+services:
+  db:
+    image: busybox
+    healthcheck:
+      test: ["pg_isready"]
+  web:
+    image: busybox
+    depends_on:
+      - db
+  admin:
+    image: busybox
+    depends_on:
+      db:
+        condition: service_healthy
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(
+            doc.services["web"].depends_on["db"].condition,
+            "service_started"
+        );
+        assert_eq!(
+            doc.services["admin"].depends_on["db"].condition,
+            "service_healthy"
+        );
+    }
+
+    #[test]
+    fn depends_on_unknown_service_rejected() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+    depends_on:
+      - missing
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("not a service"), "{err}");
+    }
+
+    #[test]
+    fn depends_on_bad_condition_rejected() {
+        let yaml = r#"
+name: x
+services:
+  web:
+    image: busybox
+  api:
+    image: busybox
+    depends_on:
+      web:
+        condition: service_completed_successfully
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("service_started|service_healthy"), "{err}");
+    }
+
+    #[test]
+    fn depends_on_cycle_rejected() {
+        let yaml = r#"
+name: x
+services:
+  a:
+    image: busybox
+    depends_on: [b]
+  b:
+    image: busybox
+    depends_on: [a]
+"#;
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("cycle"), "{err}");
     }
 }

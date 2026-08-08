@@ -80,8 +80,8 @@ services:
     image: alpine:3.20
     scale: 1
     ports:
-      - "18080:8000"
-      - "18081:8001"
+      - "28080:8000"
+      - "28081:8001"
     restart: on-failure
     command: ["sleep", "infinity"]
 ingress:
@@ -298,8 +298,8 @@ async fn ingress_lifecycle_update_remove_and_multi_path() {
     // smoke-ingress has no ingress; multi has two routes
     assert_eq!(routes4.len(), 2);
     let ports: Vec<u16> = routes4.iter().map(|r| r.host_port).collect();
-    assert!(ports.contains(&18080), "{ports:?}");
-    assert!(ports.contains(&18081), "{ports:?}");
+    assert!(ports.contains(&28080), "{ports:?}");
+    assert!(ports.contains(&28081), "{ports:?}");
     let guests: Vec<u16> = routes4.iter().map(|r| r.guest_port).collect();
     assert!(
         guests.contains(&8000) && guests.contains(&8001),
