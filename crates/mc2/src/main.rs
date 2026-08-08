@@ -1,9 +1,9 @@
-//! MicroCommandControl (MC2) — single-binary control plane + CLI.
+//! MicroCommandControl (MC2) — YAML-driven orchestration for microsandbox.
 //!
 //! ```text
-//! mc2 server   # control plane + local node
+//! mc2 server   # the orchestrator (single process)
 //! mc2 apply    # operator: apply a stack
-//! mc2 node ls  # list nodes
+//! mc2 node ls  # show the local node
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -13,9 +13,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[derive(Debug, Parser)]
 #[command(
     name = "mc2",
-    about = "MC2 (MicroCommandControl) — self-hosted C2 for microsandbox microVMs",
+    about = "MC2 (MicroCommandControl) — YAML-driven orchestration for microsandbox microVMs",
     long_about = "MC2 (MicroCommandControl) runs microsandbox microVMs from desired stack YAML. \
-                  One binary: server (control plane + local node) and operator CLI.",
+                  One binary: the orchestrator (server) and operator CLI.",
     version
 )]
 struct Cli {
@@ -25,21 +25,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the MicroCommandControl server (control plane + local node)
+    /// Run the MC2 orchestrator (single process)
     Server(mc2_server::ServerArgs),
     /// Apply a stack YAML (desired state)
     Apply(ApplyArgs),
-    /// Node operations
+    /// Show the local node (capacity, status)
     Node(NodeCmd),
     /// List instances (desired sandboxes)
     Ps(OperatorArgs),
-    /// Cluster secrets (encrypted at rest; values never listed)
+    /// Secrets (encrypted at rest; values never listed)
     Secret(SecretCmd),
     /// SSH authorized keys + endpoints
     Ssh(SshCmd),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
-    /// Show cluster / binary version info
+    /// Show version info
     Version,
 }
 
@@ -51,7 +51,7 @@ struct SshCmd {
 
 #[derive(Debug, Subcommand)]
 enum SshCommands {
-    /// Manage cluster authorized public keys
+    /// Manage authorized public keys
     Key(SshKeyCmd),
     /// List open SSH endpoints
     #[command(name = "ls", alias = "list")]
@@ -142,7 +142,7 @@ enum SecretCommands {
 
 #[derive(Debug, Parser)]
 struct SecretSetArgs {
-    /// Secret name (cluster-global)
+    /// Secret name
     name: String,
     /// Secret value (prefer env MC2_SECRET_VALUE or stdin for scripts)
     #[arg(long, env = "MC2_SECRET_VALUE")]

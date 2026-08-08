@@ -15,7 +15,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
-/// Ephemeral control plane: temp data dir, real SQLite, REST only.
+/// Ephemeral MC2 install: temp data dir, real SQLite, REST only.
 ///
 /// A single local node row is created at startup (`local_node_id`); tests
 /// drive the "node" by writing store rows directly — no hypervisor needed.
@@ -33,7 +33,7 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
-    /// Bootstrap a new cluster with a local node; serve REST on an ephemeral port.
+    /// Bootstrap a new install with a local node; serve REST on an ephemeral port.
     pub async fn start() -> Result<Self> {
         Self::start_with_node(true).await
     }

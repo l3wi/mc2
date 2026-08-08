@@ -1,4 +1,4 @@
-# Secrets smoke stack — set the cluster secret first, then apply.
+# Secrets smoke stack — set the secret first, then apply.
 #
 #   mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
 #   mc2 apply -f examples/secrets/stack.yaml

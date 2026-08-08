@@ -1,4 +1,5 @@
-//! MicroCommandControl server process (control plane + local node).
+//! MicroCommandControl orchestrator: state, REST API, scheduler, and the local
+//! node loop that drives the embedded microsandbox runtime.
 
 mod apply;
 mod auth;
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
-/// Arguments for `mc2 server` (control plane + local node in one process).
+/// Arguments for `mc2 server` (the single-process orchestrator).
 #[derive(Debug, Clone, Parser)]
 pub struct ServerArgs {
     /// Address to bind the operator REST API
@@ -107,7 +108,7 @@ pub struct AppState {
     pub secrets_key: Arc<SecretsKey>,
 }
 
-/// Periodically export cluster gauges (when OTLP is enabled).
+/// Periodically export status gauges (when OTLP is enabled).
 async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -133,7 +134,7 @@ async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
     }
 }
 
-/// Run the control plane + local node.
+/// Run the orchestrator (REST + scheduler + local node loop).
 pub async fn run(args: ServerArgs) -> Result<()> {
     let data_dir = expand_data_dir(&args.data_dir);
     let secrets_key_path = args
@@ -180,12 +181,12 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         eprintln!("=========================================================================");
     } else if args.no_auth {
         if store.api_auth_required().await.unwrap_or(true) {
-            info!("MC2_NO_AUTH/--no-auth ignored: cluster already has API auth configured");
+            info!("MC2_NO_AUTH/--no-auth ignored: API auth already configured");
         } else {
-            info!(db = %boot.db_path.display(), "open cluster (no API token)");
+            info!(db = %boot.db_path.display(), "open install (no API token)");
         }
     } else {
-        info!(db = %boot.db_path.display(), "cluster already initialized");
+        info!(db = %boot.db_path.display(), "data directory already initialized");
     }
 
     if args.init_only || args.dry_run {

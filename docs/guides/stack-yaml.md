@@ -1,6 +1,6 @@
 # Stack YAML reference (`mc2/v1`)
 
-The desired-state document `mc2 apply -f <file>` sends to the control plane.
+The desired-state document `mc2 apply -f <file>` sends to the MC2 server.
 Compose-like shape: top-level declarations (`volumes`, `networks`) plus a
 `services` map. All keys are camelCase.
 
@@ -73,7 +73,7 @@ services:
         protocol: tcp            # tcp | udp
         bind: 127.0.0.1
     secrets:
-      - name: SMOKE_TOKEN        # cluster secret (mc2 secret set)
+      - name: SMOKE_TOKEN        # secret (mc2 secret set)
         env: API_TOKEN
         allowHosts: [api.example.com]
     nodeName: worker-1           # hard pin (optional)
@@ -210,7 +210,7 @@ and is retained on removal. See
 | `port` | `0` | Agent backend port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
 | `user` | `root` | SSH username presented to the SDK. |
 | `sftp` | `true` | Enable SFTP on the session. |
-| `authorizedKeys` | `[]` | Names from the cluster key registry (`mc2 ssh key add`). |
+| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh key add`). |
 
 ### `expose[]` (fabric)
 
@@ -302,6 +302,6 @@ services without fixed SSH ports.
 
 ## Further reading
 
-- [Quickstart](./quickstart.md) — run a cluster and apply examples.
+- [Quickstart](./quickstart.md) — run MC2 and apply examples.
 - [examples/README.md](../../examples/README.md) — scenario walkthroughs.
 - [examples/06-persistent-volumes](../../examples/06-persistent-volumes/README.md) — volume behavior and lab runbook.

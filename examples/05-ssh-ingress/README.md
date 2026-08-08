@@ -52,7 +52,7 @@ SSH fields:
 - `user` — SSH username presented to the microsandbox SDK; this example uses
   `root`.
 - `sftp` — enables SFTP support for the SSH session.
-- `authorizedKeys` — names in MC2’s cluster SSH-key registry, not raw public
+- `authorizedKeys` — names in MC2’s SSH-key registry, not raw public
   keys. Register each name with `mc2 ssh key add` first.
 
 TCP ingress fields:

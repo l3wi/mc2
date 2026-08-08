@@ -1,6 +1,6 @@
 [package]
 name = "mc2-runtime"
-description = "NodeRuntime trait and microsandbox SDK backend for MicroCommandControl agents"
+description = "NodeRuntime trait and microsandbox SDK backend for MicroCommandControl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

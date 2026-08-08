@@ -37,8 +37,8 @@ verbatim. Full key reference: [stack.yaml guide](../docs/guides/stack-yaml.md).
 ## Ready-to-use
 
 - [Hello service](./01-hello-service/) — run one HTTP service and verify it with `curl`.
-- [Secrets](./02-secrets/) — inject a cluster secret with an `allowHosts` policy.
-- [Service fabric](./03-service-fabric/) — connect two same-node services with `expose` and `allow`.
+- [Secrets](./02-secrets/) — inject an encrypted secret with an `allowHosts` policy.
+- [Service fabric](./03-service-fabric/) — connect two services with `expose` and `allow`.
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.
 - [Persistent volumes](./06-persistent-volumes/) — mount a node-local named volume that survives sandbox recreate.

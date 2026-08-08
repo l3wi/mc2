@@ -149,9 +149,9 @@ Resolvers fold into native returns:
 - **Feature unification**: microsandbox `ssh` feature now requested by
   mc2-server; already unified in workspace today via mc2-agent, so no change
   in resolved features.
-- **Lost capability**: multi-node. Re-adding later means a transport around
-  `build_desired_set` + report writes — the seams are preserved by keeping
-  those as pure functions.
+- **Dropped capability**: multi-node (now out of scope entirely, not
+  deferred). The seams (`build_desired_set` + report writes) stay pure
+  functions regardless.
 
 ## Follow-up (re-scoped after this lands)
 

@@ -1,6 +1,6 @@
 [package]
 name = "mc2-server"
-description = "MicroCommandControl server (control plane + local node)"
+description = "MicroCommandControl orchestrator (state, REST, scheduler, local node loop)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

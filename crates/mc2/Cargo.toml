@@ -1,6 +1,6 @@
 [package]
 name = "mc2"
-description = "MicroCommandControl — single binary (server + operator CLI)"
+description = "MicroCommandControl — YAML-driven orchestration for microsandbox (server + operator CLI)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

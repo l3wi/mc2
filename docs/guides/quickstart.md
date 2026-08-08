@@ -1,8 +1,10 @@
 # Quickstart — MicroCommandControl
 
-Single-node lab path for **Linux (KVM)** and **macOS Apple Silicon (HVF)**.
+Single-machine path for **Linux (KVM)** and **macOS Apple Silicon (HVF)**.
 
-MC2 is **one process**: `mc2 server` runs the control plane (SQLite + REST + scheduler) *and* the local node loop that drives sandboxes through the embedded microsandbox SDK — no separate agent, no gRPC seam.
+MC2 is a **YAML-driven orchestration system for microsandbox**: one process
+(`mc2 server`) that keeps state in SQLite, serves REST, and drives sandboxes
+through the embedded microsandbox SDK — no separate agent, no gRPC seam.
 
 ## Prerequisites
 
@@ -30,13 +32,13 @@ just build
 
 Release binaries (CI): `linux-amd64`, `linux-arm64`, `darwin-arm64` — see `.github/workflows/release.yml`.
 
-## Single-node (open lab cluster)
+## Run it (open lab install)
 
 ```bash
 DATA=/tmp/mc2-lab
 mkdir -p "$DATA"
 
-# Terminal 1 — control plane + local node (no API token)
+# Terminal 1 — the orchestrator (no API token)
 ./target/debug/mc2 server \
   --data-dir "$DATA" \
   --bind 127.0.0.1:7443 \
@@ -61,7 +63,7 @@ Useful server flags (all also env vars): `--node-name`, `--label KEY=VALUE`,
 ./target/debug/mc2 apply -f examples/02-secrets/stack.yaml
 ```
 
-### Service fabric (same-node east–west)
+### Service fabric (east–west)
 
 Compose-like multi-service connectivity without a flat pod network. Stack declares `expose` (internal listeners) and client `allow` edges; the node loop L4-splices and injects DNS (`db.<stack>.svc.mc2`).
 
@@ -77,7 +79,7 @@ cargo run -p mc2-runtime --example msb_shell -- smoke-fabric-client-0 \
 # expect: FABRIC_OK
 ```
 
-### Ingress (same-node HTTP via Traefik files)
+### Ingress (HTTP via Traefik files)
 
 North–south HTTP: declare `ports:` + stack `ingress:`; the server writes Traefik files when `--ingress-config-dir` is set. Operator guide: [examples/04-http-ingress/README.md](../../examples/04-http-ingress/README.md).
 
@@ -95,9 +97,9 @@ curl -s http://127.0.0.1:18080/ | head   # direct backend
 # Point Traefik file provider at /tmp/mc2-ingress — see examples/04-http-ingress/
 ```
 
-**Defaults:** deny east–west until `allow`; same-stack + same-node only; no multi-node fabric yet.
+**Defaults:** deny east–west until `allow`; same-stack only.
 
-## Auth-enabled cluster
+## Auth-enabled install
 
 Omit `--no-auth` on first bootstrap. Save the printed **API token** (operator REST bearer).
 
@@ -117,7 +119,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 # restart the server so it picks up the endpoint
 ```
 
-MC2 exports control-plane / node metrics (`mc2.server.*`). Sandbox CPU/mem/net remain on **msb-metrics** — configure that sidecar to the same collector for a unified view. See [the advanced observability example](../../examples/90-advanced/observability/).
+MC2 exports orchestrator + node metrics (`mc2.server.*`, `mc2.node.*`). Sandbox CPU/mem/net remain on **msb-metrics** — configure that sidecar to the same collector for a unified view. See [the advanced observability example](../../examples/90-advanced/observability/).
 
 ## Platform notes
 

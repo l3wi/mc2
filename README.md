@@ -1,10 +1,10 @@
 # MicroCommandControl (MC2)
 
-Self-hosted **command & control** for [microsandbox](https://docs.microsandbox.dev) microVMs — one process, MSB-embedded style.
+A **YAML-driven orchestration system** for [microsandbox](https://docs.microsandbox.dev) microVMs. Declare services in a Compose-like stack file; MC2 schedules, runs, and reconciles them as detached microVMs on your machine.
 
-MC2 adds a desired-state control plane with a local node, scheduling, Compose-like stacks, cluster secrets, port exposure, same-node **mediated service fabric** (`expose` / `allow` / `*.svc.mc2` DNS), and OTLP metrics — without reimplementing the VMM or becoming full Kubernetes.
+MC2 gives you desired-state orchestration over microsandbox: stacks, replicas, restart policies, encrypted secrets, port exposure, a mediated **service fabric** (`expose` / `allow` / `*.svc.mc2` DNS), ingress via a Traefik file catalog, and OTLP metrics — without reimplementing the VMM and without becoming Kubernetes.
 
-The server **embeds** the microsandbox SDK directly (no daemon, no separate agent): `mc2 server` is scheduler + SQLite + REST + the local node reconcile loop that fork+execs `msb sandbox` microVMs.
+The server **embeds** the microsandbox SDK directly (no daemon, no separate worker process — MSB-embedded style): `mc2 server` is the orchestrator — SQLite state, REST API, scheduler, and the reconcile loop that fork+execs `msb sandbox` microVMs.
 
 ## Quick start (dev)
 
@@ -15,7 +15,7 @@ just build
 DATA=/tmp/mc2-dev
 ./target/debug/mc2 doctor
 
-# Terminal 1 — control plane + local node (one process)
+# Terminal 1 — the orchestrator (one process)
 # Lab (no token): --no-auth
 # Default: prints the API token once on first bootstrap
 ./target/debug/mc2 server --data-dir "$DATA" --bind 127.0.0.1:7443 --no-auth
@@ -49,21 +49,21 @@ just test-integration
 
 | Command | Role |
 | ------- | ---- |
-| `mc2 server` | Control plane + local node (SQLite, REST, embedded msb runtime) |
-| `mc2 node ls` | List nodes via REST |
+| `mc2 server` | The orchestrator (SQLite, REST, scheduler, embedded msb runtime) |
+| `mc2 node ls` | Show the local node (capacity, status) via REST |
 | `mc2 apply -f stack.yaml` | Apply desired stack (schedule + run) |
-| `mc2 secret set\|ls\|rm` | Cluster secrets (encrypted; values never listed) |
+| `mc2 secret set\|ls\|rm` | Secrets (encrypted; values never listed) |
 | `mc2 ps` | List instances / instance phases |
 | `mc2 doctor` | Host / msb readiness checks |
 | `mc2 ssh key\|open\|close\|ls` | SSH keys + open/close endpoints (served via microsandbox SDK) |
 
-**Service fabric (same-node):** stack YAML `expose` + client `allow` → L4 splice + guest DNS (`db.<stack>.svc.mc2`). Default deny east–west; multi-node deferred. See [examples/03-service-fabric/](examples/03-service-fabric/).
+**Service fabric:** stack YAML `expose` + client `allow` → L4 splice + guest DNS (`db.<stack>.svc.mc2`). Default deny east–west. See [examples/03-service-fabric/](examples/03-service-fabric/).
 
-**Ingress (same-node):** stack `ingress:` + `ports:` → the server writes a Traefik file-provider catalog (`--ingress-config-dir`). See [examples/04-http-ingress/](examples/04-http-ingress/).
+**Ingress:** stack `ingress:` + `ports:` → the server writes a Traefik file-provider catalog (`--ingress-config-dir`). See [examples/04-http-ingress/](examples/04-http-ingress/).
 
 **Examples:** start with [examples/01-hello-service/](examples/01-hello-service/); incomplete workflows are marked under [examples/90-advanced/](examples/90-advanced/).
 
-One binary: server and operator CLI.
+One binary: orchestrator and operator CLI.
 
 ## Repository layout
 
