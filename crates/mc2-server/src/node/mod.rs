@@ -3,15 +3,14 @@
 //!
 //! Replaces the former `mc2-agent` gRPC client/server pair with direct calls.
 
+mod health;
+mod state;
+
 use crate::desired::build_desired_set;
-use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter, SelfIngressRoute};
-use crate::network_serve::NetworkTable;
-use crate::ssh_serve::SshServeTable;
+use crate::ingress_files::{warn_ingress_dir_unset, SelfIngressRoute};
 use anyhow::{Context, Result};
-use mc2_api::HealthcheckSpec;
 use mc2_runtime::{
-    backoff_secs, desired_recreate_hash, InstanceReport, NetworkObserved, NodeRuntime,
-    RestartPolicy, SandboxPhase,
+    desired_recreate_hash, InstanceReport, NetworkObserved, NodeRuntime, SandboxPhase,
 };
 use mc2_store::{NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
@@ -20,26 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// Per-sandbox restart / health bookkeeping on the node.
-#[derive(Debug, Default)]
-struct InstanceRuntimeState {
-    spec_hash: Option<String>,
-    running_since: Option<Instant>,
-    restart_count: u32,
-    next_restart_ok: Option<Instant>,
-    last_health: Option<Instant>,
-    /// Healthcheck passed at least once since the last (re)create.
-    health_ok: bool,
-    /// Consecutive health-probe failures (reset on success).
-    health_failures: u32,
-}
-
-/// Aggregate liveness of one service within a stack, used to gate `depends_on`.
-#[derive(Debug, Clone, Default)]
-struct ServiceLive {
-    running: bool,
-    healthy: bool,
-}
+use self::health::run_healthcheck;
+use self::state::{NodeRuntimeState, ServiceLive};
 
 /// Configuration for the local node loop.
 #[derive(Debug, Clone)]
@@ -103,15 +84,12 @@ pub async fn run(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Track runtime ids we created so we can GC on scale-down.
-    let mut owned: HashSet<String> = HashSet::new();
-    let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
-    let mut ssh_table = SshServeTable::new();
-    let mut network_table = NetworkTable::new();
-    let mut ingress_writer = cfg
-        .ingress_config_dir
-        .clone()
-        .map(|d| IngressFileWriter::new(d, cfg.name.clone()));
+    let mut rt_state = NodeRuntimeState::new(
+        cfg.ingress_config_dir
+            .clone()
+            .map(|d| crate::ingress_files::IngressFileWriter::new(d, cfg.name.clone())),
+        self_route,
+    );
 
     loop {
         tokio::select! {
@@ -137,12 +115,7 @@ pub async fn run(
                     secrets_key.as_ref(),
                     &node_id,
                     runtime.as_ref(),
-                    &mut owned,
                     &mut rt_state,
-                    &mut ssh_table,
-                    &mut network_table,
-                    ingress_writer.as_mut(),
-                    self_route.as_ref(),
                 )
                 .await
                 {
@@ -160,18 +133,12 @@ pub async fn run(
 }
 
 /// Build desired set, ensure sandboxes running, remove extras, persist phases.
-#[allow(clippy::too_many_arguments)]
 async fn reconcile(
     store: Arc<dyn Store>,
     secrets_key: &SecretsKey,
     node_id: &str,
     runtime: &dyn NodeRuntime,
-    owned: &mut HashSet<String>,
-    rt_state: &mut HashMap<String, InstanceRuntimeState>,
-    ssh_table: &mut SshServeTable,
-    network_table: &mut NetworkTable,
-    ingress_writer: Option<&mut IngressFileWriter>,
-    self_route: Option<&SelfIngressRoute>,
+    rt: &mut NodeRuntimeState,
 ) -> Result<()> {
     let (mut desired, ingress_routes) =
         build_desired_set(store.clone(), secrets_key, node_id).await?;
@@ -179,13 +146,13 @@ async fn reconcile(
     let desired_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
 
     // Scale down / GC
-    let stale: Vec<String> = owned.difference(&desired_ids).cloned().collect();
+    let stale: Vec<String> = rt.owned.difference(&desired_ids).cloned().collect();
     for rid in stale {
         if let Err(e) = runtime.ensure_removed(&rid).await {
             warn!(runtime_id = %rid, error = %e, "ensure_removed failed");
         }
-        owned.remove(&rid);
-        rt_state.remove(&rid);
+        rt.owned.remove(&rid);
+        rt.rt_state.remove(&rid);
     }
 
     let mut reports: Vec<InstanceReport> = Vec::new();
@@ -216,8 +183,8 @@ async fn reconcile(
     }
 
     for d in &mut desired {
-        let policy = RestartPolicy::parse(&d.spec.restart);
-        let state = rt_state.entry(d.runtime_id.clone()).or_default();
+        let policy = mc2_runtime::RestartPolicy::parse(&d.spec.restart);
+        let state = rt.rt_state.entry(d.runtime_id.clone()).or_default();
 
         // Compose `depends_on` startup gate: skip ensure_running until every
         // dependency is Running (service_started) or Running+healthy
@@ -239,8 +206,8 @@ async fn reconcile(
         // Backoff gate before ensure_running when we recently recreated.
         if let Some(next) = state.next_restart_ok {
             if now < next {
-                let ssh = ssh_table.reconcile(d, false).await;
-                let network = network_table.reconcile_not_running(d).await;
+                let ssh = rt.ssh_table.reconcile(d, false).await;
+                let network = rt.network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Creating".into(),
@@ -257,10 +224,10 @@ async fn reconcile(
             }
         }
 
-        if let Err(e) = network_table.prepare_exposes(d).await {
+        if let Err(e) = rt.network_table.prepare_exposes(d).await {
             warn!(instance_id = %d.instance_id, error = %e, "network prepare_exposes failed");
-            let ssh = ssh_table.reconcile(d, false).await;
-            let network = network_table.reconcile_not_running(d).await;
+            let ssh = rt.ssh_table.reconcile(d, false).await;
+            let network = rt.network_table.reconcile_not_running(d).await;
             reports.push(InstanceReport {
                 instance_id: d.instance_id.clone(),
                 phase: "Failed".into(),
@@ -288,7 +255,7 @@ async fn reconcile(
         // Expose host ports are only bound at msb create. If we inherited a
         // Running sandbox without live publish (server restart / orphan), recreate.
         if !force_recreate {
-            if let Some(ports) = network_table.expose_host_ports(&d.instance_id) {
+            if let Some(ports) = rt.network_table.expose_host_ports(&d.instance_id) {
                 if !ports.is_empty() && !host_ports_accepting(&ports).await {
                     force_recreate = true;
                     info!(
@@ -300,15 +267,15 @@ async fn reconcile(
             }
         }
         if force_recreate {
-            network_table.drop_instance(&d.instance_id).await;
+            rt.network_table.drop_instance(&d.instance_id).await;
             // Re-prepare after drop so publish_index stays correct for this cycle.
-            if let Err(e) = network_table.prepare_exposes(d).await {
+            if let Err(e) = rt.network_table.prepare_exposes(d).await {
                 warn!(instance_id = %d.instance_id, error = %e, "network re-prepare after drop");
             }
             if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
                 warn!(runtime_id = %d.runtime_id, error = %e, "remove before recreate");
             }
-            owned.remove(&d.runtime_id);
+            rt.owned.remove(&d.runtime_id);
             state.spec_hash = None;
             state.running_since = None;
             state.health_ok = false;
@@ -318,7 +285,7 @@ async fn reconcile(
 
         match runtime.ensure_running(d).await {
             Ok(mut st) => {
-                owned.insert(d.runtime_id.clone());
+                rt.owned.insert(d.runtime_id.clone());
                 state.spec_hash = Some(want_hash);
 
                 // Reset restart counter after sustained Running.
@@ -338,101 +305,8 @@ async fn reconcile(
                 // Exec health when Running (compose `healthcheck` semantics:
                 // interval / timeout / retries / start_period / disable).
                 if st.phase == SandboxPhase::Running {
-                    if let Some(ref health) = d.spec.healthcheck {
-                        if health_active(health) {
-                            let interval =
-                                Duration::from_secs(u64::from(health.interval_seconds.max(1)));
-                            let due = state
-                                .last_health
-                                .map(|t| now.duration_since(t) >= interval)
-                                .unwrap_or(true);
-                            if due {
-                                state.last_health = Some(now);
-                                let in_start_period = health.start_period_seconds > 0
-                                    && state.running_since.is_some_and(|since| {
-                                        now.duration_since(since)
-                                            < Duration::from_secs(u64::from(
-                                                health.start_period_seconds,
-                                            ))
-                                    });
-                                match run_health_probe(runtime, &d.runtime_id, health).await {
-                                    Ok(0) => {
-                                        state.health_failures = 0;
-                                        state.health_ok = true;
-                                    }
-                                    Ok(code) => {
-                                        state.health_failures =
-                                            state.health_failures.saturating_add(1);
-                                        state.health_ok = false;
-                                        if in_start_period {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                code,
-                                                "health probe failed (within start_period; ignored)"
-                                            );
-                                        } else if state.health_failures >= health.retries.max(1) {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                code,
-                                                failures = state.health_failures,
-                                                "health exec failed past retries"
-                                            );
-                                            st = handle_health_failure(
-                                                runtime,
-                                                d,
-                                                policy,
-                                                state,
-                                                now,
-                                                format!("health: exit {code}"),
-                                            )
-                                            .await;
-                                        } else {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                code,
-                                                failures = state.health_failures,
-                                                "health exec failed"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        state.health_failures =
-                                            state.health_failures.saturating_add(1);
-                                        state.health_ok = false;
-                                        if in_start_period {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                error = %e,
-                                                "health probe error (within start_period; ignored)"
-                                            );
-                                        } else if state.health_failures >= health.retries.max(1) {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                error = %e,
-                                                failures = state.health_failures,
-                                                "health exec error past retries"
-                                            );
-                                            st = handle_health_failure(
-                                                runtime,
-                                                d,
-                                                policy,
-                                                state,
-                                                now,
-                                                format!("health: {e}"),
-                                            )
-                                            .await;
-                                        } else {
-                                            warn!(
-                                                runtime_id = %d.runtime_id,
-                                                error = %e,
-                                                failures = state.health_failures,
-                                                "health exec error"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(new_st) = run_healthcheck(runtime, d, policy, state, now).await {
+                        st = new_st;
                     }
                 }
 
@@ -444,11 +318,11 @@ async fn reconcile(
                     SandboxPhase::Pending | SandboxPhase::Unknown => "Creating",
                 };
                 let running = st.phase == SandboxPhase::Running;
-                let ssh = ssh_table.reconcile(d, running).await;
+                let ssh = rt.ssh_table.reconcile(d, running).await;
                 let network = if running {
-                    network_table.reconcile_running(d).await
+                    rt.network_table.reconcile_running(d).await
                 } else {
-                    network_table.reconcile_not_running(d).await
+                    rt.network_table.reconcile_not_running(d).await
                 };
                 let mut message = st.message.unwrap_or_default();
                 if !network.message.is_empty() {
@@ -489,14 +363,15 @@ async fn reconcile(
                     "ensure_running failed"
                 );
                 // Schedule backoff for next attempt if policy allows restart.
-                if policy != RestartPolicy::Never {
+                if policy != mc2_runtime::RestartPolicy::Never {
                     state.restart_count = state.restart_count.saturating_add(1);
-                    state.next_restart_ok =
-                        Some(now + Duration::from_secs(backoff_secs(state.restart_count)));
+                    state.next_restart_ok = Some(
+                        now + Duration::from_secs(mc2_runtime::backoff_secs(state.restart_count)),
+                    );
                     state.running_since = None;
                 }
-                let ssh = ssh_table.reconcile(d, false).await;
-                let network = network_table.reconcile_not_running(d).await;
+                let ssh = rt.ssh_table.reconcile(d, false).await;
+                let network = rt.network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
@@ -511,20 +386,23 @@ async fn reconcile(
     }
 
     let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
-    ssh_table.close_missing(&keep_ids).await;
+    rt.ssh_table.close_missing(&keep_ids).await;
     // Rebuild shared network splices from the current desired set + observed phases.
-    network_table
+    rt.network_table
         .reconcile_splices(desired.as_slice(), &reports)
         .await;
-    network_table.close_missing(&keep_ids).await;
+    rt.network_table.close_missing(&keep_ids).await;
 
     // Ingress file catalog (same-node BYO Traefik).
     let mut phases: HashMap<String, String> = HashMap::new();
     for r in &reports {
         phases.insert(r.instance_id.clone(), r.phase.clone());
     }
-    if let Some(writer) = ingress_writer {
-        match writer.reconcile(&ingress_routes, &phases, self_route).await {
+    if let Some(writer) = rt.ingress_writer.as_mut() {
+        match writer
+            .reconcile(&ingress_routes, &phases, rt.self_route.as_ref())
+            .await
+        {
             Ok(st) if st.wrote => {
                 info!(
                     ready = st.ready,
@@ -559,7 +437,7 @@ async fn reconcile(
             .await;
 
         // Healthcheck signal (drives depends_on: service_healthy).
-        if let Some(hstate) = rt_state.get(&r.runtime_id) {
+        if let Some(hstate) = rt.rt_state.get(&r.runtime_id) {
             let _ = store
                 .update_instance_health(&r.instance_id, hstate.health_ok)
                 .await;
@@ -600,61 +478,6 @@ async fn reconcile(
     }
 
     Ok(())
-}
-
-async fn handle_health_failure(
-    runtime: &dyn NodeRuntime,
-    d: &mc2_runtime::DesiredSandbox,
-    policy: RestartPolicy,
-    state: &mut InstanceRuntimeState,
-    now: Instant,
-    message: String,
-) -> mc2_runtime::SandboxStatus {
-    use mc2_runtime::SandboxStatus;
-    if policy == RestartPolicy::Never {
-        return SandboxStatus {
-            runtime_id: d.runtime_id.clone(),
-            phase: SandboxPhase::Failed,
-            message: Some(message),
-        };
-    }
-    state.restart_count = state.restart_count.saturating_add(1);
-    state.next_restart_ok = Some(now + Duration::from_secs(backoff_secs(state.restart_count)));
-    state.running_since = None;
-    if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
-        warn!(runtime_id = %d.runtime_id, error = %e, "remove after health fail");
-    }
-    match runtime.ensure_running(d).await {
-        Ok(st) => st,
-        Err(e) => SandboxStatus {
-            runtime_id: d.runtime_id.clone(),
-            phase: SandboxPhase::Failed,
-            message: Some(format!("{message}; recreate: {e:#}")),
-        },
-    }
-}
-
-/// True when a healthcheck should actually run (not disabled, has a test).
-fn health_active(h: &HealthcheckSpec) -> bool {
-    !h.disable && h.test.as_ref().is_some_and(|t| !t.is_empty())
-}
-
-/// Run one health probe, honoring the compose `timeout` (0 = no timeout).
-/// Returns the guest exit code, or an Err (probe error / timeout).
-async fn run_health_probe(
-    runtime: &dyn NodeRuntime,
-    runtime_id: &str,
-    health: &HealthcheckSpec,
-) -> anyhow::Result<i32> {
-    let command = health.test.as_ref().expect("active healthcheck has a test");
-    let fut = runtime.exec_command(runtime_id, command);
-    if health.timeout_seconds == 0 {
-        return fut.await;
-    }
-    match tokio::time::timeout(Duration::from_secs(u64::from(health.timeout_seconds)), fut).await {
-        Ok(res) => res,
-        Err(_) => anyhow::bail!("health probe timed out"),
-    }
 }
 
 /// Compose `depends_on` gate: `Some(...)` lists the unsatisfied dependencies
