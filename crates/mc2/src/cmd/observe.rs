@@ -192,35 +192,30 @@ fn print_resources(res: &serde_json::Value) {
         }
     };
     let body = crate::table::Table::new()
+        .header(["METRIC", "CPU", "MEMORY", "DISK"])
         .row([
-            "limits:".to_string(),
+            "Host".to_string(),
+            host["cpus"].as_u64().unwrap_or(0).to_string(),
+            format!("{} MiB", host["memoryMib"].as_u64().unwrap_or(0)),
             format!(
-                "cpu {} · mem {} MiB · disk {} MiB",
-                unit(&lim["cpus"]),
-                unit(&lim["memoryMib"]),
-                unit(&lim["diskMib"])
-            ),
-        ])
-        .row([
-            "host:".to_string(),
-            format!(
-                "{} cpu · {} MiB · disk {} MiB ({} MiB free)",
-                host["cpus"].as_u64().unwrap_or(0),
-                host["memoryMib"].as_u64().unwrap_or(0),
+                "{} MiB ({} MiB free)",
                 host["diskTotalMib"].as_u64().unwrap_or(0),
                 host["diskFreeMib"].as_u64().unwrap_or(0)
             ),
         ])
         .row([
-            "mc2 uses:".to_string(),
-            format!(
-                "{} cpu · {} MiB mem reserved · {} MiB disk",
-                used["cpus"].as_u64().unwrap_or(0),
-                used["memoryMib"].as_u64().unwrap_or(0),
-                res["mc2DiskUsedMib"].as_u64().unwrap_or(0)
-            ),
+            "Limits".to_string(),
+            unit(&lim["cpus"]),
+            format!("{} MiB", unit(&lim["memoryMib"])),
+            format!("{} MiB", unit(&lim["diskMib"])),
         ])
-        .render_body();
+        .row([
+            "MC2".to_string(),
+            used["cpus"].as_u64().unwrap_or(0).to_string(),
+            format!("{} MiB", used["memoryMib"].as_u64().unwrap_or(0)),
+            format!("{} MiB", res["mc2DiskUsedMib"].as_u64().unwrap_or(0)),
+        ])
+        .render();
     println!("  resources:");
     for line in body.lines() {
         println!("    {line}");

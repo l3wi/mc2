@@ -60,11 +60,6 @@ impl Table {
         self.render_inner(true)
     }
 
-    /// Render without a header row (e.g. key/value blocks).
-    pub fn render_body(self) -> String {
-        self.render_inner(false)
-    }
-
     fn render_inner(&self, with_header: bool) -> String {
         let mut t = ComfyTable::new();
         t.load_style(UTF8_FULL)
@@ -108,16 +103,5 @@ mod tests {
         assert!(out.contains("NAME"), "header present: {out}");
         assert!(out.contains("demo-web-0"), "row present: {out}");
         assert!(out.contains("Creating"), "row present: {out}");
-    }
-
-    #[test]
-    fn body_renders_without_header() {
-        let t = Table::new()
-            .row(["mc2 uses", "0 cpu"])
-            .row(["host", "14 cpu"]);
-        let out = t.render_body();
-        assert!(out.contains('┌'), "top border: {out}");
-        assert!(out.contains("mc2 uses"), "row present: {out}");
-        assert!(!out.contains("┌─┬─┐"), "no header separator expected");
     }
 }
