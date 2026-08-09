@@ -222,12 +222,13 @@ Verify: `cargo test -p mc2-server` green; clippy clean **without** the `too_many
 Verify: `cargo machete` clean; `cargo test --workspace` green.
 
 ### Phase 6 — Workspace lints + docs hygiene (P1)
-- Add `[workspace.lints.rust] unsafe_code = "deny"` if not done in Phase 0; propagate via
-  `[workspace.lints]` + per-crate `lints.workspace = true`.
-- Optional, with sign-off: `#![warn(missing_docs)]` on `mc2-api`/`mc2-runtime`/`mc2-store` and fill any gaps
-  (most public items already documented).
-- Create `docs/architecture/` with 1–2 short ADRs for decisions surfaced by this review (e.g. "store keeps
-  string phases; typed enums at module boundaries" F9, and "workspace crate layout").
+- `[workspace.lints.rust] unsafe_code = "deny"` propagated via `lints.workspace = true`
+  (done in Phase 0).
+- Optional, with sign-off: `#![warn(missing_docs)]` on `mc2-api`/`mc2-runtime`/`mc2-store` — **not
+  enabled** (large doc-comment sweep; most public items are already documented).
+- Create `docs/decisions/ADR-0001-workspace-layout.md` and
+  `docs/decisions/ADR-0002-phase-status-representation.md` documenting the workspace shape and the
+  string-phase-vs-enum-boundary decision (F9).
 Verify: `cargo doc` with `-D warnings` green; docs render.
 
 ### Phase 7 — Typed phases MVP (P2, optional, clearly bounded)
