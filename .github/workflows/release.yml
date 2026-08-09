@@ -143,7 +143,7 @@ jobs:
       # cargo-dist, so install it explicitly on the Linux build runners.
       # (Hand-maintained: re-apply after any `dist generate`.)
       - name: Install Linux system deps (libcap-ng)
-        if: contains(matrix.targets, 'linux')
+        if: contains(matrix.runner, 'ubuntu')
         run: |
           if command -v sudo >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y libcap-ng-dev; else apt-get update && apt-get install -y libcap-ng-dev; fi
       - name: Build artifacts
