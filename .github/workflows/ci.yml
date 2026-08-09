@@ -53,6 +53,9 @@ jobs:
   security:
     name: licenses · advisories
     runs-on: ubuntu-latest
+    # cargo-audit posts a check run; needs checks: write.
+    permissions:
+      checks: write
     steps:
       - uses: actions/checkout@v4
 

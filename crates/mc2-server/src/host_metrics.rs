@@ -42,6 +42,13 @@ pub fn host_memory_mib() -> u64 {
     }
 }
 
+/// `blocks`/`blocks_available` are `fsblkcnt_t` — `u32` on macOS (cast needed)
+/// but `u64` on Linux (cast is unnecessary, which clippy flags there).
+#[allow(clippy::unnecessary_cast)]
+fn statvfs_blocks(vfs: &nix::sys::statvfs::Statvfs) -> (u64, u64) {
+    (vfs.blocks() as u64, vfs.blocks_available() as u64)
+}
+
 /// (total MiB, free MiB) on the filesystem containing `path`.
 pub fn disk_usage_mib(path: &Path) -> (u64, u64) {
     use nix::sys::statvfs::statvfs;
@@ -53,8 +60,9 @@ pub fn disk_usage_mib(path: &Path) -> (u64, u64) {
     } else {
         vfs.block_size()
     };
-    let total = (vfs.blocks() as u64).saturating_mul(frsize) / (1024 * 1024);
-    let free = (vfs.blocks_available() as u64).saturating_mul(frsize) / (1024 * 1024);
+    let (blocks, free_blocks) = statvfs_blocks(&vfs);
+    let total = blocks.saturating_mul(frsize) / (1024 * 1024);
+    let free = free_blocks.saturating_mul(frsize) / (1024 * 1024);
     (total, free)
 }
 
