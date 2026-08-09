@@ -233,14 +233,13 @@ Verify: `cargo doc` with `-D warnings` green; docs render.
 
 ### Phase 7 — Typed phases MVP (P2, optional, clearly bounded)
 Scope: apply existing enums at module boundaries; do **not** change DB/REST string columns.
-- `node.rs`: replace `"Running"/"Creating"/"Failed"/"Stopped"` literal comparisons with
-  `SandboxPhase`/`InstancePhase::as_str()` constants.
-- `scheduler.rs` / `reschedule.rs`: use `NodeStatus`/`InstancePhase` instead of `"Ready"`, `"NotReady"`,
-  `"Failed"`, `"Stopped"`, `"Pending"`.
-- `network_serve.rs` / `networks.rs` / `ingress_files.rs`: centralize `"Ready"/"Pending"/"Failed"` strings
-  (newtype `enum PhaseKind` in mc2-runtime or consts).
-- `ssh_serve.rs` / `ssh.rs`: `"Closed"/"Open"/"Opening"/"Failed"` → `enum SshPhase`.
-Do not widen scope beyond these modules. Re-evaluate a full enum-typed store in a future task if desired.
+- Done: `scheduler.rs` / `reschedule.rs` / `node/mod.rs` now parse to and match on
+  `InstancePhase` / `NodeStatus` / `SandboxPhase` variants instead of scattered string literals
+  (e.g. `InstancePhase::parse(&inst.phase)` in capacity/load maps; report phases built from
+  `InstancePhase::X.as_str()`).
+- Deferred (documented in ADR-0002): `network_serve.rs`/`networks.rs`/`ingress_files.rs`
+  (`"Ready"/"Pending"/"Failed"`) and `ssh_serve.rs`/`ssh.rs` (`"Closed"/"Open"/"Opening"/"Failed"`)
+  keep string literals; introducing new enums there adds API surface without a behavior payoff.
 Verify: workspace tests green; clippy clean.
 
 ### Phase 8 — Verification & release prep (P0 gate)

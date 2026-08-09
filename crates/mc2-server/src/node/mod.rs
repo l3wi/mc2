@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use mc2_runtime::{
     desired_recreate_hash, InstanceReport, NetworkObserved, NodeRuntime, SandboxPhase,
 };
-use mc2_store::{NodeHeartbeat, SecretsKey, Store};
+use mc2_store::{InstancePhase, NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,7 +176,7 @@ async fn reconcile(
     {
         let key = (inst.stack, inst.service);
         let entry = live.entry(key).or_default();
-        if inst.phase == "Running" {
+        if inst.phase == InstancePhase::Running.as_str() {
             entry.running = true;
             entry.healthy = entry.healthy || inst.healthy;
         }
@@ -193,7 +193,7 @@ async fn reconcile(
             if let Some(waiting) = waiting_deps(d, &live) {
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
-                    phase: "Pending".into(),
+                    phase: InstancePhase::Pending.as_str().into(),
                     message: format!("depends_on: waiting for {waiting}"),
                     runtime_id: d.runtime_id.clone(),
                     ssh: None,
@@ -210,7 +210,7 @@ async fn reconcile(
                 let network = rt.network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
-                    phase: "Creating".into(),
+                    phase: InstancePhase::Creating.as_str().into(),
                     message: format!(
                         "restart backoff {}s",
                         next.saturating_duration_since(now).as_secs()
@@ -219,7 +219,7 @@ async fn reconcile(
                     ssh: Some(ssh),
                     network: Some(network),
                 });
-                apply_live(&mut live, d, "Creating", false);
+                apply_live(&mut live, d, InstancePhase::Creating.as_str(), false);
                 continue;
             }
         }
@@ -230,13 +230,13 @@ async fn reconcile(
             let network = rt.network_table.reconcile_not_running(d).await;
             reports.push(InstanceReport {
                 instance_id: d.instance_id.clone(),
-                phase: "Failed".into(),
+                phase: InstancePhase::Failed.as_str().into(),
                 message: e,
                 runtime_id: d.runtime_id.clone(),
                 ssh: Some(ssh),
                 network: Some(network),
             });
-            apply_live(&mut live, d, "Failed", false);
+            apply_live(&mut live, d, InstancePhase::Failed.as_str(), false);
             continue;
         }
 
@@ -311,11 +311,13 @@ async fn reconcile(
                 }
 
                 let phase = match st.phase {
-                    SandboxPhase::Running => "Running",
-                    SandboxPhase::Creating => "Creating",
-                    SandboxPhase::Failed => "Failed",
-                    SandboxPhase::Stopped => "Stopped",
-                    SandboxPhase::Pending | SandboxPhase::Unknown => "Creating",
+                    SandboxPhase::Running => InstancePhase::Running.as_str(),
+                    SandboxPhase::Creating => InstancePhase::Creating.as_str(),
+                    SandboxPhase::Failed => InstancePhase::Failed.as_str(),
+                    SandboxPhase::Stopped => InstancePhase::Stopped.as_str(),
+                    SandboxPhase::Pending | SandboxPhase::Unknown => {
+                        InstancePhase::Creating.as_str()
+                    }
                 };
                 let running = st.phase == SandboxPhase::Running;
                 let ssh = rt.ssh_table.reconcile(d, running).await;
@@ -374,13 +376,13 @@ async fn reconcile(
                 let network = rt.network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
-                    phase: "Failed".into(),
+                    phase: InstancePhase::Failed.as_str().into(),
                     message: format!("{e:#}"),
                     runtime_id: d.runtime_id.clone(),
                     ssh: Some(ssh),
                     network: Some(network),
                 });
-                apply_live(&mut live, d, "Failed", false);
+                apply_live(&mut live, d, InstancePhase::Failed.as_str(), false);
             }
         }
     }
@@ -516,7 +518,7 @@ fn apply_live(
     let entry = live
         .entry((d.stack.clone(), d.service.clone()))
         .or_default();
-    entry.running = phase == "Running";
+    entry.running = phase == InstancePhase::Running.as_str();
     entry.healthy = healthy;
 }
 
