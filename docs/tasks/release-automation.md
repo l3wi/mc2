@@ -1,6 +1,6 @@
 # Release automation: tags + releases on main, nightlies from dev
 
-Status: **approved with refinements** (implementing)
+Status: **implemented** (see ADR-0003)
 Branch: `dev` → will land on `main` via the release flow below.
 
 ## Context
@@ -13,44 +13,53 @@ Stack: **release-plz** (version bumping + tagging, same axodotdev ecosystem as c
 **cargo-dist prerelease tags** for nightlies.
 
 > Note: the crate name `mc2` is taken on crates.io by an unrelated project (nicolube/mc2). MC2 is never
-> published (`publish = false`), but release-plz compares local crates against the registry, so its
-> registry lookups must not drive versioning. Verified: with `publish = false` release-plz skips
-> registry-based version comparison.
+> published (`publish = false`); verified locally that release-plz then skips registry-based version
+> comparison.
 
-## Version policy (branch-based)
+## Version policy (final, ADR-0003)
 
-- **`dev` = next-minor line.** Every merge into `dev` bumps **MINOR** (`x.Y.Z` → `x.(Y+1).0`) via a
-  release-plz release PR (`custom_minor_increment_regex = ".*"` forces minor). No release tags on `dev`.
-- **`main` = release + patch line.** The dev → main release PR adopts dev's already-bumped version
-  (release-plz takes max(current, computed) — never double-bumps) and tags it; a hotfix merged directly
-  to `main` bumps **PATCH** (`x.Y.z` → `x.Y.(z+1)`, conventional `fix:`).
-- **Nightlies = cargo-dist prereleases.** A scheduled workflow cuts `vX.Y.Z-dev.<date>` prerelease tags
-  from `dev` on a temp branch; the existing `release.yml` builds them as GitHub **prereleases**. Nightly
-  tags never appear in the changelog (`tag_pattern`).
+- **`main` = the only release line.** release-plz on `main`:
+  - Feature batches (merged via `dev` → `main`) bump **MINOR** —
+    `custom_minor_increment_regex = "^feat"` makes `feat` → `x.Y.Z` even in 0.x.
+  - Hotfixes merged directly to `main` bump **PATCH** (conventional `fix:`).
+  - One release PR (version + CHANGELOG.md, managed by release-plz) per cycle; once merged, release-plz
+    creates the single **`vX.Y.Z`** tag (`git_tag_name = "v{{ version }}"`, only the `mc2` package —
+    internal crates are `release = false` and share the workspace version). cargo-dist builds the Release.
+- **`dev` = nightlies.** A scheduled workflow cuts `vX.Y.Z-dev.<date>` **prerelease** tags from `dev`
+  (throwaway branch, tag pushed only); cargo-dist publishes them as GitHub prereleases. The base version
+  is the latest full release tag, so `dev`'s Cargo.toml never drifts and `-dev` tags never enter `main`'s
+  history or the changelog (`tag_pattern` excludes them).
+- **Changelog gate**: PRs into `dev`/`main` must modify `CHANGELOG.md` (automation branches exempt).
+
+### Why not "bump minor on every dev merge" (as originally requested)
+
+Verified against release-plz 0.3.160: release-plz **always increments the current version** from the
+commit-derived bump. If `dev` bumped to `0.2.0` and `main` then ran release-plz, `main` would compute
+`0.2.1` (or `0.3.0` with the feat regex) on top — a double bump — rather than "adopting" `0.2.0`.
+Bumping on both branches also diverges the shared `Cargo.toml` version and causes merge conflicts.
+So the minor bump for feature work happens **at release time on `main`** (from the `feat:` commits that
+merged into `dev`), and hotfixes on `main` stay patch. This is the standard release-plz + cargo-dist
+setup and keeps the automation reliable.
 
 ## Files
 
-- `release-plz.toml` (main) — conventional-commit bumps, changelog managed by release-plz, no publish,
-  no git release (cargo-dist owns the Release), `semver_check = false`.
-- `release-plz-dev.toml` (dev) — same + `custom_minor_increment_regex = ".*"` (force minor).
+- `release-plz.toml` — main config (feat→minor regex, single v-tag for `mc2`, changelog managed, no
+  publish, no git release; cargo-dist owns the Release).
 - `.github/workflows/release-plz.yml` — on push to `main`: `release-pr` (opens version-bump PR) and
-  `release` (tags the merged release PR → cargo-dist builds the Release).
-- `.github/workflows/release-plz-dev.yml` — on push to `dev`: `release-pr` only (bump minor + changelog
-  via PR into dev; no tag).
-- `.github/workflows/nightly.yml` — daily: bump `dev` HEAD to `X.Y.Z-dev.<date>`, tag `vX.Y.Z-dev.<date>`
-  on a temp branch, push the tag → cargo-dist prerelease.
-- `.github/workflows/changelog.yml` — **gate**: PRs into `dev`/`main` must modify `CHANGELOG.md`
-  (exempt: release-plz / dependabot / nightly branches) so changes never land unexplained.
+  `release` (tags the merged release PR).
+- `.github/workflows/nightly.yml` — daily: cut `vX.Y.Z-dev.<date>` prerelease tag from `dev` → cargo-dist
+  prerelease.
+- `.github/workflows/changelog.yml` — gate: PRs into `dev`/`main` must modify `CHANGELOG.md`.
 - `docs/decisions/ADR-0003-release-process.md`.
 
 ## Release flow (main)
 
 ```
-PR (dev → main) merges  ── carries dev's already-bumped minor version
+PR (dev → main) merges  ── dev's version line is static; main keeps its higher version via 3-way merge
       │ push to main
       ▼
 release-plz (main)
-  ├─ release-pr job → opens/updates release PR (version + CHANGELOG)
+  ├─ release-pr job → opens/updates release PR (feat → minor, fix → patch; CHANGELOG.md regenerated)
   └─ release job   → no-op until that release PR merges
       │
       │ merge release PR → push to main
@@ -65,6 +74,7 @@ Hotfix: `fix:` merged directly to `main` → release-plz bumps patch → `vX.Y.(
 
 ## Verification
 
-- `release-plz update --config <file>` runs clean locally (clean tree, `publish = false` ⇒ no registry
-  comparison) and prints the computed next version.
-- CI additions don't affect `just check` / deny / audit.
+- `release-plz update --config release-plz.toml` runs clean locally (clean tree; `publish = false` ⇒ no
+  registry comparison) and reports `mc2: 0.1.0 → 0.2.0` with only the `mc2` package.
+- Workflow YAML + TOML validated; CI additions don't affect `just check` / deny / audit.
+

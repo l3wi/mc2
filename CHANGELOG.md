@@ -4,6 +4,25 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+## [0.1.1](https://github.com/l3wi/mc2/compare/mc2-api-v0.1.0...mc2-api-v0.1.1) - 2026-08-09
+
+### Added
+
+- *(cli+language)* mc2 network (replaces mc2 fabric, fabric→network rename), ssh:true + up prints ssh endpoints, docs rewrite
+- *(compose-parity)* environment key, string command, full healthcheck, depends_on, per-replica ports — env overrides secrets
+- *(cli+server+networking)* compose-faithful MC2 — canonical YAML, local/remote modes, setup wizard, server-wide networks, exec/logs
+- *(examples)* hello-service becomes the minimal stack file — boilerplate omitted, python http.server returns hello world, resources default fix (memory 0 bug), stack name falls back to parent dir
+- *(volumes)* node-local persistent directory volumes via msb named volumes — validation, mount wiring, --volume-dir, example 06, CI+lab tests
+- add Traefik SSH TCP ingress examples
+- rebrand mcc→mc2, add ingress, slim public docs
+
+### Other
+
+- CHANGELOG for cleanup work + fix private intra-doc links in stack/mod.rs
+- *(api)* split stack.rs into schema/decode/validate modules
+- *(ci)* tooling baseline — rustdoc-clean docs, workspace unsafe lint, dep sweep
+- *(arch)* single-process merge — delete the gRPC agent seam
+
 ### Rust best-practice cleanup (internal, no behavior change)
 
 - **Tooling baseline.** `cargo doc` is now warning-clean and enforced in CI
@@ -42,6 +61,11 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   `cargo audit` are enforced in CI (were non-blocking); the deny/audit config
   documents the one known exception (RUSTSEC-2023-0071, `rsa` via the embedded
   microsandbox SDK — no safe upgrade exists).
+- **Automated releases (ADR-0003).** release-plz on `main` bumps the version
+  from conventional commits (feature batches → minor, hotfixes → patch) and
+  creates `vX.Y.Z` tags; cargo-dist builds the GitHub Release. Nightly
+  prereleases (`vX.Y.Z-dev.<date>`) are cut from `dev` via cargo-dist. PRs into
+  `dev`/`main` must update `CHANGELOG.md`.
 
 ### CLI surface cleanup
 
