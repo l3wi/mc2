@@ -71,6 +71,7 @@ impl TestCluster {
             secrets_key,
             volume_dir: None,
             runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
+            limits: Default::default(),
         };
 
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

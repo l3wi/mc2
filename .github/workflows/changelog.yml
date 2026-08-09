@@ -1,0 +1,37 @@
+# Changelog gate: PRs into `main`/`dev` must update CHANGELOG.md so changes
+# never land unexplained. Automation PRs (release-plz version bumps, dependabot,
+# nightly tooling) are exempt — release-plz regenerates the changelog from
+# conventional commits at release time.
+name: Changelog gate
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  changelog:
+    name: CHANGELOG.md updated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip automation PRs
+        id: skip
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-}"
+          if [[ "$BRANCH" == release-plz/* || "$BRANCH" == dependabot/* || "$BRANCH" == nightly/* ]]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require CHANGELOG.md change
+        if: steps.skip.outputs.skipped == 'false'
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if ! git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -qx 'CHANGELOG.md'; then
+            echo "::error::CHANGELOG.md must be updated — add an entry under '## Unreleased' describing your change."
+            exit 1
+          fi

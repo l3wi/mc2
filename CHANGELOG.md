@@ -4,6 +4,78 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Resource limits (opt-in; unlimited by default)
+
+- **Configurable cluster budgets.** `--limit-cpus`, `--limit-memory-mib`,
+  `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
+  refuses an apply that would exceed the reserved CPU/RAM budget, or when MC2's
+  measured disk usage (data dir + named volumes) is already at the disk limit.
+- **Node capacity is host-derived.** The `--cpus` / `--memory-mib` flags are
+  gone; each node now advertises the host's real CPU/RAM (detected via
+  `num_cpus` and `/proc`/`sysctl`). Apply is also refused when a stack would
+  exceed that capacity, so a stack that can't be placed is rejected up front
+  instead of sitting `Pending`. `--limit-*` remains the operator's budget knob.
+- **Resource visibility.** `mc2 status` and `/v1/status` report host CPU/RAM/disk,
+  the configured limits, MC2's reserved CPU/RAM from instance specs, and MC2's
+  measured disk usage.
+
+### CLI + fixes
+
+- **Bordered tables.** `mc2 ps` / `node ls` / `network` / `ingress` /
+  `secret ls` / `ssh keys` / `ssh endpoints` / `context ls` and the `status`
+  resources block now render as bordered tables with headers via a shared
+  `crate::table` wrapper over **comfy-table** (the most-downloaded Rust table
+  library), replacing hand-formatted `{:<N}` strings.
+- **Fix: `mem_limit` JSON round-trip.** `ServiceSpec` now serializes
+  `mem_limit` as bytes (matching compose semantics), so a stored/re-read spec
+  keeps the same MiB value (512 MiB no longer comes back as 1 MiB). This also
+  corrects reserved-memory accounting in the scheduler and the new resource
+  limits.
+
+### Rust best-practice cleanup (internal, no behavior change)
+
+- **Tooling baseline.** `cargo doc` is now warning-clean and enforced in CI
+  (`RUSTDOCFLAGS=-D warnings`); `[workspace.lints.rust] unsafe_code = "deny"`
+  codifies the zero-`unsafe` posture; `cargo clippy` runs with `--all-features`;
+  CI gains `cargo machete` plus non-blocking `cargo-deny` / `cargo-audit` jobs.
+  `just check` covers fmt + lint + test + doc + machete.
+- **Unused deps removed** (`cargo machete`-verified): `tracing` in `mc2`,
+  `thiserror` in `mc2-runtime`, `tracing` in `mc2-tests`.
+- **CLI split into modules.** `mc2/src/main.rs` (2123 LOC) becomes a thin
+  dispatcher; clap definitions live in `cli.rs`, REST plumbing in `client.rs`,
+  the grouped-help renderer in `help.rs`, and handlers in `cmd/` grouped along
+  the help surfaces (stacks / observe / access / security).
+- **REST split into `api/` with typed errors.** `http.rs` (1328 LOC) becomes
+  `api/` (meta / stacks / instances / secrets / ssh / ingress) with a shared
+  `ApiError`; `is_stack_client_error` string-matching is replaced by a typed
+  `ApplyError::{Validation,Allocation,Other}` (user errors → 400, store errors
+  → 500), `SecretError` for secrets, and `StoreError::InvalidArgument` for
+  invalid SSH public keys.
+- **Stack schema split into `stack/`.** `stack.rs` (1698 LOC) becomes
+  `schema.rs` (types) + `decode.rs` (compose-value deserializers) + `validate.rs`.
+- **Node loop tightened.** `reconcile()` drops its 10-arg signature (bundled
+  into `NodeRuntimeState`) and the nested health-probe block moves to
+  `node/health.rs`.
+- **Dead code removed**: `network_expose_guest_ports`,
+  `Store::list_instance_network`, `make_route_id`, and a vestigial
+  `let _ = key_names;`.
+- **Typed phases at boundaries.** Scheduler / reschedule / node reconcile use
+  `InstancePhase` / `NodeStatus` / `SandboxPhase` enums instead of scattered
+  string literals (persistence stays string-based — see ADR-0002).
+- **Network/SSH phase enums.** `NetworkPhase` (Pending/Ready/Failed/Mixed) and
+  `SshPhase` (Closed/Opening/Open/Failed) now back the observed status
+  constructions and comparisons in the node loop, network dataplane, and SSH
+  serve layers.
+- **License + advisory gates are blocking.** `cargo deny check` and
+  `cargo audit` are enforced in CI (were non-blocking); the deny/audit config
+  documents the one known exception (RUSTSEC-2023-0071, `rsa` via the embedded
+  microsandbox SDK — no safe upgrade exists).
+- **Automated releases (ADR-0003).** release-plz on `main` bumps the version
+  from conventional commits (feature batches → minor, hotfixes → patch) and
+  creates `vX.Y.Z` tags; cargo-dist builds the GitHub Release. Nightly
+  prereleases (`vX.Y.Z-dev.<date>`) are cut from `dev` via cargo-dist. PRs into
+  `dev`/`main` must update `CHANGELOG.md`.
+
 ### CLI surface cleanup
 
 - **Grouped top-level help.** `mc2 --help` (and bare `mc2`) now renders

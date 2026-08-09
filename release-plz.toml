@@ -1,0 +1,56 @@
+# release-plz config for the `main` branch (production releases).
+#
+# Version policy:
+# - Feature work that merges into `dev` is released from `main` with a MINOR
+#   bump (`custom_minor_increment_regex = "^feat"` — feat → x.Y.Z even in 0.x).
+# - Hotfixes merged directly to `main` get a PATCH bump (conventional `fix:`).
+# - Nightly prereleases from `dev` cut `vX.Y.Z-dev.<date>` tags; this config
+#   only creates full `vX.Y.Z` tags, and `tag_pattern` keeps `-dev` tags out of
+#   the changelog.
+#
+# release-plz manages CHANGELOG.md (regenerated from conventional commits).
+# cargo-dist (release.yml) builds + publishes the GitHub Release; release-plz
+# only creates the git tag. Internal workspace crates share the workspace
+# version and are excluded here — `mc2` (the binary) is the single released
+# package.
+
+[workspace]
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+custom_minor_increment_regex = "^feat"
+dependencies_update = false
+git_release_enable = false
+git_tag_enable = false
+publish = false
+semver_check = false
+
+# Single git tag for the whole workspace release (matches cargo-dist).
+[[package]]
+name = "mc2"
+git_tag_name = "v{{ version }}"
+git_tag_enable = true
+
+# Internal crates share the workspace version; don't release them separately.
+[[package]]
+name = "mc2-api"
+release = false
+
+[[package]]
+name = "mc2-metrics"
+release = false
+
+[[package]]
+name = "mc2-runtime"
+release = false
+
+[[package]]
+name = "mc2-store"
+release = false
+
+[[package]]
+name = "mc2-server"
+release = false
+
+[changelog]
+# Only full releases appear in the changelog; nightly `-dev.*` tags are ignored.
+tag_pattern = "v[0-9]+.[0-9]+.[0-9]+"

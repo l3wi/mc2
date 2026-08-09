@@ -1,11 +1,12 @@
 //! MicroCommandControl orchestrator: state, REST API, scheduler, and the local
 //! node loop that drives the embedded microsandbox runtime.
 
+mod api;
 mod apply;
 mod auth;
 mod bootstrap;
 pub mod desired;
-mod http;
+mod host_metrics;
 mod ingress;
 mod ingress_files;
 mod network_serve;
@@ -18,10 +19,10 @@ mod ssh;
 mod ssh_serve;
 mod watcher;
 
+pub use api::router;
 pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
 pub use desired::build_desired_set;
-pub use http::router;
 pub use reschedule::reschedule_not_ready;
 pub use secrets::{decrypt_secret, set_secret};
 
@@ -64,14 +65,6 @@ pub struct ServerArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// Advertise CPU capacity (default: host logical CPUs)
-    #[arg(long, env = "MC2_NODE_CPUS")]
-    pub cpus: Option<u32>,
-
-    /// Advertise memory capacity MiB (default: 8192 if unknown)
-    #[arg(long, env = "MC2_NODE_MEMORY_MIB")]
-    pub memory_mib: Option<u64>,
-
     /// Node reconcile interval seconds
     #[arg(long, default_value_t = 10, env = "MC2_RECONCILE_INTERVAL_SECS")]
     pub reconcile_interval_secs: u64,
@@ -103,9 +96,32 @@ pub struct ServerArgs {
     #[arg(long, env = "MC2_NO_AUTH", default_value_t = false)]
     pub no_auth: bool,
 
+    /// Max reserved CPUs across the cluster; `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_CPUS")]
+    pub limit_cpus: u32,
+
+    /// Max reserved memory MiB across the cluster; `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_MEMORY_MIB")]
+    pub limit_memory_mib: u64,
+
+    /// Max MC2-used disk MiB (data dir + named volumes); `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_DISK_MIB")]
+    pub limit_disk_mib: u64,
+
     /// Log bootstrap result and exit without listening (tests / CI)
     #[arg(long, hide = true)]
     pub dry_run: bool,
+}
+
+/// Cluster reservation budget enforced at apply time. `0` = unlimited.
+///
+/// CPU/RAM are reserved from instance specs; disk is the measured on-disk size
+/// of the data dir + named volumes (volumes have no declared size).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
 }
 
 /// Shared server state for HTTP handlers.
@@ -119,6 +135,8 @@ pub struct AppState {
     pub volume_dir: Option<PathBuf>,
     /// Shared microsandbox runtime (exec/logs handlers + node loop).
     pub runtime: Arc<dyn mc2_runtime::NodeRuntime>,
+    /// Cluster resource budget (`--limit-*`); all-zero = unlimited.
+    pub limits: ResourceLimits,
 }
 
 /// Periodically export status gauges (when OTLP is enabled).
@@ -229,6 +247,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         secrets_key: secrets_key.clone(),
         volume_dir: args.volume_dir.clone(),
         runtime: runtime.clone(),
+        limits: ResourceLimits {
+            cpus: args.limit_cpus,
+            memory_mib: args.limit_memory_mib,
+            disk_mib: args.limit_disk_mib,
+        },
     };
 
     let app = router(state);
@@ -267,8 +290,10 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             .unwrap_or_else(|| "local".into()),
         labels_json: serde_json::to_string(&parse_labels(&args.labels)?)
             .unwrap_or_else(|_| "{}".into()),
-        cpus: args.cpus.unwrap_or_else(|| num_cpus::get() as u32),
-        memory_mib: args.memory_mib.unwrap_or(8192),
+        // Node capacity is auto-derived from the host; `--limit-*` is the
+        // operator's resource budget. Fall back to 8192 MiB if detection fails.
+        cpus: num_cpus::get() as u32,
+        memory_mib: crate::host_metrics::host_memory_mib().max(8192),
         reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
         ingress_config_dir: args.ingress_config_dir.clone(),
         public_hostname: args.public_hostname.clone(),
@@ -396,8 +421,6 @@ mod tests {
             reschedule_interval_secs: 5,
             node_name: None,
             labels: vec![],
-            cpus: None,
-            memory_mib: None,
             reconcile_interval_secs: 10,
             ingress_config_dir: None,
             public_hostname: None,
@@ -405,6 +428,9 @@ mod tests {
             volume_dir: None,
             init_only: false,
             no_auth: false,
+            limit_cpus: 0,
+            limit_memory_mib: 0,
+            limit_disk_mib: 0,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");

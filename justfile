@@ -37,13 +37,31 @@ fmt-fix:
 
 # Clippy
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# fmt + clippy + full test suite (regression gate)
+# Docs (rustdoc warnings are errors)
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+# Unused dependency check (requires cargo-machete: `cargo install cargo-machete --locked`)
+machete:
+    cargo machete
+
+# License / advisory / source policy gate (requires cargo-deny)
+deny:
+    cargo deny check
+
+# RustSec advisory scan (requires cargo-audit)
+audit:
+    cargo audit
+
+# fmt + clippy + tests + docs + machete (regression gate)
 check:
     just fmt
     just lint
     just test
+    just doc
+    just machete
 
 # Run server (REST :7443, data dir ~/.mc2; embeds the local node)
 run-server *args:

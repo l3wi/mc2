@@ -1,7 +1,7 @@
 //! Spread scheduler: filter Ready nodes, pin/selector, minimize co-location.
 
 use mc2_api::ServiceSpec;
-use mc2_store::{InstanceRecord, NodeRecord, NodeStatus};
+use mc2_store::{InstancePhase, InstanceRecord, NodeRecord, NodeStatus};
 use std::collections::HashMap;
 
 /// Pure scheduling decision for one pending instance.
@@ -71,7 +71,10 @@ pub fn pick_node(
 fn network_affinity_scores(all_instances: &[InstanceRecord]) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for inst in all_instances {
-        if inst.phase == "Failed" || inst.phase == "Stopped" || inst.phase == "Pending" {
+        if matches!(
+            InstancePhase::parse(&inst.phase),
+            InstancePhase::Failed | InstancePhase::Stopped | InstancePhase::Pending
+        ) {
             continue;
         }
         let exposes = serde_json::from_str::<ServiceSpec>(&inst.spec_json)
@@ -113,7 +116,10 @@ pub fn residual_capacity(
         let Some(ref nid) = inst.node_id else {
             continue;
         };
-        if inst.phase == "Failed" || inst.phase == "Stopped" {
+        if matches!(
+            InstancePhase::parse(&inst.phase),
+            InstancePhase::Failed | InstancePhase::Stopped
+        ) {
             continue;
         }
         let (need_cpu, need_mem) = resources_from_spec_json(&inst.spec_json);
@@ -125,6 +131,28 @@ pub fn residual_capacity(
     res
 }
 
+/// Cluster-wide reserved CPU/memory across bound instances (same accounting as
+/// [`residual_capacity`]). Used for apply-time budget checks.
+pub fn reserved_capacity(instances: &[InstanceRecord]) -> (u32, u64) {
+    let mut cpu = 0u32;
+    let mut mem = 0u64;
+    for inst in instances {
+        if inst.node_id.is_none() {
+            continue;
+        }
+        if matches!(
+            InstancePhase::parse(&inst.phase),
+            InstancePhase::Failed | InstancePhase::Stopped
+        ) {
+            continue;
+        }
+        let (need_cpu, need_mem) = resources_from_spec_json(&inst.spec_json);
+        cpu = cpu.saturating_add(need_cpu);
+        mem = mem.saturating_add(need_mem);
+    }
+    (cpu, mem)
+}
+
 pub fn service_load_map(instances: &[InstanceRecord], service: &str) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for inst in instances {
@@ -132,7 +160,10 @@ pub fn service_load_map(instances: &[InstanceRecord], service: &str) -> HashMap<
             continue;
         }
         // Failed/Stopped do not consume placement load (align with residual_capacity).
-        if inst.phase == "Failed" || inst.phase == "Stopped" {
+        if matches!(
+            InstancePhase::parse(&inst.phase),
+            InstancePhase::Failed | InstancePhase::Stopped
+        ) {
             continue;
         }
         if let Some(ref nid) = inst.node_id {

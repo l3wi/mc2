@@ -3,7 +3,7 @@
 //! No `msb` CLI subprocess. Uses `Sandbox::ssh().server_with(...).serve(stream)`
 //! over a host TCP listener (default bind 127.0.0.1, auto port when port=0).
 
-use mc2_runtime::{DesiredSandbox, SshObserved};
+use mc2_runtime::{DesiredSandbox, SshObserved, SshPhase};
 use microsandbox::Sandbox;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -45,7 +45,7 @@ impl SshServeTable {
         if !want {
             self.close(&desired.instance_id).await;
             return SshObserved {
-                phase: "Closed".into(),
+                phase: SshPhase::Closed.as_str().into(),
                 bind: String::new(),
                 port: 0,
                 message: if desired.ssh.enabled && !sandbox_running {
@@ -61,7 +61,7 @@ impl SshServeTable {
         if let Some(active) = self.active.get(&desired.instance_id) {
             if active.config_hash == desired.ssh.config_hash && !active.join.is_finished() {
                 return SshObserved {
-                    phase: "Open".into(),
+                    phase: SshPhase::Open.as_str().into(),
                     bind: active.bind.clone(),
                     port: active.port,
                     message: "sdk".into(),
@@ -73,7 +73,7 @@ impl SshServeTable {
         match start_serve_sdk(desired).await {
             Ok(active) => {
                 let obs = SshObserved {
-                    phase: "Open".into(),
+                    phase: SshPhase::Open.as_str().into(),
                     bind: active.bind.clone(),
                     port: active.port,
                     message: "sdk".into(),
@@ -91,7 +91,7 @@ impl SshServeTable {
             Err(e) => {
                 warn!(instance = %desired.instance_id, error = %e, "ssh serve failed");
                 SshObserved {
-                    phase: "Failed".into(),
+                    phase: SshPhase::Failed.as_str().into(),
                     bind: String::new(),
                     port: 0,
                     message: e.to_string(),

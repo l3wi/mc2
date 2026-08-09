@@ -774,7 +774,7 @@ impl Store for SqliteStore {
         name: &str,
         public_key: &str,
     ) -> Result<SshAuthorizedKey, StoreError> {
-        validate_public_key(public_key).map_err(|e| StoreError::Other(anyhow::anyhow!(e)))?;
+        validate_public_key(public_key).map_err(StoreError::InvalidArgument)?;
         let now = Utc::now().to_rfc3339();
         let pk = public_key.trim();
         let fp = ssh_fingerprint(pk);
@@ -1051,25 +1051,6 @@ impl Store for SqliteStore {
             message: r.get("message"),
             updated_at: r.get("updated_at"),
         }))
-    }
-
-    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError> {
-        let rows = sqlx::query(
-            r#"SELECT instance_id, phase, observed_json, message, updated_at FROM instance_network"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
-        Ok(rows
-            .iter()
-            .map(|r| InstanceNetworkRecord {
-                instance_id: r.get("instance_id"),
-                phase: r.get("phase"),
-                observed_json: r.get("observed_json"),
-                message: r.get("message"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
     }
 }
 

@@ -17,3 +17,6 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 [lib]
 name = "mc2_metrics"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

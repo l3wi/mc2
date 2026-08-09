@@ -4,7 +4,7 @@ use crate::apply::run_scheduler;
 use crate::scheduler::may_reschedule_on_node_loss;
 use anyhow::{Context, Result};
 use mc2_api::ServiceSpec;
-use mc2_store::{NodeStatus, Store};
+use mc2_store::{InstancePhase, NodeStatus, Store};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -42,7 +42,7 @@ pub async fn reschedule_not_ready(store: Arc<dyn Store>) -> Result<(u32, u32)> {
                     let _ = store
                         .update_instance_status(
                             &inst.id,
-                            "Failed",
+                            InstancePhase::Failed.as_str(),
                             None,
                             Some("node lost; restart=no"),
                         )

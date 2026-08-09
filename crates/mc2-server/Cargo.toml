@@ -13,6 +13,7 @@ mc2-store = { workspace = true }
 mc2-runtime = { workspace = true }
 mc2-metrics = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 clap = { workspace = true }
@@ -27,6 +28,8 @@ futures = "0.3"
 rand = "0.8"
 http = "1"
 num_cpus = "1"
+# statvfs for host disk metrics (safe wrapper, no unsafe in our code).
+nix = { version = "0.31", features = ["fs"] }
 # Same SDK as runtime; ssh feature enabled via mc2-runtime (cargo feature unification).
 microsandbox = { version = "0.6.8", features = ["ssh"] }
 
@@ -39,3 +42,6 @@ async-trait = "0.1"
 [lib]
 name = "mc2_server"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

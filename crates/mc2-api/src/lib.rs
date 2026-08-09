@@ -42,6 +42,50 @@ pub struct ClusterStatus {
         skip_serializing_if = "Option::is_none"
     )]
     pub public_hostname: Option<String>,
+    /// Resource budget + host/consumption snapshot (`--limit-*`), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceStatus>,
+}
+
+/// Resource budget + host/consumption snapshot in `/v1/status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceStatus {
+    /// Configured budget (`--limit-*`); `0` = unlimited.
+    pub limits: ResourceLimitsView,
+    /// Host totals the server runs on.
+    pub host: HostResources,
+    /// MC2's reserved CPU/RAM from instance specs (bound, not Failed/Stopped).
+    pub reserved: ReservedResources,
+    /// MC2's measured on-disk usage (data dir + named volumes), MiB.
+    pub mc2_disk_used_mib: u64,
+}
+
+/// Configured resource budget (`0` = unlimited).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceLimitsView {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
+}
+
+/// Host capacity the server observes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostResources {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_total_mib: u64,
+    pub disk_free_mib: u64,
+}
+
+/// MC2's reserved CPU/RAM from instance specs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservedResources {
+    pub cpus: u32,
+    pub memory_mib: u64,
 }
 
 impl ClusterStatus {
@@ -55,6 +99,7 @@ impl ClusterStatus {
             instances: 0,
             message: Some("bootstrap stub".into()),
             public_hostname: None,
+            resources: None,
         }
     }
 }
