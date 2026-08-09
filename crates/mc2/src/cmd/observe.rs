@@ -178,52 +178,74 @@ pub(crate) async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
     Ok(())
 }
 
+/// Format a MiB value: small values stay in MiB, larger ones convert to GiB
+/// (binary units — 1 GiB = 1024 MiB), dropping a trailing `.0`.
+fn fmt_mib(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} MiB")
+    } else {
+        let g = n as f64 / 1024.0;
+        if (g - g.round()).abs() < 0.05 {
+            format!("{g:.0} GiB")
+        } else {
+            format!("{g:.1} GiB")
+        }
+    }
+}
+
+/// `used/limit` for a MiB-valued resource; `Unlim` when the limit is 0.
+fn fmt_mib_ratio(used: u64, limit: u64) -> String {
+    let used_s = if used == 0 {
+        "0".to_string()
+    } else {
+        fmt_mib(used)
+    };
+    let limit_s = if limit == 0 {
+        "Unlim".to_string()
+    } else {
+        fmt_mib(limit)
+    };
+    format!("{used_s}/{limit_s}")
+}
+
 /// Print the `resources` block of `/v1/status` (budget + host + consumption).
 fn print_resources(res: &serde_json::Value) {
     let lim = &res["limits"];
     let host = &res["host"];
     let used = &res["reserved"];
-    // CPU: `0` = unlimited. Memory/disk: `0` = unlimited (no unit suffix).
-    let unit = |n: &serde_json::Value| {
-        let n = n.as_u64().unwrap_or(0);
-        if n == 0 {
-            "unlimited".to_string()
+    let lim_cpu = lim["cpus"].as_u64().unwrap_or(0);
+    let lim_mem = lim["memoryMib"].as_u64().unwrap_or(0);
+    let lim_disk = lim["diskMib"].as_u64().unwrap_or(0);
+    let used_cpu = used["cpus"].as_u64().unwrap_or(0);
+    let used_mem = used["memoryMib"].as_u64().unwrap_or(0);
+    let used_disk = res["mc2DiskUsedMib"].as_u64().unwrap_or(0);
+    // CPU is a unitless count; `Unlim` when no limit is set.
+    let cpu_ratio = |used: u64, limit: u64| {
+        if limit == 0 {
+            format!("{used}/Unlim")
         } else {
-            n.to_string()
+            format!("{used}/{limit}")
         }
     };
-    let mib = |n: &serde_json::Value| {
-        let n = n.as_u64().unwrap_or(0);
-        if n == 0 {
-            "unlimited".to_string()
-        } else {
-            format!("{n} MiB")
-        }
-    };
+
     let body = crate::table::Table::new()
         .header(["METRIC", "CPU", "MEMORY", "DISK"])
         .right_align([1, 2, 3])
         .row([
             "Host".to_string(),
             host["cpus"].as_u64().unwrap_or(0).to_string(),
-            format!("{} MiB", host["memoryMib"].as_u64().unwrap_or(0)),
+            fmt_mib(host["memoryMib"].as_u64().unwrap_or(0)),
             format!(
-                "{:.1}/{:.1} GB",
+                "{:.1}/{:.1} GiB",
                 host["diskFreeMib"].as_u64().unwrap_or(0) as f64 / 1024.0,
                 host["diskTotalMib"].as_u64().unwrap_or(0) as f64 / 1024.0
             ),
         ])
         .row([
-            "Limits".to_string(),
-            unit(&lim["cpus"]),
-            mib(&lim["memoryMib"]),
-            mib(&lim["diskMib"]),
-        ])
-        .row([
             "MC2".to_string(),
-            used["cpus"].as_u64().unwrap_or(0).to_string(),
-            format!("{} MiB", used["memoryMib"].as_u64().unwrap_or(0)),
-            format!("{} MiB", res["mc2DiskUsedMib"].as_u64().unwrap_or(0)),
+            cpu_ratio(used_cpu, lim_cpu),
+            fmt_mib_ratio(used_mem, lim_mem),
+            fmt_mib_ratio(used_disk, lim_disk),
         ])
         .render();
     println!("  resources:");
@@ -512,4 +534,28 @@ pub(crate) async fn ingress_cmd(args: IngressArgs, conn: &Conn) -> Result<()> {
     }
     print!("{}", t.render());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mib_formats_with_gi_b_transition() {
+        assert_eq!(fmt_mib(0), "0 MiB");
+        assert_eq!(fmt_mib(512), "512 MiB");
+        assert_eq!(fmt_mib(1023), "1023 MiB");
+        assert_eq!(fmt_mib(1024), "1 GiB");
+        assert_eq!(fmt_mib(8192), "8 GiB");
+        assert_eq!(fmt_mib(49152), "48 GiB");
+        assert_eq!(fmt_mib(952), "952 MiB");
+    }
+
+    #[test]
+    fn ratios_show_used_over_limit() {
+        assert_eq!(fmt_mib_ratio(0, 8192), "0/8 GiB");
+        assert_eq!(fmt_mib_ratio(0, 0), "0/Unlim");
+        assert_eq!(fmt_mib_ratio(512, 8192), "512 MiB/8 GiB");
+        assert_eq!(fmt_mib_ratio(0, 2048), "0/2 GiB");
+    }
 }
