@@ -71,7 +71,7 @@ pub enum Commands {
     Context(ContextCmd),
 
     /// Run the MC2 orchestrator (single process)
-    Server(mc2_server::ServerArgs),
+    Server(Box<mc2_server::ServerArgs>),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
     /// Node operations

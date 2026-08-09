@@ -1,7 +1,7 @@
 //! Stack endpoints: apply (up) and delete (down).
 
 use crate::api::{ApiError, ApiResult};
-use crate::apply::{apply_stack_yaml, ApplyError};
+use crate::apply::{apply_stack_yaml, ApplyConfig, ApplyError};
 use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -24,11 +24,16 @@ pub async fn apply_stack(
     _auth: crate::auth::AuthUser,
     Json(body): Json<ApplyBody>,
 ) -> ApiResult<crate::ApplyResult> {
-    match apply_stack_yaml(state.store.clone(), &body.yaml).await {
+    let cfg = ApplyConfig {
+        limits: state.limits,
+        data_dir: state.data_dir.clone(),
+        volume_dir: state.volume_dir.clone(),
+    };
+    match apply_stack_yaml(state.store.clone(), &cfg, &body.yaml).await {
         Ok(r) => Ok(Json(r)),
-        Err(ApplyError::Validation(msg) | ApplyError::Allocation(msg)) => {
-            Err(ApiError::bad_request(msg))
-        }
+        Err(
+            ApplyError::Validation(msg) | ApplyError::Allocation(msg) | ApplyError::Capacity(msg),
+        ) => Err(ApiError::bad_request(msg)),
         Err(ApplyError::Other(e)) => Err(ApiError::internal(e.to_string())),
     }
 }
@@ -100,10 +105,19 @@ mod tests {
     use crate::api::router;
     use crate::api::testing::test_state;
 
+    /// ApplyConfig with no limits, for tests that exercise validation only.
+    fn unlimited_cfg() -> ApplyConfig {
+        ApplyConfig {
+            limits: crate::ResourceLimits::default(),
+            data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+            volume_dir: None,
+        }
+    }
+
     #[tokio::test]
     async fn parse_errors_classify_as_validation() {
         let store: std::sync::Arc<dyn Store> = mc2_store::MemoryStore::new();
-        let err = apply_stack_yaml(store, "name: x\nservices: {")
+        let err = apply_stack_yaml(store, &unlimited_cfg(), "name: x\nservices: {")
             .await
             .unwrap_err();
         assert!(matches!(err, ApplyError::Validation(_)), "{err:?}");
@@ -125,7 +139,9 @@ services:
     expose:
       - port: 8080
 "#;
-        let err = apply_stack_yaml(store, yaml).await.unwrap_err();
+        let err = apply_stack_yaml(store, &unlimited_cfg(), yaml)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApplyError::Validation(_)), "{err:?}");
     }
 

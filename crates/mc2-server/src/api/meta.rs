@@ -41,7 +41,49 @@ pub async fn status(
         instances: counts.instances,
         message: Some("control plane up".into()),
         public_hostname,
+        resources: Some(resource_status(&state).await),
     }))
+}
+
+/// Build the resource budget + host/consumption snapshot for status.
+async fn resource_status(state: &AppState) -> mc2_api::ResourceStatus {
+    use mc2_api::{HostResources, ReservedResources, ResourceLimitsView};
+
+    let instances = state.store.list_instances().await.unwrap_or_default();
+    let (reserved_cpu, reserved_mem) = crate::scheduler::reserved_capacity(&instances);
+
+    // Host disk: the filesystem hosting MC2's data/volumes.
+    let disk_path = state
+        .volume_dir
+        .as_deref()
+        .unwrap_or(state.data_dir.as_path());
+    let (disk_total_mib, disk_free_mib) = crate::host_metrics::disk_usage_mib(disk_path);
+
+    let mc2_disk_used_mib = crate::host_metrics::dir_size_mib(&state.data_dir)
+        + state
+            .volume_dir
+            .as_deref()
+            .map(crate::host_metrics::dir_size_mib)
+            .unwrap_or(0);
+
+    mc2_api::ResourceStatus {
+        limits: ResourceLimitsView {
+            cpus: state.limits.cpus,
+            memory_mib: state.limits.memory_mib,
+            disk_mib: state.limits.disk_mib,
+        },
+        host: HostResources {
+            cpus: crate::host_metrics::host_cpus(),
+            memory_mib: crate::host_metrics::host_memory_mib(),
+            disk_total_mib,
+            disk_free_mib,
+        },
+        reserved: ReservedResources {
+            cpus: reserved_cpu,
+            memory_mib: reserved_mem,
+        },
+        mc2_disk_used_mib,
+    }
 }
 
 pub async fn list_nodes(

@@ -4,24 +4,15 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
-## [0.1.1](https://github.com/l3wi/mc2/compare/mc2-api-v0.1.0...mc2-api-v0.1.1) - 2026-08-09
+### Resource limits (opt-in; unlimited by default)
 
-### Added
-
-- *(cli+language)* mc2 network (replaces mc2 fabric, fabric→network rename), ssh:true + up prints ssh endpoints, docs rewrite
-- *(compose-parity)* environment key, string command, full healthcheck, depends_on, per-replica ports — env overrides secrets
-- *(cli+server+networking)* compose-faithful MC2 — canonical YAML, local/remote modes, setup wizard, server-wide networks, exec/logs
-- *(examples)* hello-service becomes the minimal stack file — boilerplate omitted, python http.server returns hello world, resources default fix (memory 0 bug), stack name falls back to parent dir
-- *(volumes)* node-local persistent directory volumes via msb named volumes — validation, mount wiring, --volume-dir, example 06, CI+lab tests
-- add Traefik SSH TCP ingress examples
-- rebrand mcc→mc2, add ingress, slim public docs
-
-### Other
-
-- CHANGELOG for cleanup work + fix private intra-doc links in stack/mod.rs
-- *(api)* split stack.rs into schema/decode/validate modules
-- *(ci)* tooling baseline — rustdoc-clean docs, workspace unsafe lint, dep sweep
-- *(arch)* single-process merge — delete the gRPC agent seam
+- **Configurable cluster budgets.** `--limit-cpus`, `--limit-memory-mib`,
+  `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
+  refuses an apply that would exceed the reserved CPU/RAM budget, or when MC2's
+  measured disk usage (data dir + named volumes) is already at the disk limit.
+- **Resource visibility.** `mc2 status` and `/v1/status` report host CPU/RAM/disk,
+  the configured limits, MC2's reserved CPU/RAM from instance specs, and MC2's
+  measured disk usage.
 
 ### Rust best-practice cleanup (internal, no behavior change)
 

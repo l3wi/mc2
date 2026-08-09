@@ -166,7 +166,45 @@ pub(crate) async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
     if let Some(msg) = v["message"].as_str() {
         println!("  message: {msg}");
     }
+    if let Some(res) = v.get("resources") {
+        print_resources(res);
+    }
     Ok(())
+}
+
+/// Print the `resources` block of `/v1/status` (budget + host + consumption).
+fn print_resources(res: &serde_json::Value) {
+    let lim = &res["limits"];
+    let host = &res["host"];
+    let used = &res["reserved"];
+    let unit = |n: &serde_json::Value| {
+        let n = n.as_u64().unwrap_or(0);
+        if n == 0 {
+            "unlimited".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    println!("  resources:");
+    println!(
+        "    limits:   cpu {} · mem {} MiB · disk {} MiB",
+        unit(&lim["cpus"]),
+        unit(&lim["memoryMib"]),
+        unit(&lim["diskMib"])
+    );
+    println!(
+        "    host:     {} cpu · {} MiB · disk {} MiB ({} MiB free)",
+        host["cpus"].as_u64().unwrap_or(0),
+        host["memoryMib"].as_u64().unwrap_or(0),
+        host["diskTotalMib"].as_u64().unwrap_or(0),
+        host["diskFreeMib"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "    mc2 uses: {} cpu · {} MiB mem reserved · {} MiB disk",
+        used["cpus"].as_u64().unwrap_or(0),
+        used["memoryMib"].as_u64().unwrap_or(0),
+        res["mc2DiskUsedMib"].as_u64().unwrap_or(0)
+    );
 }
 
 /// Server-wide network membership summary. `mc2 network` lists all networks;

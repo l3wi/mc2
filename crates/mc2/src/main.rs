@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     };
 
     match command {
-        Commands::Server(args) => mc2_server::run(args).await?,
+        Commands::Server(args) => mc2_server::run(*args).await?,
 
         Commands::Up(args) => {
             let conn = resolve()?;

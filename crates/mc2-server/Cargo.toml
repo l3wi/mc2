@@ -28,6 +28,8 @@ futures = "0.3"
 rand = "0.8"
 http = "1"
 num_cpus = "1"
+# statvfs for host disk metrics (safe wrapper, no unsafe in our code).
+nix = { version = "0.31", features = ["fs"] }
 # Same SDK as runtime; ssh feature enabled via mc2-runtime (cargo feature unification).
 microsandbox = { version = "0.6.8", features = ["ssh"] }
 

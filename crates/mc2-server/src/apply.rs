@@ -1,15 +1,18 @@
 //! Apply stack YAML: parse, upsert, reconcile replicas, schedule.
 
-use crate::scheduler::{pick_node, residual_capacity, service_load_map};
+use crate::host_metrics::dir_size_mib;
+use crate::scheduler::{pick_node, reserved_capacity, residual_capacity, service_load_map};
+use crate::ResourceLimits;
 use anyhow::{Context, Result};
 use mc2_api::{parse_stack_yaml, ServiceSpec, StackDocument};
 use mc2_store::{InstanceRecord, Store};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
 /// Apply-time classification so the REST layer can map user errors to 400
-/// (validation / port allocation) instead of substring-matching messages.
+/// (validation / port allocation / capacity) instead of substring-matching messages.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
     /// Stack YAML parse/validation failure (user error).
@@ -18,9 +21,41 @@ pub enum ApplyError {
     /// Host port allocation conflict (fixed-block / auto range).
     #[error("{0}")]
     Allocation(String),
+    /// Apply refused by the configured resource budget (`--limit-*`).
+    #[error("{0}")]
+    Capacity(String),
     /// Store, serialization, or scheduling failure.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// What an apply may use, to enforce resource budgets. `0` = unlimited.
+#[derive(Debug, Clone)]
+pub struct ApplyConfig {
+    pub limits: ResourceLimits,
+    pub data_dir: PathBuf,
+    pub volume_dir: Option<PathBuf>,
+}
+
+impl ApplyConfig {
+    /// Reserved CPU/memory for a stack document (summed over services × scale).
+    fn stack_reserved(&self, doc: &StackDocument) -> (u32, u64) {
+        let mut cpu = 0u32;
+        let mut mem = 0u64;
+        for svc in doc.services.values() {
+            let scale = svc.scale.max(1) as u64;
+            cpu = cpu.saturating_add((svc.cpus.ceil() as u64).saturating_mul(scale) as u32);
+            mem = mem.saturating_add(svc.mem_limit_mib.saturating_mul(scale));
+        }
+        (cpu, mem)
+    }
+
+    /// Measured MC2 disk usage (data dir + named volumes), in MiB.
+    fn disk_used_mib(&self) -> u64 {
+        let data = dir_size_mib(&self.data_dir);
+        let volumes = self.volume_dir.as_deref().map(dir_size_mib).unwrap_or(0);
+        data.saturating_add(volumes)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,20 +162,70 @@ async fn resolve_replica_ports(
     Ok(out)
 }
 
+/// Refuse the apply when the stack's reserved CPU/RAM would exceed the
+/// configured budget, or when MC2's measured disk usage already exceeds the
+/// disk budget. Skips any limit set to `0` (unlimited).
+async fn check_capacity(
+    store: &dyn Store,
+    cfg: &ApplyConfig,
+    doc: &StackDocument,
+) -> Result<(), ApplyError> {
+    let limits = cfg.limits;
+    if limits.cpus == 0 && limits.memory_mib == 0 && limits.disk_mib == 0 {
+        return Ok(());
+    }
+
+    if limits.cpus > 0 || limits.memory_mib > 0 {
+        let instances = store.list_instances().await.map_err(anyhow::Error::from)?;
+        let (reserved_cpu, reserved_mem) = reserved_capacity(&instances);
+        let (stack_cpu, stack_mem) = cfg.stack_reserved(doc);
+        if limits.cpus > 0 && reserved_cpu.saturating_add(stack_cpu) > limits.cpus {
+            return Err(ApplyError::Capacity(format!(
+                "refusing apply: stack would reserve {stack_cpu} CPU (limit {}; {reserved_cpu} already reserved) \
+                 — raise --limit-cpus or scale down",
+                limits.cpus
+            )));
+        }
+        if limits.memory_mib > 0 && reserved_mem.saturating_add(stack_mem) > limits.memory_mib {
+            return Err(ApplyError::Capacity(format!(
+                "refusing apply: stack would reserve {stack_mem} MiB memory (limit {}; {reserved_mem} MiB already reserved) \
+                 — raise --limit-memory-mib or scale down",
+                limits.memory_mib
+            )));
+        }
+    }
+
+    if limits.disk_mib > 0 {
+        let used = cfg.disk_used_mib();
+        if used >= limits.disk_mib {
+            return Err(ApplyError::Capacity(format!(
+                "refusing apply: MC2 already uses {used} MiB disk (limit {} MiB) \
+                 — raise --limit-disk-mib or free space",
+                limits.disk_mib
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Apply a stack document from YAML text.
 pub async fn apply_stack_yaml(
     store: Arc<dyn Store>,
+    cfg: &ApplyConfig,
     yaml: &str,
 ) -> Result<ApplyResult, ApplyError> {
     let doc = parse_stack_yaml(yaml).map_err(ApplyError::Validation)?;
-    apply_stack(store, &doc, yaml).await
+    apply_stack(store, cfg, &doc, yaml).await
 }
 
 pub async fn apply_stack(
     store: Arc<dyn Store>,
+    cfg: &ApplyConfig,
     doc: &StackDocument,
     raw_yaml: &str,
 ) -> Result<ApplyResult, ApplyError> {
+    check_capacity(store.as_ref(), cfg, doc).await?;
+
     store
         .upsert_stack(&doc.name, "{}", raw_yaml)
         .await
@@ -465,7 +550,7 @@ ingress:
       entryPoint: ssh
       service: admin
 "#;
-    let result = apply_stack_yaml(store, yaml).await.unwrap();
+    let result = apply_stack_yaml(store, &cfg_default(), yaml).await.unwrap();
     assert_eq!(result.ssh.len(), 2, "{:?}", result.ssh);
 
     let web = result.ssh.iter().find(|e| e.service == "web").unwrap();
@@ -476,4 +561,93 @@ ingress:
     let admin = result.ssh.iter().find(|e| e.service == "admin").unwrap();
     assert_eq!(admin.port, Some(2222));
     assert_eq!(admin.entrypoint.as_deref(), Some("ssh"));
+}
+
+/// ApplyConfig with unlimited limits and a throwaway data dir (tests only).
+#[cfg(test)]
+fn cfg_default() -> ApplyConfig {
+    ApplyConfig {
+        limits: ResourceLimits::default(),
+        data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+        volume_dir: None,
+    }
+}
+
+#[tokio::test]
+async fn refuses_apply_over_cpu_limit() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let cfg = ApplyConfig {
+        limits: ResourceLimits {
+            cpus: 1,
+            memory_mib: 0,
+            disk_mib: 0,
+        },
+        data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+        volume_dir: None,
+    };
+    let yaml = "name: big\nservices:\n  a:\n    image: alpine\n    cpus: 2\n";
+    let err = apply_stack_yaml(store, &cfg, yaml).await.unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+    assert!(err.to_string().contains("CPU"), "{err}");
+}
+
+#[tokio::test]
+async fn refuses_apply_over_memory_limit() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let cfg = ApplyConfig {
+        limits: ResourceLimits {
+            cpus: 0,
+            memory_mib: 512,
+            disk_mib: 0,
+        },
+        data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+        volume_dir: None,
+    };
+    let yaml = "name: big\nservices:\n  a:\n    image: alpine\n    mem_limit: 1g\n";
+    let err = apply_stack_yaml(store, &cfg, yaml).await.unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+    assert!(err.to_string().contains("memory"), "{err}");
+}
+
+#[tokio::test]
+async fn refuses_apply_when_disk_limit_reached() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // 2 MiB of MC2 data in the data dir.
+    std::fs::write(dir.path().join("mc2.db"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+    let cfg = ApplyConfig {
+        limits: ResourceLimits {
+            cpus: 0,
+            memory_mib: 0,
+            disk_mib: 1,
+        },
+        data_dir: dir.path().to_path_buf(),
+        volume_dir: None,
+    };
+    let yaml = "name: any\nservices:\n  a:\n    image: alpine\n";
+    let err = apply_stack_yaml(store, &cfg, yaml).await.unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+    assert!(err.to_string().contains("disk"), "{err}");
+}
+
+#[tokio::test]
+async fn applies_within_limits() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let cfg = ApplyConfig {
+        limits: ResourceLimits {
+            cpus: 2,
+            memory_mib: 1024,
+            disk_mib: 0,
+        },
+        data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+        volume_dir: None,
+    };
+    let yaml = "name: ok\nservices:\n  a:\n    image: alpine\n    cpus: 1\n    mem_limit: 512m\n";
+    apply_stack_yaml(store, &cfg, yaml)
+        .await
+        .expect("within limits");
 }

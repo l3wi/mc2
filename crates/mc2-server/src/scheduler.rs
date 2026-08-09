@@ -131,6 +131,28 @@ pub fn residual_capacity(
     res
 }
 
+/// Cluster-wide reserved CPU/memory across bound instances (same accounting as
+/// [`residual_capacity`]). Used for apply-time budget checks.
+pub fn reserved_capacity(instances: &[InstanceRecord]) -> (u32, u64) {
+    let mut cpu = 0u32;
+    let mut mem = 0u64;
+    for inst in instances {
+        if inst.node_id.is_none() {
+            continue;
+        }
+        if matches!(
+            InstancePhase::parse(&inst.phase),
+            InstancePhase::Failed | InstancePhase::Stopped
+        ) {
+            continue;
+        }
+        let (need_cpu, need_mem) = resources_from_spec_json(&inst.spec_json);
+        cpu = cpu.saturating_add(need_cpu);
+        mem = mem.saturating_add(need_mem);
+    }
+    (cpu, mem)
+}
+
 pub fn service_load_map(instances: &[InstanceRecord], service: &str) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for inst in instances {

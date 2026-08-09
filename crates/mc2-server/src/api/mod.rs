@@ -243,6 +243,60 @@ services:
     }
 
     #[tokio::test]
+    async fn status_reports_resources() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
+        let inst = store
+            .reconcile_service_replicas(
+                "demo",
+                "web",
+                1,
+                r#"{"image":"x","cpus":1.0,"mem_limit":"512m"}"#,
+            )
+            .await
+            .unwrap();
+        // Bind the instance so it counts toward reserved usage.
+        store
+            .bind_instance_to_node(&inst[0].id, "n1")
+            .await
+            .unwrap();
+        store
+            .update_instance_status(&inst[0].id, "Running", Some("demo-web-0"), None)
+            .await
+            .unwrap();
+
+        let mut state = test_state(store);
+        state.limits = crate::ResourceLimits {
+            cpus: 4,
+            memory_mib: 8192,
+            disk_mib: 0,
+        };
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let r = &v["resources"];
+        assert_eq!(r["limits"]["cpus"], 4);
+        assert_eq!(r["limits"]["memoryMib"], 8192);
+        assert_eq!(r["limits"]["diskMib"], 0);
+        assert!(r["host"]["cpus"].as_u64().unwrap() > 0, "host cpu");
+        assert_eq!(r["reserved"]["cpus"], 1);
+        assert_eq!(r["reserved"]["memoryMib"], 512);
+        assert!(r["mc2DiskUsedMib"].as_u64().is_some());
+    }
+
+    #[tokio::test]
     async fn list_nodes_returns_joined() {
         let store = MemoryStore::new();
         store.init_cluster(&hash_token("secret")).await.unwrap();
@@ -330,6 +384,7 @@ pub(crate) mod testing {
             secrets_key: Arc::new(mc2_store::SecretsKey::from_bytes([1u8; 32])),
             volume_dir: None,
             runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
+            limits: crate::ResourceLimits::default(),
         };
         state.runtime = Arc::new(MockRuntime);
         state

@@ -6,6 +6,7 @@ mod apply;
 mod auth;
 mod bootstrap;
 pub mod desired;
+mod host_metrics;
 mod ingress;
 mod ingress_files;
 mod network_serve;
@@ -103,9 +104,32 @@ pub struct ServerArgs {
     #[arg(long, env = "MC2_NO_AUTH", default_value_t = false)]
     pub no_auth: bool,
 
+    /// Max reserved CPUs across the cluster; `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_CPUS")]
+    pub limit_cpus: u32,
+
+    /// Max reserved memory MiB across the cluster; `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_MEMORY_MIB")]
+    pub limit_memory_mib: u64,
+
+    /// Max MC2-used disk MiB (data dir + named volumes); `0` = unlimited (default)
+    #[arg(long, default_value_t = 0, env = "MC2_LIMIT_DISK_MIB")]
+    pub limit_disk_mib: u64,
+
     /// Log bootstrap result and exit without listening (tests / CI)
     #[arg(long, hide = true)]
     pub dry_run: bool,
+}
+
+/// Cluster reservation budget enforced at apply time. `0` = unlimited.
+///
+/// CPU/RAM are reserved from instance specs; disk is the measured on-disk size
+/// of the data dir + named volumes (volumes have no declared size).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
 }
 
 /// Shared server state for HTTP handlers.
@@ -119,6 +143,8 @@ pub struct AppState {
     pub volume_dir: Option<PathBuf>,
     /// Shared microsandbox runtime (exec/logs handlers + node loop).
     pub runtime: Arc<dyn mc2_runtime::NodeRuntime>,
+    /// Cluster resource budget (`--limit-*`); all-zero = unlimited.
+    pub limits: ResourceLimits,
 }
 
 /// Periodically export status gauges (when OTLP is enabled).
@@ -229,6 +255,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         secrets_key: secrets_key.clone(),
         volume_dir: args.volume_dir.clone(),
         runtime: runtime.clone(),
+        limits: ResourceLimits {
+            cpus: args.limit_cpus,
+            memory_mib: args.limit_memory_mib,
+            disk_mib: args.limit_disk_mib,
+        },
     };
 
     let app = router(state);
@@ -405,6 +436,9 @@ mod tests {
             volume_dir: None,
             init_only: false,
             no_auth: false,
+            limit_cpus: 0,
+            limit_memory_mib: 0,
+            limit_disk_mib: 0,
             dry_run: true,
         };
         run(args).await.expect("dry_run should succeed");
