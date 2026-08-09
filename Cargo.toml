@@ -57,3 +57,6 @@ targets = [
 ]
 # Release notes from CHANGELOG.md sections.
 changelog = true
+# The generated release.yml is hand-tuned (installs libcap-ng-dev for the
+# Linux microsandbox link); allow cargo-dist to accept the drift.
+allow-dirty = ["ci"]
