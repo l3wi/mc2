@@ -126,3 +126,14 @@ New module `crates/mc2-server/src/host_metrics.rs` with thin, `cfg`-gated host r
   "docs: ADR-0003" commit (a `git add -A` swept up an unreverted release-plz run); Cargo.toml +
   Cargo.lock + CHANGELOG restored to `0.1.0` / clean Unreleased.
 
+### Follow-up: table renderer + mem_limit round-trip fix
+
+- Added `crate::table` (unicode-width-aware plain column renderer) in the `mc2` crate and migrated
+  `ps` / `node ls` / `network` / `ingress` / `secret ls` / `ssh keys` / `ssh endpoints` / `context ls`
+  plus the status resources block off hand-formatted `{:<N}` strings.
+- Fixed a `ServiceSpec` JSON round-trip bug surfaced by the limits feature: `mem_limit_mib` was
+  serialized as a bare number while `de_mem_limit` reads numbers as bytes (512 MiB round-tripped to
+  1 MiB), which skewed scheduler residual capacity and the new reserved-memory limits. `mem_limit` now
+  serializes as bytes (compose semantics), making the round-trip lossless.
+
+
