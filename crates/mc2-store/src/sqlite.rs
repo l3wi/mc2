@@ -1052,25 +1052,6 @@ impl Store for SqliteStore {
             updated_at: r.get("updated_at"),
         }))
     }
-
-    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError> {
-        let rows = sqlx::query(
-            r#"SELECT instance_id, phase, observed_json, message, updated_at FROM instance_network"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
-        Ok(rows
-            .iter()
-            .map(|r| InstanceNetworkRecord {
-                instance_id: r.get("instance_id"),
-                phase: r.get("phase"),
-                observed_json: r.get("observed_json"),
-                message: r.get("message"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
-    }
 }
 
 #[cfg(test)]

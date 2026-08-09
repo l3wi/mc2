@@ -643,17 +643,6 @@ impl Store for MemoryStore {
             .get(instance_id)
             .cloned())
     }
-
-    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError> {
-        Ok(self
-            .inner
-            .read()
-            .await
-            .instance_network
-            .values()
-            .cloned()
-            .collect())
-    }
 }
 
 #[cfg(test)]

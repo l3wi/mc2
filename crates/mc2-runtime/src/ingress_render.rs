@@ -67,7 +67,7 @@ pub struct CatalogTls {
 }
 
 /// Normalize path for proxy rules (`""` → `/`).
-pub fn normalize_path(path: &str) -> String {
+fn normalize_path(path: &str) -> String {
     mc2_api::normalize_ingress_path(path)
 }
 
@@ -248,17 +248,6 @@ impl DesiredIngressRoute {
     }
 }
 
-/// Stable id for a route (stack + host + path + service + guest port).
-pub fn make_route_id(
-    stack: &str,
-    host: &str,
-    path: &str,
-    service: &str,
-    guest_port: u16,
-) -> String {
-    mc2_api::make_ingress_route_id(stack, host, path, service, guest_port)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,13 +353,19 @@ mod tests {
 
     #[test]
     fn route_id_stable_for_catalog_key() {
-        let id = make_route_id("smoke-ingress", "smoke-ingress.local", "/", "web", 8000);
+        let id = mc2_api::make_ingress_route_id(
+            "smoke-ingress",
+            "smoke-ingress.local",
+            "/",
+            "web",
+            8000,
+        );
         assert!(id.contains("smoke-ingress"));
         assert!(id.contains("web"));
         assert!(id.contains("8000"));
         assert_eq!(
             id,
-            make_route_id("smoke-ingress", "smoke-ingress.local", "", "web", 8000)
+            mc2_api::make_ingress_route_id("smoke-ingress", "smoke-ingress.local", "", "web", 8000)
         );
     }
 }

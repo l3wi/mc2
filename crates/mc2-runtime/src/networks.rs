@@ -66,8 +66,3 @@ pub fn network_host_allow_ports(network: &DesiredNetwork) -> Vec<u16> {
     ports.dedup();
     ports
 }
-
-/// Publish ports for `expose` (host ephemeral chosen by caller).
-pub fn network_expose_guest_ports(network: &DesiredNetwork) -> Vec<u16> {
-    network.exposes.iter().map(|e| e.guest_port).collect()
-}

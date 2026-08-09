@@ -249,6 +249,4 @@ pub trait Store: Send + Sync {
         &self,
         instance_id: &str,
     ) -> Result<Option<InstanceNetworkRecord>, StoreError>;
-
-    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError>;
 }

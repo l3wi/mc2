@@ -92,7 +92,6 @@ pub async fn resolve_ssh_desired(
         public_keys.push(key.public_key);
     }
 
-    let _ = key_names;
     let config_hash = hash_ssh_config(&bind, port, &user, sftp, &public_keys);
     Ok(DesiredSsh {
         enabled: true,
