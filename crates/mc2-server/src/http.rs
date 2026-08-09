@@ -26,7 +26,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/stacks:apply", axum::routing::post(apply_stack))
         .route("/v1/stacks/{name}", axum::routing::delete(delete_stack))
         .route("/v1/instances", get(list_instances))
-        .route("/v1/instances/{id}/fabric", get(get_instance_fabric))
+        .route("/v1/instances/{id}/network", get(get_instance_network))
+        .route("/v1/networks", get(list_networks))
         .route(
             "/v1/instances/{id}/exec",
             axum::routing::post(exec_instance),
@@ -255,13 +256,13 @@ async fn list_instances(
         })
 }
 
-/// Observed fabric status for one instance (agent-reported).
-async fn get_instance_fabric(
+/// Observed network status for one instance (agent-reported).
+async fn get_instance_network(
     State(state): State<AppState>,
     _auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match state.store.get_instance_fabric(&id).await {
+    match state.store.get_instance_network(&id).await {
         Ok(Some(rec)) => {
             let observed: serde_json::Value =
                 serde_json::from_str(&rec.observed_json).unwrap_or(json!({}));
@@ -275,8 +276,22 @@ async fn get_instance_fabric(
         }
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no fabric status for instance" })),
+            Json(json!({ "error": "no network status for instance" })),
         )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+/// Server-wide network membership summary (default + named networks).
+async fn list_networks(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<crate::networks::NetworksView>, (StatusCode, Json<serde_json::Value>)> {
+    match crate::networks::build_networks_view(state.store.as_ref()).await {
+        Ok(view) => Ok(Json(view)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -921,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_fabric_validation_returns_400() {
+    async fn apply_network_validation_returns_400() {
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
         let app = router(test_state(store));

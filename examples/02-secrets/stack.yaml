@@ -1,7 +1,7 @@
 # Secrets smoke stack — set the secret first, then apply.
 #
 #   mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
-#   mc2 up -f examples/secrets/stack.yaml
+#   mc2 up -f examples/02-secrets/stack.yaml
 #
 # Guest env shows a placeholder (msb host-side injection); the real value is
 # only attached on TLS to allowHosts. CI covers set → apply → agent Sync

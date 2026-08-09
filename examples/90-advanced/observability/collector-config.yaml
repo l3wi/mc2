@@ -8,11 +8,11 @@
 # same collector if you want one pipeline.
 #
 # Run (example):
-#   otelcol --config examples/advanced/observability/collector-config.yaml
+#   otelcol --config examples/90-advanced/observability/collector-config.yaml
 #
 # Or with Docker:
 #   docker run --rm -p 4317:4317 -p 4318:4318 \
-#     -v "$PWD/examples/advanced/observability/collector-config.yaml:/etc/otelcol/config.yaml" \
+#     -v "$PWD/examples/90-advanced/observability/collector-config.yaml:/etc/otelcol/config.yaml" \
 #     otel/opentelemetry-collector:latest
 
 receivers:

@@ -50,8 +50,8 @@ enum Commands {
     Node(NodeCmd),
     /// List instances (desired sandboxes)
     Ps(PsArgs),
-    /// Observed fabric status for one instance
-    Fabric(FabricArgs),
+    /// Server-wide network membership summary (default + named networks)
+    Network(NetworkArgs),
     /// Desired ingress routes
     Ingress(IngressArgs),
     /// Secrets (encrypted at rest; values never listed)
@@ -336,9 +336,9 @@ struct PsArgs {
 }
 
 #[derive(Debug, Parser)]
-struct FabricArgs {
-    /// Instance id, or <stack>/<service>/<ordinal> (e.g. demo/web/0)
-    id: String,
+struct NetworkArgs {
+    /// Network name, or <stack>/<service>/<ordinal> for per-instance connectivity (all networks when omitted)
+    network: Option<String>,
     #[command(flatten)]
     op: OperatorArgs,
     /// Output format
@@ -468,9 +468,9 @@ async fn main() -> Result<()> {
             resolve_op(&mut args.op)?;
             ps_cmd(args).await?
         }
-        Commands::Fabric(mut args) => {
+        Commands::Network(mut args) => {
             resolve_op(&mut args.op)?;
-            fabric_cmd(args).await?
+            network_cmd(args).await?
         }
         Commands::Ingress(mut args) => {
             resolve_op(&mut args.op)?;
@@ -1093,7 +1093,47 @@ async fn up_cmd(args: UpArgs) -> Result<()> {
         return Err(api_error("up", status, &body));
     }
     println!("{body}");
+    print_ssh_endpoints(&body);
     Ok(())
+}
+
+/// After `mc2 up`, print the declared SSH front ends and their ingress
+/// entrypoints (auto host ports resolve on first reconcile → `mc2 ssh ls`).
+fn print_ssh_endpoints(body: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return;
+    };
+    let Some(ssh) = v["ssh"].as_array() else {
+        return;
+    };
+    if ssh.is_empty() {
+        return;
+    }
+    println!("ssh:");
+    for e in ssh {
+        let port = e["port"]
+            .as_u64()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "auto".into());
+        let replicas = e["replicas"].as_u64().unwrap_or(1);
+        println!(
+            "  {}{}  {}:{}",
+            e["service"].as_str().unwrap_or("-"),
+            if replicas > 1 {
+                format!(" ×{replicas}")
+            } else {
+                String::new()
+            },
+            e["bind"].as_str().unwrap_or("127.0.0.1"),
+            port
+        );
+        if let Some(ep) = e["entrypoint"].as_str().filter(|s| !s.is_empty()) {
+            println!("    ingress entrypoint: {ep}");
+        }
+        if e["port"].as_u64().is_none() {
+            println!("    host port auto — see `mc2 ssh ls` after reconcile");
+        }
+    }
 }
 
 /// Tear down a stack (instances + definition); named volumes retained.
@@ -1549,11 +1589,88 @@ async fn resolve_instance_id(op: &OperatorArgs, id_or_ref: &str) -> Result<Strin
         .ok_or_else(|| anyhow::anyhow!("no instance {stack}/{service}/{ordinal}"))
 }
 
-/// Observed fabric status for one instance.
-async fn fabric_cmd(args: FabricArgs) -> Result<()> {
-    let id = resolve_instance_id(&args.op, &args.id).await?;
+/// Server-wide network membership summary. `mc2 network` lists all networks;
+/// `mc2 network <name>` shows one network's instances and their ports;
+/// `mc2 network <stack>/<service>/<ordinal>` shows one instance's observed
+/// network connectivity (exposes/edges).
+async fn network_cmd(args: NetworkArgs) -> Result<()> {
+    // An instance reference (contains `/`) shows observed per-instance connectivity.
+    let Some(target) = args.network.clone() else {
+        return network_summary_cmd(args).await;
+    };
+    if target.contains('/') {
+        return network_instance_cmd(args, &target).await;
+    }
+
+    let url = format!("{}/v1/networks", args.op.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, args.op.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("network", status, &body));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let all = v["networks"].as_array().cloned().unwrap_or_default();
+    let selected: Vec<serde_json::Value> = all
+        .into_iter()
+        .filter(|n| n["name"] == target.as_str())
+        .collect();
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&selected)?);
+        return Ok(());
+    }
+    let Some(net) = selected.first() else {
+        let known: Vec<String> = v["networks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n["name"].as_str().map(str::to_string))
+            .collect();
+        bail!(
+            "network {target:?} not found (known networks: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        );
+    };
+    print_network_detail(net);
+    Ok(())
+}
+
+/// `mc2 network` with no argument: table of every network.
+async fn network_summary_cmd(args: NetworkArgs) -> Result<()> {
+    let url = format!("{}/v1/networks", args.op.api.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, args.op.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(api_error("network", status, &body));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let all = v["networks"].as_array().cloned().unwrap_or_default();
+    if matches!(args.output, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&all)?);
+        return Ok(());
+    }
+    print_network_summary(&all);
+    Ok(())
+}
+
+/// `mc2 network <stack>/<service>/<ordinal>`: observed connectivity for one instance.
+async fn network_instance_cmd(args: NetworkArgs, target: &str) -> Result<()> {
+    let id = resolve_instance_id(&args.op, target).await?;
     let url = format!(
-        "{}/v1/instances/{}/fabric",
+        "{}/v1/instances/{}/network",
         args.op.api.trim_end_matches('/'),
         urlencoding_simple(&id)
     );
@@ -1565,7 +1682,7 @@ async fn fabric_cmd(args: FabricArgs) -> Result<()> {
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(api_error("fabric", status, &body));
+        return Err(api_error("network", status, &body));
     }
     if matches!(args.output, OutputFormat::Json) {
         println!("{body}");
@@ -1573,7 +1690,7 @@ async fn fabric_cmd(args: FabricArgs) -> Result<()> {
     }
     let v: serde_json::Value = serde_json::from_str(&body)?;
     println!(
-        "instance {} — fabric {}",
+        "instance {} — network {}",
         v["instanceId"].as_str().unwrap_or("-"),
         v["phase"].as_str().unwrap_or("-")
     );
@@ -1601,6 +1718,110 @@ async fn fabric_cmd(args: FabricArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// (stacks, services, instances, active) for a network view value.
+fn network_counts(n: &serde_json::Value) -> (usize, usize, usize, usize) {
+    use std::collections::BTreeSet;
+    let mut stacks: BTreeSet<String> = BTreeSet::new();
+    let mut services: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut active = 0usize;
+    for i in n["instances"].as_array().into_iter().flatten() {
+        stacks.insert(i["stack"].as_str().unwrap_or("").to_string());
+        services.insert((
+            i["stack"].as_str().unwrap_or("").to_string(),
+            i["service"].as_str().unwrap_or("").to_string(),
+        ));
+        if i["phase"] == "Running" {
+            active += 1;
+        }
+    }
+    (
+        stacks.len(),
+        services.len(),
+        n["instances"].as_array().map(|a| a.len()).unwrap_or(0),
+        active,
+    )
+}
+
+fn print_network_summary(nets: &[serde_json::Value]) {
+    if nets.is_empty() {
+        println!("No networks.");
+        return;
+    }
+    println!(
+        "{:<16} {:<8} {:<7} {:<9} {:<10} {:<6}",
+        "NETWORK", "KIND", "STACKS", "SERVICES", "INSTANCES", "ACTIVE"
+    );
+    for n in nets {
+        let (stacks, services, instances, active) = network_counts(n);
+        println!(
+            "{:<16} {:<8} {:<7} {:<9} {:<10} {:<6}",
+            n["name"].as_str().unwrap_or("-"),
+            n["kind"].as_str().unwrap_or("-"),
+            stacks,
+            services,
+            instances,
+            active
+        );
+    }
+}
+
+fn print_network_detail(n: &serde_json::Value) {
+    let (stacks, services, instances, active) = network_counts(n);
+    let plural = |x: usize| if x == 1 { "" } else { "s" };
+    println!(
+        "network '{}' ({}) — {} stack{}, {} service{}, {} instance{} ({} active)",
+        n["name"].as_str().unwrap_or("-"),
+        n["kind"].as_str().unwrap_or("-"),
+        stacks,
+        plural(stacks),
+        services,
+        plural(services),
+        instances,
+        plural(instances),
+        active
+    );
+    for i in n["instances"].as_array().into_iter().flatten() {
+        let expose: Vec<String> = i["exposePorts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_u64())
+            .map(|p| p.to_string())
+            .collect();
+        let ports: Vec<String> = i["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| {
+                format!(
+                    "{}->{}",
+                    p["published"].as_u64().unwrap_or(0),
+                    p["target"].as_u64().unwrap_or(0)
+                )
+            })
+            .collect();
+        let health = if i["healthy"].as_bool().unwrap_or(false) {
+            "  healthy"
+        } else {
+            ""
+        };
+        println!(
+            "  {}/{}  {}  {}{}",
+            i["stack"].as_str().unwrap_or("-"),
+            i["service"].as_str().unwrap_or("-"),
+            i["ordinal"].as_u64().unwrap_or(0),
+            i["phase"].as_str().unwrap_or("-"),
+            health
+        );
+        if !expose.is_empty() {
+            println!("      expose: {}", expose.join(", "));
+        }
+        if !ports.is_empty() {
+            println!("      host ports: {}", ports.join(", "));
+        }
+    }
 }
 
 /// Desired ingress routes.
@@ -1734,13 +1955,13 @@ mod tests {
     #[test]
     fn api_error_prefers_server_error_field() {
         let e = api_error(
-            "fabric",
+            "network",
             reqwest::StatusCode::NOT_FOUND,
-            r#"{"error":"no fabric status"}"#,
+            r#"{"error":"no network status"}"#,
         );
         assert_eq!(
             e.to_string(),
-            "fabric failed: 404 Not Found: no fabric status"
+            "network failed: 404 Not Found: no network status"
         );
     }
 

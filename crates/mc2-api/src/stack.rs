@@ -151,10 +151,11 @@ pub struct ServiceSpec {
     /// Soft placement by node labels.
     #[serde(default)]
     pub node_selector: BTreeMap<String, String>,
-    /// Host-side msb SSH serve (not guest sshd). Optional.
-    #[serde(default)]
+    /// Host-side msb SSH serve (not guest sshd). Optional; `true` = defaults
+    /// (auth from every registered key).
+    #[serde(default, deserialize_with = "de_ssh")]
     pub ssh: Option<SshSpec>,
-    /// Cluster-internal listeners (loopback publish; not LAN). D13 fabric.
+    /// Cluster-internal listeners (loopback publish; not LAN). D13 network.
     #[serde(default, deserialize_with = "de_expose")]
     pub expose: Vec<ExposeSpec>,
     /// Server-wide network membership (default-allow). Absent → the stack's
@@ -163,7 +164,7 @@ pub struct ServiceSpec {
     pub networks: Vec<String>,
 }
 
-/// Internal service listener (fabric `expose`). Compose list form
+/// Internal service listener (network `expose`). Compose list form
 /// (`[5432]` / `["5432"]`) and map form (`{port, protocol, name}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -215,6 +216,8 @@ where
 }
 
 /// Desired host-side SSH front end for a service (msb `ssh` feature).
+/// Accepts the short boolean form (`ssh: true` → enabled, all defaults, auth
+/// from every registered cluster key) or the long map form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SshSpec {
@@ -229,9 +232,34 @@ pub struct SshSpec {
     pub user: String,
     #[serde(default = "default_true")]
     pub sftp: bool,
-    /// Cluster key names (`mc2 ssh-key` / `/v1/ssh/keys`).
+    /// Cluster key names (`mc2 ssh key add …`). Empty → every registered key.
     #[serde(default)]
     pub authorized_keys: Vec<String>,
+}
+
+/// Accept `ssh` as a boolean flag (`true`/`false`) or the long map form.
+fn de_ssh<'de, D>(d: D) -> Result<Option<SshSpec>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Bool(bool),
+        Spec(SshSpec),
+    }
+    Ok(match Option::<Entry>::deserialize(d)? {
+        Some(Entry::Spec(s)) => Some(s),
+        Some(Entry::Bool(enabled)) => Some(SshSpec {
+            enabled,
+            bind: default_ssh_bind(),
+            port: 0,
+            user: default_ssh_user(),
+            sftp: default_true(),
+            authorized_keys: vec![],
+        }),
+        None => None,
+    })
 }
 
 fn default_ssh_bind() -> String {
@@ -822,7 +850,7 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
         }
     }
 
-    // Shared fabric splices bind one host loopback port per exposed guest port,
+    // Shared network splices bind one host loopback port per exposed guest port,
     // so exposed ports must be unique across the whole stack.
     {
         let mut stack_expose_ports = std::collections::BTreeSet::new();
@@ -831,7 +859,7 @@ fn validate_stack(doc: &StackDocument) -> Result<(), String> {
                 if !stack_expose_ports.insert(ex.port) {
                     return Err(format!(
                         "expose port {} is used by multiple services in this stack \
-                         (fabric ports must be unique across the stack)",
+                         (network ports must be unique across the stack)",
                         ex.port
                     ));
                 }
@@ -1043,12 +1071,12 @@ fn validate_ingress(doc: &StackDocument, ing: &IngressSpec) -> Result<(), String
     Ok(())
 }
 
-/// Fabric FQDN on the stack's default network: `<service>.<stack>.svc.mc2`.
-pub fn fabric_fqdn(stack: &str, service: &str) -> String {
+/// Default-network FQDN on the stack's default network: `<service>.<stack>.svc.mc2`.
+pub fn default_network_fqdn(stack: &str, service: &str) -> String {
     format!("{service}.{stack}.svc.mc2")
 }
 
-/// Fabric FQDN on a named network: `<service>.<network>.svc.mc2`.
+/// Network FQDN on a named network: `<service>.<network>.svc.mc2`.
 pub fn network_fqdn(network: &str, service: &str) -> String {
     format!("{service}.{network}.svc.mc2")
 }
@@ -1242,8 +1270,8 @@ services:
     }
 
     #[test]
-    fn fabric_expose_without_allow_parses() {
-        // Full-mesh fabric: no allow field needed; expose is the reachability gate.
+    fn network_expose_without_allow_parses() {
+        // Full-mesh network: no allow field needed; expose is the reachability gate.
         let yaml = r#"
 name: shop
 networks:
@@ -1261,7 +1289,7 @@ services:
 "#;
         let doc = parse_stack_yaml(yaml).unwrap();
         assert_eq!(doc.services["db"].expose[0].port, 5432);
-        assert_eq!(fabric_fqdn("shop", "db"), "db.shop.svc.mc2");
+        assert_eq!(default_network_fqdn("shop", "db"), "db.shop.svc.mc2");
     }
 
     #[test]
@@ -1283,7 +1311,7 @@ services:
     }
 
     #[test]
-    fn fabric_named_network_needs_no_declaration() {
+    fn network_join_needs_no_declaration() {
         // Server-wide networks: joining an undeclared named network is valid.
         let yaml = r#"
 name: shop
@@ -1632,5 +1660,39 @@ services:
 "#;
         let err = parse_stack_yaml(yaml).unwrap_err();
         assert!(err.contains("cycle"), "{err}");
+    }
+
+    #[test]
+    fn ssh_accepts_boolean_and_map() {
+        // Short flag: enabled with defaults.
+        let yaml = r#"
+name: x
+services:
+  a:
+    image: busybox
+    ssh: true
+  b:
+    image: busybox
+    ssh: false
+  c:
+    image: busybox
+    ssh:
+      enabled: true
+      port: 2222
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        let a = doc.services["a"].ssh.as_ref().unwrap();
+        assert!(a.enabled);
+        assert_eq!(a.bind, "127.0.0.1");
+        assert_eq!(a.port, 0);
+        assert_eq!(a.user, "root");
+        assert!(a.sftp);
+        assert!(
+            a.authorized_keys.is_empty(),
+            "flag form → all registered keys"
+        );
+        assert!(!doc.services["b"].ssh.as_ref().unwrap().enabled);
+        let c = doc.services["c"].ssh.as_ref().unwrap();
+        assert_eq!(c.port, 2222);
     }
 }

@@ -4,13 +4,13 @@
 //! Replaces the former `mc2-agent` gRPC client/server pair with direct calls.
 
 use crate::desired::build_desired_set;
-use crate::fabric_serve::FabricTable;
 use crate::ingress_files::{warn_ingress_dir_unset, IngressFileWriter, SelfIngressRoute};
+use crate::network_serve::NetworkTable;
 use crate::ssh_serve::SshServeTable;
 use anyhow::{Context, Result};
 use mc2_api::HealthcheckSpec;
 use mc2_runtime::{
-    backoff_secs, desired_recreate_hash, FabricObserved, InstanceReport, NodeRuntime,
+    backoff_secs, desired_recreate_hash, InstanceReport, NetworkObserved, NodeRuntime,
     RestartPolicy, SandboxPhase,
 };
 use mc2_store::{NodeHeartbeat, SecretsKey, Store};
@@ -107,7 +107,7 @@ pub async fn run(
     let mut owned: HashSet<String> = HashSet::new();
     let mut rt_state: HashMap<String, InstanceRuntimeState> = HashMap::new();
     let mut ssh_table = SshServeTable::new();
-    let mut fabric_table = FabricTable::new();
+    let mut network_table = NetworkTable::new();
     let mut ingress_writer = cfg
         .ingress_config_dir
         .clone()
@@ -140,7 +140,7 @@ pub async fn run(
                     &mut owned,
                     &mut rt_state,
                     &mut ssh_table,
-                    &mut fabric_table,
+                    &mut network_table,
                     ingress_writer.as_mut(),
                     self_route.as_ref(),
                 )
@@ -169,7 +169,7 @@ async fn reconcile(
     owned: &mut HashSet<String>,
     rt_state: &mut HashMap<String, InstanceRuntimeState>,
     ssh_table: &mut SshServeTable,
-    fabric_table: &mut FabricTable,
+    network_table: &mut NetworkTable,
     ingress_writer: Option<&mut IngressFileWriter>,
     self_route: Option<&SelfIngressRoute>,
 ) -> Result<()> {
@@ -193,8 +193,8 @@ async fn reconcile(
 
     // Providers first so expose publish index is populated before client edges.
     desired.sort_by(|a, b| {
-        let ae = a.fabric.exposes.is_empty();
-        let be = b.fabric.exposes.is_empty();
+        let ae = a.network.exposes.is_empty();
+        let be = b.network.exposes.is_empty();
         ae.cmp(&be) // false (has expose) sorts before true
             .then_with(|| a.service.cmp(&b.service))
     });
@@ -230,7 +230,7 @@ async fn reconcile(
                     message: format!("depends_on: waiting for {waiting}"),
                     runtime_id: d.runtime_id.clone(),
                     ssh: None,
-                    fabric: None,
+                    network: None,
                 });
                 continue;
             }
@@ -240,7 +240,7 @@ async fn reconcile(
         if let Some(next) = state.next_restart_ok {
             if now < next {
                 let ssh = ssh_table.reconcile(d, false).await;
-                let fabric = fabric_table.reconcile_not_running(d).await;
+                let network = network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Creating".into(),
@@ -250,30 +250,30 @@ async fn reconcile(
                     ),
                     runtime_id: d.runtime_id.clone(),
                     ssh: Some(ssh),
-                    fabric: Some(fabric),
+                    network: Some(network),
                 });
                 apply_live(&mut live, d, "Creating", false);
                 continue;
             }
         }
 
-        if let Err(e) = fabric_table.prepare_exposes(d).await {
-            warn!(instance_id = %d.instance_id, error = %e, "fabric prepare_exposes failed");
+        if let Err(e) = network_table.prepare_exposes(d).await {
+            warn!(instance_id = %d.instance_id, error = %e, "network prepare_exposes failed");
             let ssh = ssh_table.reconcile(d, false).await;
-            let fabric = fabric_table.reconcile_not_running(d).await;
+            let network = network_table.reconcile_not_running(d).await;
             reports.push(InstanceReport {
                 instance_id: d.instance_id.clone(),
                 phase: "Failed".into(),
                 message: e,
                 runtime_id: d.runtime_id.clone(),
                 ssh: Some(ssh),
-                fabric: Some(fabric),
+                network: Some(network),
             });
             apply_live(&mut live, d, "Failed", false);
             continue;
         }
 
-        // Recreate when create-time config changes (image, command, ports, fabric…).
+        // Recreate when create-time config changes (image, command, ports, network…).
         let want_hash = desired_recreate_hash(d);
         let mut force_recreate = false;
         if let Some(prev) = state.spec_hash.as_ref() {
@@ -288,22 +288,22 @@ async fn reconcile(
         // Expose host ports are only bound at msb create. If we inherited a
         // Running sandbox without live publish (server restart / orphan), recreate.
         if !force_recreate {
-            if let Some(ports) = fabric_table.expose_host_ports(&d.instance_id) {
+            if let Some(ports) = network_table.expose_host_ports(&d.instance_id) {
                 if !ports.is_empty() && !host_ports_accepting(&ports).await {
                     force_recreate = true;
                     info!(
                         runtime_id = %d.runtime_id,
                         ?ports,
-                        "fabric expose host ports not live; recreating sandbox"
+                        "network expose host ports not live; recreating sandbox"
                     );
                 }
             }
         }
         if force_recreate {
-            fabric_table.drop_instance(&d.instance_id).await;
+            network_table.drop_instance(&d.instance_id).await;
             // Re-prepare after drop so publish_index stays correct for this cycle.
-            if let Err(e) = fabric_table.prepare_exposes(d).await {
-                warn!(instance_id = %d.instance_id, error = %e, "fabric re-prepare after drop");
+            if let Err(e) = network_table.prepare_exposes(d).await {
+                warn!(instance_id = %d.instance_id, error = %e, "network re-prepare after drop");
             }
             if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
                 warn!(runtime_id = %d.runtime_id, error = %e, "remove before recreate");
@@ -445,19 +445,19 @@ async fn reconcile(
                 };
                 let running = st.phase == SandboxPhase::Running;
                 let ssh = ssh_table.reconcile(d, running).await;
-                let fabric = if running {
-                    fabric_table.reconcile_running(d).await
+                let network = if running {
+                    network_table.reconcile_running(d).await
                 } else {
-                    fabric_table.reconcile_not_running(d).await
+                    network_table.reconcile_not_running(d).await
                 };
                 let mut message = st.message.unwrap_or_default();
-                if !fabric.message.is_empty() {
+                if !network.message.is_empty() {
                     if !message.is_empty() {
                         message.push_str("; ");
                     }
-                    message.push_str(&fabric.message);
+                    message.push_str(&network.message);
                 }
-                for e in &fabric.edges {
+                for e in &network.edges {
                     if e.phase == "Failed" {
                         if !message.is_empty() {
                             message.push_str("; ");
@@ -477,7 +477,7 @@ async fn reconcile(
                     message,
                     runtime_id: st.runtime_id,
                     ssh: Some(ssh),
-                    fabric: Some(fabric),
+                    network: Some(network),
                 });
                 apply_live(&mut live, d, phase, state.health_ok);
             }
@@ -496,14 +496,14 @@ async fn reconcile(
                     state.running_since = None;
                 }
                 let ssh = ssh_table.reconcile(d, false).await;
-                let fabric = fabric_table.reconcile_not_running(d).await;
+                let network = network_table.reconcile_not_running(d).await;
                 reports.push(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: "Failed".into(),
                     message: format!("{e:#}"),
                     runtime_id: d.runtime_id.clone(),
                     ssh: Some(ssh),
-                    fabric: Some(fabric),
+                    network: Some(network),
                 });
                 apply_live(&mut live, d, "Failed", false);
             }
@@ -512,11 +512,11 @@ async fn reconcile(
 
     let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
     ssh_table.close_missing(&keep_ids).await;
-    // Rebuild shared fabric splices from the current desired set + observed phases.
-    fabric_table
+    // Rebuild shared network splices from the current desired set + observed phases.
+    network_table
         .reconcile_splices(desired.as_slice(), &reports)
         .await;
-    fabric_table.close_missing(&keep_ids).await;
+    network_table.close_missing(&keep_ids).await;
 
     // Ingress file catalog (same-node BYO Traefik).
     let mut phases: HashMap<String, String> = HashMap::new();
@@ -585,16 +585,16 @@ async fn reconcile(
                 .await;
         }
 
-        if let Some(ref fabric) = r.fabric {
-            let phase = fabric_summary_phase(fabric);
-            let json = fabric_observed_json(fabric);
-            let msg = if fabric.message.is_empty() {
+        if let Some(ref network) = r.network {
+            let phase = network_summary_phase(network);
+            let json = network_observed_json(network);
+            let msg = if network.message.is_empty() {
                 None
             } else {
-                Some(fabric.message.as_str())
+                Some(network.message.as_str())
             };
             let _ = store
-                .update_instance_fabric_observed(&r.instance_id, &phase, &json, msg)
+                .update_instance_network_observed(&r.instance_id, &phase, &json, msg)
                 .await;
         }
     }
@@ -715,11 +715,11 @@ async fn host_ports_accepting(ports: &[u16]) -> bool {
     true
 }
 
-fn fabric_observed_json(f: &FabricObserved) -> String {
+fn network_observed_json(f: &NetworkObserved) -> String {
     serde_json::to_string(f).unwrap_or_else(|_| "{}".into())
 }
 
-fn fabric_summary_phase(f: &FabricObserved) -> String {
+fn network_summary_phase(f: &NetworkObserved) -> String {
     let mut has_ready = false;
     let mut has_failed = false;
     let mut has_pending = false;
@@ -786,7 +786,7 @@ mod tests {
             },
             secrets: vec![],
             ssh: Default::default(),
-            fabric: Default::default(),
+            network: Default::default(),
         }
     }
 

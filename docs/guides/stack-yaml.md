@@ -127,7 +127,7 @@ ingress:                         # BYO Traefik via server file export
 | `volumes` | no | `[]` | Mounts of declared stack volumes. |
 | `healthcheck` | no | none | Exec health probe. |
 | `ssh` | no | disabled | Host-side msb SSH front end. |
-| `expose` | no | `[]` | Fabric listeners (east-west; default-allow on shared networks). |
+| `expose` | no | `[]` | Network listeners (east-west; default-allow on shared networks). |
 | `networks` | no | `[]` | Server-wide network membership (default = stack). |
 | `nodeName` | no | — | Hard pin to a node name. |
 | `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
@@ -136,7 +136,7 @@ ingress:                         # BYO Traefik via server file export
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Fabric reachable ports are always allowed via narrow rules regardless of profile. |
+| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Network reachable ports are always allowed via narrow rules regardless of profile. |
 
 ### `ports[]`
 
@@ -163,7 +163,7 @@ Long form: `{ target: 3001, published: 5000, protocol: tcp, hostname: "mcp.examp
 | `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
 | `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). |
 
-### `expose[]` (fabric listeners)
+### `expose[]` (network listeners)
 
 Compose list form or map form:
 
@@ -276,6 +276,10 @@ re-applies. Ingress routes for a scaled service target replica 0's port.
 
 ### `ssh`
 
+Host-side microsandbox SSH front end (not guest sshd). Accepts a short boolean
+form — `ssh: true` (all defaults, authenticated by **every registered key**) —
+or the long map form:
+
 | Key | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Turns on the host-side microsandbox SSH server. |
@@ -283,7 +287,10 @@ re-applies. Ingress routes for a scaled service target replica 0's port.
 | `port` | `0` | Agent backend port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
 | `user` | `root` | SSH username presented to the SDK. |
 | `sftp` | `true` | Enable SFTP on the session. |
-| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh key add`). |
+| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh key add`). Empty → **all registered keys** authenticate. |
+
+`mc2 up` prints the declared SSH ports and any `ingress.tcp` entrypoint per
+service (auto ports resolve on first reconcile — see `mc2 ssh ls`).
 
 ## `volumes` (top-level)
 

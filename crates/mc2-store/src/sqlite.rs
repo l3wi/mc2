@@ -2,7 +2,7 @@
 
 use crate::{
     ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
-    InstanceFabricRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord,
+    InstanceNetworkRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord,
     SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
@@ -448,7 +448,7 @@ impl Store for SqliteStore {
 
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
         // Instances first (no FK from instances→stacks); cascades to
-        // instance_ssh / instance_fabric. services cascade via stacks.
+        // instance_ssh / instance_network. services cascade via stacks.
         sqlx::query("DELETE FROM instances WHERE stack = ?1")
             .bind(name)
             .execute(&self.pool)
@@ -999,19 +999,19 @@ impl Store for SqliteStore {
         Ok(rows.iter().map(Self::map_instance_ssh).collect())
     }
 
-    async fn update_instance_fabric_observed(
+    async fn update_instance_network_observed(
         &self,
         instance_id: &str,
         phase: &str,
         observed_json: &str,
         message: Option<&str>,
-    ) -> Result<InstanceFabricRecord, StoreError> {
+    ) -> Result<InstanceNetworkRecord, StoreError> {
         if self.get_instance(instance_id).await?.is_none() {
             return Err(StoreError::NotFound(instance_id.into()));
         }
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            r#"INSERT INTO instance_fabric (instance_id, phase, observed_json, message, updated_at)
+            r#"INSERT INTO instance_network (instance_id, phase, observed_json, message, updated_at)
                VALUES (?1, ?2, ?3, ?4, ?5)
                ON CONFLICT(instance_id) DO UPDATE SET
                  phase = excluded.phase,
@@ -1027,24 +1027,24 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
-        self.get_instance_fabric(instance_id)
+        self.get_instance_network(instance_id)
             .await?
             .ok_or_else(|| StoreError::NotFound(instance_id.into()))
     }
 
-    async fn get_instance_fabric(
+    async fn get_instance_network(
         &self,
         instance_id: &str,
-    ) -> Result<Option<InstanceFabricRecord>, StoreError> {
+    ) -> Result<Option<InstanceNetworkRecord>, StoreError> {
         let row = sqlx::query(
             r#"SELECT instance_id, phase, observed_json, message, updated_at
-               FROM instance_fabric WHERE instance_id = ?"#,
+               FROM instance_network WHERE instance_id = ?"#,
         )
         .bind(instance_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
-        Ok(row.map(|r| InstanceFabricRecord {
+        Ok(row.map(|r| InstanceNetworkRecord {
             instance_id: r.get("instance_id"),
             phase: r.get("phase"),
             observed_json: r.get("observed_json"),
@@ -1053,16 +1053,16 @@ impl Store for SqliteStore {
         }))
     }
 
-    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError> {
+    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT instance_id, phase, observed_json, message, updated_at FROM instance_fabric"#,
+            r#"SELECT instance_id, phase, observed_json, message, updated_at FROM instance_network"#,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
         Ok(rows
             .iter()
-            .map(|r| InstanceFabricRecord {
+            .map(|r| InstanceNetworkRecord {
                 instance_id: r.get("instance_id"),
                 phase: r.get("phase"),
                 observed_json: r.get("observed_json"),

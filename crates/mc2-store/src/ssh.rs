@@ -57,10 +57,10 @@ impl Default for InstanceSshRecord {
     }
 }
 
-/// Agent-reported fabric observed snapshot for one instance.
+/// Agent-reported network observed snapshot for one instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InstanceFabricRecord {
+pub struct InstanceNetworkRecord {
     pub instance_id: String,
     /// Pending | Ready | Failed | Mixed
     pub phase: String,

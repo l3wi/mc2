@@ -1,0 +1,49 @@
+# Same-node mediated networks (D13): echo server + client via echo.smoke-networks.svc.mc2 DNS.
+#
+#   mc2 up -f examples/03-networks/stack.yaml
+#   mc2 network                 # all networks (default + named) + members
+#   mc2 network smoke-networks  # this network's instances and ports
+#
+# After both Running: from the `client` sandbox,
+#   wget -qO- http://echo.smoke-networks.svc.mc2:8080/
+# should hit the `echo` service through the server's L4 splice.
+#
+# Full-mesh within a shared network: `echo` exposes port 8080, so `client`
+# reaches it by default (Docker-style default allow) — no allow edges needed.
+name: smoke-networks
+
+networks:
+  backend:
+    mode: mediated
+
+services:
+  echo:
+    # python image: alpine micro rootfs may lack busybox httpd applet.
+    image: python:3.12-alpine
+    scale: 1
+    cpus: 1
+    mem_limit: 256m
+    network:
+      profiles: [public]
+    expose:
+      - port: 8080
+        protocol: tcp
+    command:
+      - /bin/sh
+      - -c
+      - "mkdir -p /tmp/www && printf 'NETWORK_OK\\n' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"
+    restart: always
+    labels:
+      app: smoke-networks-echo
+
+  client:
+    image: alpine:3.20
+    scale: 1
+    cpus: 1
+    mem_limit: 128m
+    network:
+      profiles: [public]
+    command: ["sleep", "infinity"]
+    restart: always
+    labels:
+      app: smoke-networks-client

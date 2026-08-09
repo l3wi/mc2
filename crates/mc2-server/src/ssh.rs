@@ -62,9 +62,25 @@ pub async fn resolve_ssh_desired(
         return Ok(DesiredSsh::default());
     }
 
-    if key_names.is_empty() {
-        anyhow::bail!("ssh enabled but authorizedKeys is empty");
-    }
+    // Empty `authorizedKeys` → every registered cluster key (the short
+    // `ssh: true` form). Still fails closed when none are registered.
+    let key_names = if key_names.is_empty() {
+        let all = store
+            .list_ssh_keys()
+            .await
+            .context("list ssh keys")?
+            .into_iter()
+            .map(|k| k.name)
+            .collect::<Vec<_>>();
+        if all.is_empty() {
+            anyhow::bail!(
+                "ssh enabled but no keys registered — run `mc2 ssh key add NAME --file <pubkey>`"
+            );
+        }
+        all
+    } else {
+        key_names
+    };
 
     let mut public_keys = Vec::with_capacity(key_names.len());
     for name in &key_names {
@@ -128,5 +144,72 @@ pub fn desired_from_put(
         port: None,
         message: None,
         updated_at: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mc2_store::MemoryStore;
+
+    const FAKE_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJustAFakeKeyMaterialHere0000 test@mc2";
+
+    fn enabled_spec() -> SshSpec {
+        SshSpec {
+            enabled: true,
+            bind: "127.0.0.1".into(),
+            port: 0,
+            user: "root".into(),
+            sftp: true,
+            authorized_keys: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_authorized_keys_uses_all_registered() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.put_ssh_key("dev", FAKE_KEY).await.unwrap();
+        store
+            .put_ssh_key("ci", &FAKE_KEY.replacen("test@mc2", "ci@mc2", 1))
+            .await
+            .unwrap();
+
+        let d = resolve_ssh_desired(store.clone(), "i1", Some(&enabled_spec()))
+            .await
+            .unwrap();
+        assert!(d.enabled);
+        assert_eq!(d.authorized_public_keys.len(), 2, "all registered keys");
+        assert!(!d.config_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_authorized_keys_win() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store.put_ssh_key("dev", FAKE_KEY).await.unwrap();
+        store
+            .put_ssh_key("ci", &FAKE_KEY.replacen("test@mc2", "ci@mc2", 1))
+            .await
+            .unwrap();
+        let mut spec = enabled_spec();
+        spec.authorized_keys = vec!["dev".into()];
+
+        let d = resolve_ssh_desired(store.clone(), "i1", Some(&spec))
+            .await
+            .unwrap();
+        assert_eq!(d.authorized_public_keys.len(), 1);
+        assert_eq!(d.authorized_public_keys[0], FAKE_KEY);
+    }
+
+    #[tokio::test]
+    async fn ssh_enabled_with_no_keys_fails_closed() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        let err = resolve_ssh_desired(store.clone(), "i1", Some(&enabled_spec()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no keys registered"), "{err}");
     }
 }

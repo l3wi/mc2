@@ -12,10 +12,10 @@ mod spec_hash;
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::{sandbox_name, volume_mount_plan, volume_name};
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
-pub mod fabric;
-pub use fabric::{
-    fabric_expose_guest_ports, fabric_host_allow_ports, DesiredFabric, FabricAllowDesired,
-    FabricEdgeStatus, FabricExposeDesired, FabricExposeStatus, FabricObserved,
+pub mod networks;
+pub use networks::{
+    network_expose_guest_ports, network_host_allow_ports, DesiredNetwork, NetworkAllowDesired,
+    NetworkEdgeStatus, NetworkExposeDesired, NetworkExposeStatus, NetworkObserved,
 };
 pub mod ingress {
     pub use crate::ingress_render::*;

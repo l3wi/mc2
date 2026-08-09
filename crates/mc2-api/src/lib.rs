@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod stack;
 pub use stack::{
-    fabric_fqdn, is_loopback_bind, make_ingress_route_id, network_fqdn, normalize_ingress_path,
-    parse_stack_yaml, split_command_string, DependsOnSpec, ExposeSpec, HealthcheckSpec,
-    IngressPath, IngressRule, IngressSpec, IngressTlsSpec, NetworkSpec, PortSpec, SecretRef,
-    ServiceSpec, SshSpec, StackDocument, StackNetworkSpec, VolumeMount, VolumeSpec,
+    default_network_fqdn, is_loopback_bind, make_ingress_route_id, network_fqdn,
+    normalize_ingress_path, parse_stack_yaml, split_command_string, DependsOnSpec, ExposeSpec,
+    HealthcheckSpec, IngressPath, IngressRule, IngressSpec, IngressTlsSpec, NetworkSpec, PortSpec,
+    SecretRef, ServiceSpec, SshSpec, StackDocument, StackNetworkSpec, VolumeMount, VolumeSpec,
 };
 
 /// Stack / API schema version string used in YAML `apiVersion`.

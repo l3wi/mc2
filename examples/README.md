@@ -25,21 +25,23 @@ Defaults applied by the CLI when fields are absent:
 | `services.<svc>.restart` | `no` |
 | `services.<svc>.network.profiles` | `public` |
 | `services.<svc>.command` | `sleep infinity` (keeps the VM alive) |
+| `services.<svc>.environment` | `{}` (map or `KEY=VALUE` list) |
+| `services.<svc>.depends_on` | `{}` |
 | `services.<svc>.healthcheck` | none |
 
 Volumes still require an explicit top-level declaration and absolute `target`
 paths. The parser is canonical — unknown keys (including the old k8s-style
 `apiVersion`/`kind`/`metadata`, `replicas`, `resources`, `restartPolicy`,
-`health`, `mount`) are rejected loudly rather than silently ignored. Note that
-filling re-serializes the document, so YAML comments in partial files are
-dropped; complete files pass through verbatim. Full key reference:
+`health`, `mount`, and `env`) are rejected loudly rather than silently ignored.
+Note that filling re-serializes the document, so YAML comments in partial files
+are dropped; complete files pass through verbatim. Full key reference:
 [stack.yaml guide](../docs/guides/stack-yaml.md).
 
 ## Ready-to-use
 
 - [Hello service](./01-hello-service/) — run one HTTP service and verify it with `curl`.
-- [Secrets](./02-secrets/) — inject an encrypted secret with an `allowHosts` policy.
-- [Service fabric](./03-service-fabric/) — connect two services with `expose` (full mesh).
+- [Secrets](./02-secrets/) — inject an encrypted secret with an `allowHosts` policy (server-wide store; `environment` overrides collisions). See the [secrets guide](../docs/guides/secrets.md).
+- [Service networks](./03-networks/) — connect two services with `expose` over a shared network (default-allow mesh); `mc2 network` shows members and ports.
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.
 - [Persistent volumes](./06-persistent-volumes/) — mount a node-local named volume that survives sandbox recreate.

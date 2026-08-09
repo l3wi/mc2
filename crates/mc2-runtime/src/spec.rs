@@ -3,7 +3,7 @@
 use mc2_api::ServiceSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::fabric::DesiredFabric;
+use crate::networks::DesiredNetwork;
 
 /// Phase reported to the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,7 +61,7 @@ pub struct DesiredSandbox {
     pub spec: ServiceSpec,
     pub secrets: Vec<InjectedSecret>,
     pub ssh: DesiredSsh,
-    pub fabric: DesiredFabric,
+    pub network: DesiredNetwork,
 }
 
 /// Observed SSH serve state for one instance (reported to the store).
@@ -74,7 +74,7 @@ pub struct SshObserved {
     pub message: String,
 }
 
-/// One instance's reconcile report (phase + observed ssh/fabric).
+/// One instance's reconcile report (phase + observed ssh/network).
 #[derive(Debug, Clone)]
 pub struct InstanceReport {
     pub instance_id: String,
@@ -82,11 +82,11 @@ pub struct InstanceReport {
     pub message: String,
     pub runtime_id: String,
     pub ssh: Option<SshObserved>,
-    pub fabric: Option<FabricObservedReport>,
+    pub network: Option<NetworkObservedReport>,
 }
 
-/// Alias: fabric observed snapshot carried in an [`InstanceReport`].
-pub type FabricObservedReport = crate::fabric::FabricObserved;
+/// Alias: network observed snapshot carried in an [`InstanceReport`].
+pub type NetworkObservedReport = crate::networks::NetworkObserved;
 
 /// Guest command argv for the SDK `background_command` (detached run).
 pub fn start_command_parts(spec: &ServiceSpec) -> Vec<String> {
@@ -166,7 +166,7 @@ mod tests {
                 allow_hosts: vec!["api.example.com".into()],
             }],
             ssh: DesiredSsh::default(),
-            fabric: DesiredFabric::default(),
+            network: DesiredNetwork::default(),
         }
     }
 

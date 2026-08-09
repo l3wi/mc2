@@ -1,5 +1,5 @@
 # Example stack for MicroCommandControl (small alpine image for quick pulls).
-# Apply: mc2 up -f examples/advanced/demo-reference.yaml --token <api-token>
+# Apply: mc2 up -f examples/90-advanced/demo-reference.yaml --token <api-token>
 #
 # alpine's busybox httpd serves files from / (demo page is the filesystem listing).
 name: demo

@@ -3,7 +3,7 @@
 //! Always uses the **local** backend. Host `MSB_API_KEY` / cloud profiles must not
 //! hijack MC2 agent sandboxes.
 
-use crate::fabric::fabric_host_allow_ports;
+use crate::networks::network_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
 use crate::{DesiredSandbox, ExecResult, NodeRuntime, SandboxPhase, SandboxStatus};
@@ -96,14 +96,14 @@ fn network_profiles(desired: &DesiredSandbox) -> Vec<NetworkProfile> {
     out
 }
 
-/// Build msb network policy: base profiles + **narrow** Host TCP ports for fabric
-/// allows. Does **not** add `NetworkProfile::Host` or `Private` for fabric (D13/Q2).
+/// Build msb network policy: base profiles + **narrow** Host TCP ports for network
+/// allows. Does **not** add `NetworkProfile::Host` or `Private` for network (D13/Q2).
 fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
     let profiles = network_profiles(desired);
     let mut policy = NetworkPolicy::from_profiles(profiles);
-    let fabric_ports = fabric_host_allow_ports(&desired.fabric);
+    let network_ports = network_host_allow_ports(&desired.network);
     // Prepend so first-match-wins before broader profile rules.
-    for port in fabric_ports.into_iter().rev() {
+    for port in network_ports.into_iter().rev() {
         policy.rules.insert(
             0,
             Rule {
@@ -115,11 +115,11 @@ fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
             },
         );
     }
-    if !desired.fabric.allows.is_empty() {
+    if !desired.network.allows.is_empty() {
         debug!(
             runtime_id = %desired.runtime_id,
-            allows = desired.fabric.allows.len(),
-            "fabric: installed narrow Host:tcp:port egress rules (not Host profile)"
+            allows = desired.network.allows.len(),
+            "network: installed narrow Host:tcp:port egress rules (not Host profile)"
         );
     }
     policy
@@ -163,7 +163,7 @@ async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) ->
         });
     }
     for p in &desired.spec.ports {
-        // Ports always publish on loopback (fabric/ingress only, BYO Traefik).
+        // Ports always publish on loopback (network/ingress only, BYO Traefik).
         let bind = IpAddr::from([127, 0, 0, 1]);
         if p.protocol.eq_ignore_ascii_case("udp") {
             b = b.port_udp_bind(bind, p.published, p.target);
@@ -441,7 +441,7 @@ mod tests {
             },
             secrets: vec![],
             ssh: Default::default(),
-            fabric: Default::default(),
+            network: Default::default(),
         };
         let p = network_profiles(&d);
         assert!(p.contains(&NetworkProfile::Public));
@@ -449,8 +449,8 @@ mod tests {
     }
 
     #[test]
-    fn fabric_adds_narrow_host_port_not_profile() {
-        use crate::fabric::{DesiredFabric, FabricAllowDesired};
+    fn network_adds_narrow_host_port_not_profile() {
+        use crate::networks::{DesiredNetwork, NetworkAllowDesired};
         let mut d = DesiredSandbox {
             instance_id: "i".into(),
             stack: "shop".into(),
@@ -482,9 +482,9 @@ mod tests {
             },
             secrets: vec![],
             ssh: Default::default(),
-            fabric: DesiredFabric {
+            network: DesiredNetwork {
                 exposes: vec![],
-                allows: vec![FabricAllowDesired {
+                allows: vec![NetworkAllowDesired {
                     to_service: "db".into(),
                     port: 5432,
                     protocol: "tcp".into(),
@@ -507,6 +507,6 @@ mod tests {
                 && matches!(r.destination, Destination::Group(DestinationGroup::Host))
                 && r.ports.iter().any(|p| p.start == 5432 && p.end == 5432)
         }));
-        d.fabric = Default::default();
+        d.network = Default::default();
     }
 }

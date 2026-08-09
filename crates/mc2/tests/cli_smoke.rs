@@ -203,7 +203,7 @@ fn help_lists_parity_commands() {
     let out = mc2().arg("--help").output().expect("run");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["status", "fabric", "ingress", "completions", "ps", "node"] {
+    for cmd in ["status", "network", "ingress", "completions", "ps", "node"] {
         assert!(stdout.contains(cmd), "missing {cmd}: {stdout}");
     }
 }
@@ -232,10 +232,10 @@ fn completions_generate_for_all_shells() {
 }
 
 #[test]
-fn fabric_error_is_unified_api_error() {
+fn network_error_is_unified_api_error() {
     // Server unreachable: connection error, non-zero exit, one-line message.
     let out = mc2()
-        .args(["fabric", "demo/web/0", "--api", "http://127.0.0.1:1"])
+        .args(["network", "demo/web/0", "--api", "http://127.0.0.1:1"])
         .output()
         .expect("run");
     assert!(!out.status.success());
@@ -535,6 +535,26 @@ fn live_server_end_to_end() {
     let ps_out = String::from_utf8_lossy(&ps.stdout);
     assert!(ps_out.contains("smoke"), "ps: {ps_out}");
 
+    // Network summary + per-network detail (implicit default network `smoke`).
+    let net = srv.run(&["network"]);
+    assert!(net.status.success());
+    let net_out = String::from_utf8_lossy(&net.stdout);
+    assert!(net_out.contains("NETWORK"), "network: {net_out}");
+    assert!(net_out.contains("smoke"), "network: {net_out}");
+    let net_detail = srv.run(&["network", "smoke"]);
+    assert!(net_detail.status.success());
+    let detail_out = String::from_utf8_lossy(&net_detail.stdout);
+    assert!(detail_out.contains("smoke"), "detail: {detail_out}");
+    assert!(detail_out.contains("web"), "detail: {detail_out}");
+    // Unknown network name → clean error listing known networks.
+    let missing = srv.run(&["network", "nope"]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("smoke"),
+        "missing: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
     let status = srv.run(&["status"]);
     assert!(status.status.success());
     let status_out = String::from_utf8_lossy(&status.stdout);
@@ -558,6 +578,27 @@ fn live_server_end_to_end() {
         .status
         .success());
     assert!(String::from_utf8_lossy(&srv.run(&["ssh", "key", "ls"]).stdout).contains("dev"));
+
+    // `ssh: true` on a service → `mc2 up` prints the declared SSH front end.
+    let ssh_stack = srv._dir.path().join("ssh.yaml");
+    std::fs::write(
+        &ssh_stack,
+        "name: sshsmoke\nservices:\n  web:\n    image: alpine\n    ssh: true\n",
+    )
+    .unwrap();
+    let up_ssh = srv.run(&["up", "-f", ssh_stack.to_str().unwrap()]);
+    assert!(
+        up_ssh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up_ssh.stderr)
+    );
+    let up_ssh_out = String::from_utf8_lossy(&up_ssh.stdout);
+    assert!(up_ssh_out.contains("ssh:"), "up ssh: {up_ssh_out}");
+    assert!(
+        up_ssh_out.contains("auto"),
+        "up ssh auto port: {up_ssh_out}"
+    );
+    assert!(srv.run(&["down", "sshsmoke"]).status.success());
     assert!(srv.run(&["ssh", "key", "rm", "dev"]).status.success());
 
     // Contexts + mode-aware status JSON (context is client-local, no --api).

@@ -63,7 +63,61 @@ Useful server flags (all also env vars): `--node-name`, `--label KEY=VALUE`,
 ./target/debug/mc2 up -f examples/02-secrets/stack.yaml
 ```
 
-### Service fabric (east–west)
+Secrets are a **server-wide** store: `mc2 secret set` writes once, any stack
+references it by name. Values are encrypted at rest and never echoed back
+(`mc2 secret ls` lists names only). The guest sees a placeholder and the real
+value is attached only on connections to `allowHosts` hosts. See
+[Environment variables vs secrets](./secrets.md) — and note that an explicit
+`environment:` entry overrides a colliding `secrets[].env`.
+
+### Compose vocabulary (environment, healthcheck, depends_on)
+
+The stack schema is Compose-shaped. A two-service example with health-gated
+startup ordering lives in [examples/07-startup-ordering/](../../examples/07-startup-ordering/):
+
+```bash
+./target/debug/mc2 up -f examples/07-startup-ordering/stack.yaml
+./target/debug/mc2 ps
+# web stays "Pending: depends_on: waiting for db (service_healthy)"
+# until the db healthcheck passes, then converges to Running.
+```
+
+The pattern it shows:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    environment:                 # map or KEY=VALUE list; replaces the old env:
+      POSTGRES_PASSWORD: lab
+    healthcheck:                 # interval / timeout / retries / start_period / disable
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  web:
+    image: python:3.12-alpine
+    scale: 3                     # per-replica published ports: 8080, 8081, 8082
+    ports:
+      - "8080:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: 'exec python -m http.server 8000'   # string or list form
+```
+
+Notes:
+
+- `environment:` (not `env:`), `command` string or list, full `healthcheck`
+  field set, and `depends_on` (`service_started` or `service_healthy`) are
+  first-class. Unknown keys are rejected loudly.
+- With `scale > 1` and published ports, each replica gets a distinct host port:
+  fixed `8080` becomes the block `8080, 8081, 8082`; target-only ports get a
+  distinct auto host port. Cross-service host-port conflicts are rejected at
+  apply. Ingress routes for a scaled service target replica 0's port.
+
+### Service networks (east–west)
 
 Compose-like multi-service connectivity without a flat pod network. A service
 declares `expose` (internal listeners); every other service that shares a
@@ -72,16 +126,21 @@ loop's L4 splice + DNS (`svc.<network>.svc.mc2`). Named networks are
 server-wide, so stacks can share one.
 
 ```bash
-./target/debug/mc2 up -f examples/03-service-fabric/stack.yaml
+./target/debug/mc2 up -f examples/03-networks/stack.yaml
 ./target/debug/mc2 ps
-# Fabric status (node-reported):
-curl -s "$MC2_API/v1/instances/<client-instance-id>/fabric" | jq .
+# Network membership (default + named) with member instances and ports:
+./target/debug/mc2 network
+./target/debug/mc2 network smoke-networks
 
 # From the client sandbox (lab helper):
-cargo run -p mc2-runtime --example msb_shell -- smoke-fabric-client-0 \
-  'wget -qO- http://echo.smoke-fabric.svc.mc2:8080/'
-# expect: FABRIC_OK
+cargo run -p mc2-runtime --example msb_shell -- smoke-networks-client-0 \
+  'wget -qO- http://echo.smoke-networks.svc.mc2:8080/'
+# expect: NETWORK_OK
 ```
+
+`mc2 network` shows every network and its member instances; `mc2 network <name>`
+drills into one; `mc2 network <stack>/<service>/<ordinal>` shows one instance's
+observed exposes/edges.
 
 ### Ingress (HTTP via Traefik files)
 
@@ -103,7 +162,7 @@ curl -s http://127.0.0.1:18080/ | head   # direct backend
 
 **Defaults:** default-allow within a shared network (Docker-style); networks
 are server-wide. Exposed guest ports are effectively unique server-wide — the
-second service to claim an already-bound port reports a `Failed` fabric edge.
+second service to claim an already-bound port reports a `Failed` network edge.
 
 ## Auth-enabled install
 
@@ -219,3 +278,4 @@ MC2 exports orchestrator + node metrics (`mc2.server.*`, `mc2.node.*`). Sandbox 
 - [Testing](./testing.md)
 - [Stack YAML reference](./stack-yaml.md)
 - [Environment variables vs secrets](./secrets.md)
+- [examples/07-startup-ordering](../../examples/07-startup-ordering/) — `depends_on` + healthcheck + per-replica ports

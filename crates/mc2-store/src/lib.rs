@@ -17,7 +17,8 @@ pub use memory::MemoryStore;
 pub use node::{NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus};
 pub use sqlite::SqliteStore;
 pub use ssh::{
-    ssh_fingerprint, validate_public_key, InstanceFabricRecord, InstanceSshRecord, SshAuthorizedKey,
+    ssh_fingerprint, validate_public_key, InstanceNetworkRecord, InstanceSshRecord,
+    SshAuthorizedKey,
 };
 pub use token::{hash_token, verify_token};
 
@@ -116,7 +117,7 @@ pub trait Store: Send + Sync {
 
     async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError>;
 
-    /// Delete a stack and its instances (cascades ssh/fabric rows). Returns
+    /// Delete a stack and its instances (cascades ssh/network rows). Returns
     /// false when the stack did not exist.
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError>;
 
@@ -232,19 +233,19 @@ pub trait Store: Send + Sync {
 
     async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError>;
 
-    /// Agent ReportStatus: fabric observed snapshot (JSON).
-    async fn update_instance_fabric_observed(
+    /// Agent ReportStatus: network observed snapshot (JSON).
+    async fn update_instance_network_observed(
         &self,
         instance_id: &str,
         phase: &str,
         observed_json: &str,
         message: Option<&str>,
-    ) -> Result<InstanceFabricRecord, StoreError>;
+    ) -> Result<InstanceNetworkRecord, StoreError>;
 
-    async fn get_instance_fabric(
+    async fn get_instance_network(
         &self,
         instance_id: &str,
-    ) -> Result<Option<InstanceFabricRecord>, StoreError>;
+    ) -> Result<Option<InstanceNetworkRecord>, StoreError>;
 
-    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError>;
+    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError>;
 }

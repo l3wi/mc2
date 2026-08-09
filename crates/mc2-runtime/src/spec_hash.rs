@@ -4,7 +4,7 @@ use crate::DesiredSandbox;
 use sha2::{Digest, Sha256};
 
 /// Hash of fields that cannot be live-updated safely under msb create-time config
-/// (image, command, ports, fabric network policy, resources, env, secrets, labels…).
+/// (image, command, ports, network network policy, resources, env, secrets, labels…).
 pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
     let mut h = Sha256::new();
     h.update(d.runtime_id.as_bytes());
@@ -54,13 +54,13 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
             h.update(host.as_bytes());
         }
     }
-    // Fabric: expose guest ports + allow ports drive publish + Host:port policy at create.
-    for e in &d.fabric.exposes {
+    // Network: expose guest ports + allow ports drive publish + Host:port policy at create.
+    for e in &d.network.exposes {
         h.update(b"ex:");
         h.update(e.guest_port.to_le_bytes());
         h.update(e.protocol.as_bytes());
     }
-    for a in &d.fabric.allows {
+    for a in &d.network.allows {
         h.update(b"al:");
         h.update(a.to_service.as_bytes());
         h.update(a.port.to_le_bytes());
@@ -78,7 +78,7 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fabric::{DesiredFabric, FabricAllowDesired};
+    use crate::networks::{DesiredNetwork, NetworkAllowDesired};
     use mc2_api::ServiceSpec;
     use std::collections::BTreeMap;
 
@@ -112,7 +112,7 @@ mod tests {
             },
             secrets: vec![],
             ssh: Default::default(),
-            fabric: DesiredFabric::default(),
+            network: DesiredNetwork::default(),
         }
     }
 
@@ -124,10 +124,10 @@ mod tests {
     }
 
     #[test]
-    fn hash_changes_with_fabric_allow() {
+    fn hash_changes_with_network_allow() {
         let mut a = bare("alpine:3.20");
         let mut b = bare("alpine:3.20");
-        b.fabric.allows.push(FabricAllowDesired {
+        b.network.allows.push(NetworkAllowDesired {
             to_service: "db".into(),
             port: 5432,
             protocol: "tcp".into(),
@@ -139,7 +139,7 @@ mod tests {
             backend_ordinal: 0,
         });
         assert_ne!(desired_recreate_hash(&a), desired_recreate_hash(&b));
-        a.fabric = b.fabric.clone();
+        a.network = b.network.clone();
         assert_eq!(desired_recreate_hash(&a), desired_recreate_hash(&b));
     }
 

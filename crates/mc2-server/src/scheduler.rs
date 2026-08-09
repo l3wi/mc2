@@ -8,7 +8,7 @@ use std::collections::HashMap;
 ///
 /// `service_load`: count of same-service instances per node_id.
 /// `residual`: residual CPU/memory after existing load.
-/// `all_instances`: full inventory for fabric co-location (allow-target affinity).
+/// `all_instances`: full inventory for network co-location (allow-target affinity).
 pub fn pick_node(
     _instance: &InstanceRecord,
     spec: &ServiceSpec,
@@ -47,14 +47,14 @@ pub fn pick_node(
         return None;
     }
 
-    let fabric_affinity = fabric_affinity_scores(all_instances);
+    let network_affinity = network_affinity_scores(all_instances);
 
-    // Spread: fewest same-service instances; then higher fabric affinity; then name.
+    // Spread: fewest same-service instances; then higher network affinity; then name.
     candidates.sort_by(|a, b| {
         let la = service_load.get(&a.id).copied().unwrap_or(0);
         let lb = service_load.get(&b.id).copied().unwrap_or(0);
-        let fa = fabric_affinity.get(&a.id).copied().unwrap_or(0);
-        let fb = fabric_affinity.get(&b.id).copied().unwrap_or(0);
+        let fa = network_affinity.get(&a.id).copied().unwrap_or(0);
+        let fb = network_affinity.get(&b.id).copied().unwrap_or(0);
         la.cmp(&lb)
             .then_with(|| fb.cmp(&fa))
             .then_with(|| a.name.cmp(&b.name))
@@ -63,12 +63,12 @@ pub fn pick_node(
     candidates.first().map(|n| n.id.clone())
 }
 
-/// Count fabric-peer instances per node (same-node fabric preference).
+/// Count network-peer instances per node (same-node network preference).
 ///
-/// Full-mesh fabric: every service that exposes ports is a peer of every
-/// other service, so co-locate with exposing instances (cross-node fabric
+/// Full-mesh network: every service that exposes ports is a peer of every
+/// other service, so co-locate with exposing instances (cross-node network
 /// splices are unsupported).
-fn fabric_affinity_scores(all_instances: &[InstanceRecord]) -> HashMap<String, u32> {
+fn network_affinity_scores(all_instances: &[InstanceRecord]) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     for inst in all_instances {
         if inst.phase == "Failed" || inst.phase == "Stopped" || inst.phase == "Pending" {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn fabric_affinity_prefers_node_with_exposing_peer() {
+    fn network_affinity_prefers_node_with_exposing_peer() {
         let nodes = vec![node("a", "n1", "{}", 4), node("b", "n2", "{}", 4)];
         let spec = ServiceSpec {
             image: "x".into(),
@@ -341,7 +341,7 @@ mod tests {
             networks: vec![],
             depends_on: BTreeMap::new(),
         };
-        // db exposes a fabric port and lives on node "a" → co-locate with it.
+        // db exposes a network port and lives on node "a" → co-locate with it.
         let mut db_spec = spec.clone();
         db_spec.expose = vec![mc2_api::ExposeSpec {
             port: 5432,

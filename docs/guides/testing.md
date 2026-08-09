@@ -119,6 +119,24 @@ cargo test -p mc2-tests --test volumes
 cargo test -p mc2-api --lib stack
 ```
 
+### Compose parity (environment, healthcheck, depends_on, per-replica ports)
+
+| Path | What it proves |
+| ---- | -------------- |
+| `mc2-api` `stack` | `environment` map/list + old `env:` rejected; `command` string split (quotes/escapes); `healthcheck` timeout/retries/start_period/disable + defaults; `depends_on` list/map, unknown ref, bad condition, `service_healthy` without a healthcheck, cycles |
+| `mc2-server` `apply` | Per-replica host ports: fixed `P` → block `P..P+N-1`, auto ports distinct per replica, stable reuse on re-apply |
+| `mc2-server` `node::tests` | `depends_on` gating (`service_started` vs `service_healthy`, waiting message) + `apply_live` phase tracking |
+| `mc2-server` `secrets` | `environment` overrides colliding `secrets[].env`; exact-name collision only; no collision → all injected |
+| `tests/tests/apply_schedule.rs` | Apply of a scaled multi-service stack → per-replica `spec_json` with distinct ports + `environment`/`depends_on` round trip |
+| Lab | `examples/07-startup-ordering/` — `web` waits on `db (service_healthy)` via real health probes, then Running |
+
+```bash
+cargo test -p mc2-api --lib stack
+cargo test -p mc2-server --lib apply
+cargo test -p mc2-server --lib node::tests
+cargo test -p mc2-server --lib secrets
+```
+
 ---
 
 ## Where to add tests

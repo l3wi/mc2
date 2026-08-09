@@ -15,6 +15,23 @@ pub struct ApplyResult {
     pub instances: u32,
     pub scheduled: u32,
     pub pending: u32,
+    /// SSH front ends declared in the stack (printed by `mc2 up`).
+    #[serde(default)]
+    pub ssh: Vec<ApplySshEndpoint>,
+}
+
+/// One service's declared SSH front end (desired; auto ports resolve on first
+/// reconcile — see `mc2 ssh ls`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplySshEndpoint {
+    pub service: String,
+    pub bind: String,
+    /// Fixed host port; `None` = auto-allocate on reconcile.
+    pub port: Option<u16>,
+    /// Traefik entrypoint from an `ingress.tcp` route, when configured.
+    pub entrypoint: Option<String>,
+    pub replicas: u32,
 }
 
 /// Resolve `ports` with `published: 0` (target-only / hostname sugar) and
@@ -134,12 +151,34 @@ pub async fn apply_stack(
         .context("list pending")?
         .len() as u32;
 
+    let ssh: Vec<ApplySshEndpoint> = doc
+        .services
+        .iter()
+        .filter(|(_, s)| s.ssh.as_ref().is_some_and(|ssh| ssh.enabled))
+        .map(|(name, s)| {
+            let spec = s.ssh.as_ref().expect("filtered enabled");
+            let entrypoint = doc
+                .ingress
+                .as_ref()
+                .and_then(|ing| ing.tcp.iter().find(|r| r.service == *name))
+                .map(|r| r.entry_point.clone());
+            ApplySshEndpoint {
+                service: name.clone(),
+                bind: spec.bind.clone(),
+                port: (spec.port != 0).then_some(spec.port),
+                entrypoint,
+                replicas: s.scale,
+            }
+        })
+        .collect();
+
     info!(
         stack = %doc.name,
         services = doc.services.len(),
         instances = total_instances,
         scheduled,
         pending,
+        ssh = ssh.len(),
         "stack applied"
     );
     mc2_metrics::record_apply();
@@ -151,6 +190,7 @@ pub async fn apply_stack(
         instances: total_instances,
         scheduled,
         pending,
+        ssh,
     })
 }
 
@@ -381,4 +421,41 @@ mod tests {
             ports
         );
     }
+}
+
+#[tokio::test]
+async fn apply_reports_declared_ssh_endpoints() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let yaml = r#"
+name: ssh-demo
+services:
+  web:
+    image: alpine
+    ssh: true
+  admin:
+    image: alpine
+    ssh:
+      enabled: true
+      port: 2222
+      authorizedKeys: [dev]
+  worker:
+    image: alpine
+ingress:
+  tcp:
+    - name: web-ssh
+      entryPoint: ssh
+      service: admin
+"#;
+    let result = apply_stack_yaml(store, yaml).await.unwrap();
+    assert_eq!(result.ssh.len(), 2, "{:?}", result.ssh);
+
+    let web = result.ssh.iter().find(|e| e.service == "web").unwrap();
+    assert_eq!(web.bind, "127.0.0.1");
+    assert!(web.port.is_none(), "short form → auto port");
+    assert!(web.entrypoint.is_none(), "no tcp route for web");
+
+    let admin = result.ssh.iter().find(|e| e.service == "admin").unwrap();
+    assert_eq!(admin.port, Some(2222));
+    assert_eq!(admin.entrypoint.as_deref(), Some("ssh"));
 }

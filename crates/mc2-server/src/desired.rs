@@ -1,20 +1,20 @@
 //! Build the node's desired sandbox set directly from the store.
 
-use crate::fabric::build_fabric_desired;
 use crate::ingress::build_ingress_routes_for_node;
+use crate::networks::build_network_desired;
 use crate::secrets::{filter_secret_refs, resolve_injections};
 use crate::ssh::resolve_ssh_desired;
 use anyhow::{Context, Result};
 use mc2_api::ServiceSpec;
 use mc2_runtime::{
-    sandbox_name, DesiredFabric, DesiredIngressRoute, DesiredSandbox, InjectedSecret,
+    sandbox_name, DesiredIngressRoute, DesiredNetwork, DesiredSandbox, InjectedSecret,
 };
 use mc2_store::{SecretsKey, Store};
 use std::sync::Arc;
 use tracing::warn;
 
 /// Desired set for the local node: every instance bound to `node_id` with
-/// secrets / ssh / fabric resolved, plus the node's ingress route plan.
+/// secrets / ssh / network resolved, plus the node's ingress route plan.
 pub async fn build_desired_set(
     store: Arc<dyn Store>,
     secrets_key: &SecretsKey,
@@ -25,7 +25,7 @@ pub async fn build_desired_set(
         .await
         .context("list instances for node")?;
 
-    // Peers in the same stacks (any node) for fabric backend resolution.
+    // Peers in the same stacks (any node) for network backend resolution.
     let all_instances = store.list_instances().await.context("list instances")?;
 
     let stacks = store.list_stacks().await.context("list stacks")?;
@@ -66,10 +66,10 @@ pub async fn build_desired_set(
             .await
             .with_context(|| format!("resolve ssh for {}", i.id))?;
 
-        let fabric = if spec.expose.is_empty() {
-            DesiredFabric::default()
+        let network = if spec.expose.is_empty() {
+            DesiredNetwork::default()
         } else {
-            build_fabric_desired(&i, &spec, &all_instances)
+            build_network_desired(&i, &spec, &all_instances)
         };
 
         let runtime_id = sandbox_name(&i.stack, &i.service, i.ordinal);
@@ -82,7 +82,7 @@ pub async fn build_desired_set(
             spec,
             secrets,
             ssh,
-            fabric,
+            network,
         });
     }
 

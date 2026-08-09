@@ -42,6 +42,19 @@ ingress:
       service: web
 ```
 
+Without `ingress.tcp` (direct MC2 SSH only) you can use the short form —
+`ssh: true` enables SSH with all defaults and authenticates with **every
+registered key** (`mc2 ssh key add`):
+
+```yaml
+services:
+  web:
+    ssh: true          # auto host port, all registered keys
+```
+
+`mc2 up` prints the declared SSH port and the `ingress.tcp` entrypoint for each
+service (auto ports resolve on first reconcile — check `mc2 ssh ls`).
+
 SSH fields:
 
 - `enabled` — turns the host-side microsandbox SSH server on.

@@ -4,6 +4,30 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Simpler SSH (`ssh: true`) + `mc2 up` prints SSH endpoints
+
+- **`ssh:` accepts a boolean flag**: `ssh: true` enables the host-side SSH
+  front end with all defaults and authenticates with **every registered key**
+  (`mc2 ssh key add …`); the long map form still works and now treats an empty
+  `authorizedKeys` as "all registered keys" (fails closed if none).
+- **`mc2 up` prints declared SSH endpoints** after the apply result: per
+  service the listener `bind:port` (or `auto` until reconcile) and the
+  `ingress.tcp` entrypoint when a TCP route targets the service.
+
+### `mc2 network` + fabric→network rename
+
+- **`mc2 network`** replaces `mc2 fabric` and adds network summaries:
+  - no args → table of every network (default + named) with stacks, services, instance counts.
+  - `mc2 network <name>` → that network's member instances and their expose + host ports.
+  - `mc2 network <stack>/<service>/<ordinal>` → one instance's observed exposes/edges.
+  - Backed by `GET /v1/networks` (membership) and `GET /v1/instances/{id}/network`.
+- **"fabric" is gone from the language**: `DesiredFabric`→`DesiredNetwork`,
+  `FabricTable`→`NetworkTable`, `build_network_desired`, `instance_fabric`
+  table→`instance_network` (migration 008), `/v1/instances/{id}/network`,
+  `mc2 network`; docs/examples updated (`03-service-fabric`→`03-networks`,
+  `smoke-fabric`→`smoke-networks`). The east–west layer is now just
+  "networks": `expose` listeners + default-allow + `svc.<network>.svc.mc2` DNS.
+
 ### Compose parity round 2 — `environment`, string `command`, full `healthcheck`, `depends_on`, per-replica ports
 
 - **`environment:` replaces `env:`** as the guest env key (map or `KEY=VALUE`

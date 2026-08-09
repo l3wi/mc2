@@ -2,7 +2,7 @@
 
 use crate::{
     ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
-    InstanceFabricRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat,
+    InstanceNetworkRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat,
     NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store,
     StoreError,
 };
@@ -24,7 +24,7 @@ struct Inner {
     secrets: HashMap<String, SecretBlob>,
     ssh_keys: HashMap<String, SshAuthorizedKey>,
     instance_ssh: HashMap<String, InstanceSshRecord>,
-    instance_fabric: HashMap<String, InstanceFabricRecord>,
+    instance_network: HashMap<String, InstanceNetworkRecord>,
     settings: HashMap<String, String>,
 }
 
@@ -240,7 +240,7 @@ impl Store for MemoryStore {
         for id in &removed_ids {
             g.instances.remove(id);
             g.instance_ssh.remove(id);
-            g.instance_fabric.remove(id);
+            g.instance_network.remove(id);
         }
         Ok(existed)
     }
@@ -609,47 +609,47 @@ impl Store for MemoryStore {
             .collect())
     }
 
-    async fn update_instance_fabric_observed(
+    async fn update_instance_network_observed(
         &self,
         instance_id: &str,
         phase: &str,
         observed_json: &str,
         message: Option<&str>,
-    ) -> Result<InstanceFabricRecord, StoreError> {
+    ) -> Result<InstanceNetworkRecord, StoreError> {
         let mut g = self.inner.write().await;
         if !g.instances.contains_key(instance_id) {
             return Err(StoreError::NotFound(instance_id.into()));
         }
-        let rec = InstanceFabricRecord {
+        let rec = InstanceNetworkRecord {
             instance_id: instance_id.into(),
             phase: phase.into(),
             observed_json: observed_json.into(),
             message: message.map(str::to_string),
             updated_at: Utc::now().to_rfc3339(),
         };
-        g.instance_fabric.insert(instance_id.into(), rec.clone());
+        g.instance_network.insert(instance_id.into(), rec.clone());
         Ok(rec)
     }
 
-    async fn get_instance_fabric(
+    async fn get_instance_network(
         &self,
         instance_id: &str,
-    ) -> Result<Option<InstanceFabricRecord>, StoreError> {
+    ) -> Result<Option<InstanceNetworkRecord>, StoreError> {
         Ok(self
             .inner
             .read()
             .await
-            .instance_fabric
+            .instance_network
             .get(instance_id)
             .cloned())
     }
 
-    async fn list_instance_fabric(&self) -> Result<Vec<InstanceFabricRecord>, StoreError> {
+    async fn list_instance_network(&self) -> Result<Vec<InstanceNetworkRecord>, StoreError> {
         Ok(self
             .inner
             .read()
             .await
-            .instance_fabric
+            .instance_network
             .values()
             .cloned()
             .collect())
