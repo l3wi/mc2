@@ -12,10 +12,6 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   release:
     name: Tag merged release PR
@@ -23,6 +19,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,12 +30,16 @@ jobs:
       - uses: release-plz/action@v0.5
         with:
           command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
+    # Job-level permissions: creating the release PR needs pull-requests: write.
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
@@ -50,5 +52,3 @@ jobs:
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
