@@ -60,3 +60,9 @@ changelog = true
 # The generated release.yml is hand-tuned (installs libcap-ng-dev for the
 # Linux microsandbox link); allow cargo-dist to accept the drift.
 allow-dirty = ["ci"]
+# cargo-dist release builds use the `dist` profile (release + LTO/strip).
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
