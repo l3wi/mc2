@@ -38,6 +38,10 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   `SshPhase` (Closed/Opening/Open/Failed) now back the observed status
   constructions and comparisons in the node loop, network dataplane, and SSH
   serve layers.
+- **License + advisory gates are blocking.** `cargo deny check` and
+  `cargo audit` are enforced in CI (were non-blocking); the deny/audit config
+  documents the one known exception (RUSTSEC-2023-0071, `rsa` via the embedded
+  microsandbox SDK — no safe upgrade exists).
 
 ### CLI surface cleanup
 

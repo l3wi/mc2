@@ -48,8 +48,8 @@ jobs:
       - name: Build mc2 binary
         run: cargo build -p mc2
 
-  # License + advisory gates. New advisories or unapproved licenses must be
-  # reviewed before tightening these to blocking.
+  # License + advisory gates (blocking). Documented exceptions live in
+  # deny.toml and .cargo/audit.toml; add there, not by weakening the gate.
   security:
     name: licenses · advisories
     runs-on: ubuntu-latest
@@ -62,14 +62,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo-deny (licenses / sources)
+      - name: cargo-deny (licenses / advisories / bans / sources)
         uses: embarkstudios/cargo-deny-action@v2
-        continue-on-error: true
         with:
           command: check all
 
       - name: cargo-audit (advisories)
         uses: rustsec/audit-check@v2
-        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

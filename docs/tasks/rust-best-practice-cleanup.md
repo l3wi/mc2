@@ -281,6 +281,13 @@ Verify: workspace tests green; clippy clean.
   `SshPhase` (Closed/Opening/Open/Failed) enums added to `mc2-runtime` and used for the observed
   status constructions + comparisons in `network_serve.rs`, `node/mod.rs`, `ssh_serve.rs`,
   `ssh.rs`, and `api/ssh.rs`. Both enums get `as_str()`/`parse()` and roundtrip unit tests.
+- **Deny/audit tightened (post-review)**: `cargo deny check` and `cargo audit` installed and run
+  locally; `deny.toml` updated to the cargo-deny 0.20 schema (removed `unlicensed` /
+  `vulnerability` severity keys), allow-list extended (`0BSD`, `MPL-2.0`, `CDLA-Permissive-2.0`
+  from microsandbox transitive deps), and the RUSTSEC-2023-0071 (`rsa` Marvin Attack via
+  `russh` → microsandbox, no safe upgrade) documented as an `ignore`. `cargo-audit` config moved
+  to `.cargo/audit.toml` (its project-scoped discovery path). CI `security` job flipped from
+  `continue-on-error` to blocking; `just deny` / `just audit` recipes added.
 - **Phase 8**: full `just check` green (fmt, clippy all-targets+all-features `-D warnings`, 194 tests,
   `cargo doc -D warnings`, machete); CHANGELOG updated; ADR-0001 added under `docs/decisions/`.
 

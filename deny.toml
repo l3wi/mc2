@@ -5,9 +5,10 @@
 # permissive-2-clause-style licenses for the transitive graph.
 
 [licenses]
-unlicensed = "deny"
-# cargo-deny allows unlisted licenses too; this list is the expected set for
-# the MC2 dependency graph (axum/tokio/serde ecosystem).
+# cargo-deny 0.18+ removed `unlicensed` — unlicensed crates always fail.
+# The allow-list below is the expected set for the MC2 dependency graph
+# (axum/tokio/serde ecosystem, microsandbox + transitive); anything else is
+# denied.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -15,19 +16,31 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "CC0-1.0",
+    # microsandbox transitive deps (permissive / OSI-approved).
+    "0BSD",
+    "CDLA-Permissive-2.0",
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny 0.18+ removed the vulnerability/unsound/notice severity keys —
+# vulnerability and unsound advisories always fail; configure the rest here.
+unmaintained = "none"
 yanked = "warn"
-notice = "warn"
 # Audit DB update window. `cargo deny check advisories` fetches the RustSec
 # advisory database on each run (CI caches it via the action).
 db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Documented exceptions: advisories with no safe upgrade in the current graph.
+ignore = [
+    # rsa 0.10.0-rc.18 (transitive via russh -> microsandbox, SSH server path).
+    # "No safe upgrade is available" per the advisory; the embedded microsandbox
+    # SDK pins the pre-1.0 rsa release. Revisit when microsandbox bumps russh.
+    { id = "RUSTSEC-2023-0071", reason = "transitive via microsandbox (russh); no patched release exists yet" },
+]
 
 [sources]
 unknown-registry = "deny"

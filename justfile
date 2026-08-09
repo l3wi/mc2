@@ -47,6 +47,14 @@ doc:
 machete:
     cargo machete
 
+# License / advisory / source policy gate (requires cargo-deny)
+deny:
+    cargo deny check
+
+# RustSec advisory scan (requires cargo-audit)
+audit:
+    cargo audit
+
 # fmt + clippy + tests + docs + machete (regression gate)
 check:
     just fmt

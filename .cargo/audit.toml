@@ -1,0 +1,7 @@
+# cargo-audit configuration (mirrors deny.toml's documented exception).
+# Reference: https://github.com/rustsec/rustsec (audit docs)
+[advisories]
+# rsa 0.9.10 / 0.10.0-rc.18 (transitive via russh -> microsandbox, SSH server
+# path). "No safe upgrade is available" per RUSTSEC-2023-0071; the embedded
+# microsandbox SDK pins these releases. Revisit when microsandbox bumps russh.
+ignore = ["RUSTSEC-2023-0071"]
