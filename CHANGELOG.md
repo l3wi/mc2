@@ -4,6 +4,22 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+## [0.2.0](https://github.com/l3wi/mc2/compare/v0.1.0...v0.2.0) - 2026-08-09
+
+### Added
+
+- *(cli)* resources table shows MC2 used/limit ratios, MiB→GiB units
+- *(cli)* host disk as GB, right-aligned numeric columns in resources table
+- *(cli)* resources table with METRIC/CPU/MEMORY/DISK headers
+- *(cli)* bordered tables via comfy-table
+- *(cli)* reusable table renderer + fix mem_limit JSON round-trip
+- *(server)* opt-in resource limits (--limit-*) + host/consumption in status
+- *(cli)* grouped help, global connection flags, flat ssh keys, rm→down — declutter the operator surface
+
+### Other
+
+- *(ci)* tooling baseline — rustdoc-clean docs, workspace unsafe lint, dep sweep
+
 ### Resource limits (opt-in; unlimited by default)
 
 - **Configurable cluster budgets.** `--limit-cpus`, `--limit-memory-mib`,
