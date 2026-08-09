@@ -65,14 +65,6 @@ pub struct ServerArgs {
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub labels: Vec<String>,
 
-    /// Advertise CPU capacity (default: host logical CPUs)
-    #[arg(long, env = "MC2_NODE_CPUS")]
-    pub cpus: Option<u32>,
-
-    /// Advertise memory capacity MiB (default: 8192 if unknown)
-    #[arg(long, env = "MC2_NODE_MEMORY_MIB")]
-    pub memory_mib: Option<u64>,
-
     /// Node reconcile interval seconds
     #[arg(long, default_value_t = 10, env = "MC2_RECONCILE_INTERVAL_SECS")]
     pub reconcile_interval_secs: u64,
@@ -298,8 +290,10 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             .unwrap_or_else(|| "local".into()),
         labels_json: serde_json::to_string(&parse_labels(&args.labels)?)
             .unwrap_or_else(|_| "{}".into()),
-        cpus: args.cpus.unwrap_or_else(|| num_cpus::get() as u32),
-        memory_mib: args.memory_mib.unwrap_or(8192),
+        // Node capacity is auto-derived from the host; `--limit-*` is the
+        // operator's resource budget. Fall back to 8192 MiB if detection fails.
+        cpus: num_cpus::get() as u32,
+        memory_mib: crate::host_metrics::host_memory_mib().max(8192),
         reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
         ingress_config_dir: args.ingress_config_dir.clone(),
         public_hostname: args.public_hostname.clone(),
@@ -427,8 +421,6 @@ mod tests {
             reschedule_interval_secs: 5,
             node_name: None,
             labels: vec![],
-            cpus: None,
-            memory_mib: None,
             reconcile_interval_secs: 10,
             ingress_config_dir: None,
             public_hostname: None,

@@ -5,7 +5,7 @@ use crate::scheduler::{pick_node, reserved_capacity, residual_capacity, service_
 use crate::ResourceLimits;
 use anyhow::{Context, Result};
 use mc2_api::{parse_stack_yaml, ServiceSpec, StackDocument};
-use mc2_store::{InstanceRecord, Store};
+use mc2_store::{InstanceRecord, NodeStatus, Store};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -162,37 +162,56 @@ async fn resolve_replica_ports(
     Ok(out)
 }
 
-/// Refuse the apply when the stack's reserved CPU/RAM would exceed the
-/// configured budget, or when MC2's measured disk usage already exceeds the
-/// disk budget. Skips any limit set to `0` (unlimited).
+/// Refuse the apply when the stack's reserved CPU/RAM would exceed the node's
+/// advertised capacity (`--cpus`/`--memory-mib`) or the configured budget
+/// (`--limit-*`), or when MC2's measured disk usage is already at the disk
+/// budget. `0` limits are unlimited; capacity is enforced whenever a Ready node
+/// is registered (the scheduler would otherwise leave instances Pending).
 async fn check_capacity(
     store: &dyn Store,
     cfg: &ApplyConfig,
     doc: &StackDocument,
 ) -> Result<(), ApplyError> {
     let limits = cfg.limits;
-    if limits.cpus == 0 && limits.memory_mib == 0 && limits.disk_mib == 0 {
-        return Ok(());
+    let instances = store.list_instances().await.map_err(anyhow::Error::from)?;
+    let (reserved_cpu, reserved_mem) = reserved_capacity(&instances);
+    let (stack_cpu, stack_mem) = cfg.stack_reserved(doc);
+
+    // Node capacity: the advertised placement ceiling (`--cpus`/`--memory-mib`).
+    let nodes = store.list_nodes().await.map_err(anyhow::Error::from)?;
+    let (cap_cpu, cap_mem) = nodes
+        .iter()
+        .filter(|n| n.status == NodeStatus::Ready.as_str())
+        .fold((0u32, 0u64), |(c, m), n| {
+            (c.saturating_add(n.cpus), m.saturating_add(n.memory_mib))
+        });
+    if cap_cpu > 0 && reserved_cpu.saturating_add(stack_cpu) > cap_cpu {
+        return Err(ApplyError::Capacity(format!(
+            "refusing apply: stack would reserve {stack_cpu} CPU, exceeding the node's \
+             capacity of {cap_cpu} ({reserved_cpu} already reserved) — raise --cpus or scale down"
+        )));
+    }
+    if cap_mem > 0 && reserved_mem.saturating_add(stack_mem) > cap_mem {
+        return Err(ApplyError::Capacity(format!(
+            "refusing apply: stack would reserve {stack_mem} MiB memory, exceeding the node's \
+             capacity of {cap_mem} MiB ({reserved_mem} MiB already reserved) — raise --memory-mib or scale down"
+        )));
     }
 
-    if limits.cpus > 0 || limits.memory_mib > 0 {
-        let instances = store.list_instances().await.map_err(anyhow::Error::from)?;
-        let (reserved_cpu, reserved_mem) = reserved_capacity(&instances);
-        let (stack_cpu, stack_mem) = cfg.stack_reserved(doc);
-        if limits.cpus > 0 && reserved_cpu.saturating_add(stack_cpu) > limits.cpus {
-            return Err(ApplyError::Capacity(format!(
-                "refusing apply: stack would reserve {stack_cpu} CPU (limit {}; {reserved_cpu} already reserved) \
-                 — raise --limit-cpus or scale down",
-                limits.cpus
-            )));
-        }
-        if limits.memory_mib > 0 && reserved_mem.saturating_add(stack_mem) > limits.memory_mib {
-            return Err(ApplyError::Capacity(format!(
-                "refusing apply: stack would reserve {stack_mem} MiB memory (limit {}; {reserved_mem} MiB already reserved) \
-                 — raise --limit-memory-mib or scale down",
-                limits.memory_mib
-            )));
-        }
+    // Operator budget (`--limit-*`).
+    if limits.cpus > 0 && reserved_cpu.saturating_add(stack_cpu) > limits.cpus {
+        return Err(ApplyError::Capacity(format!(
+            "refusing apply: stack would reserve {stack_cpu} CPU (limit {}; {reserved_cpu} already reserved) \
+             — raise --limit-cpus or scale down",
+            limits.cpus
+        )));
+    }
+    if limits.memory_mib > 0 && reserved_mem.saturating_add(stack_mem) > limits.memory_mib {
+        return Err(ApplyError::Capacity(format!(
+            "refusing apply: stack would reserve {stack_mem} MiB memory (limit {}; {reserved_mem} MiB already reserved) \
+             — raise --limit-memory-mib or scale down",
+            limits.memory_mib
+        )));
     }
 
     if limits.disk_mib > 0 {
@@ -650,4 +669,54 @@ async fn applies_within_limits() {
     apply_stack_yaml(store, &cfg, yaml)
         .await
         .expect("within limits");
+}
+
+#[tokio::test]
+async fn refuses_apply_over_node_cpu_capacity() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    store
+        .upsert_local_node(mc2_store::NodeJoin {
+            name: "n1".into(),
+            labels_json: "{}".into(),
+            arch: "aarch64".into(),
+            cpus: 2,
+            memory_mib: 8192,
+        })
+        .await
+        .unwrap();
+    // No --limit-* set; capacity alone must refuse.
+    let yaml = "name: big\nservices:\n  a:\n    image: alpine\n    cpus: 4\n";
+    let err = apply_stack_yaml(store, &cfg_default(), yaml)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+    assert!(err.to_string().contains("capacity"), "{err}");
+}
+
+#[tokio::test]
+async fn refuses_apply_over_node_memory_capacity() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    store
+        .upsert_local_node(mc2_store::NodeJoin {
+            name: "n1".into(),
+            labels_json: "{}".into(),
+            arch: "aarch64".into(),
+            cpus: 8,
+            memory_mib: 1024,
+        })
+        .await
+        .unwrap();
+    // Two 512 MiB services (1024 total) fit; a third pushes past 1024 MiB.
+    let ok = "name: ok\nservices:\n  a:\n    image: alpine\n  b:\n    image: alpine\n";
+    apply_stack_yaml(store.clone(), &cfg_default(), ok)
+        .await
+        .expect("two 512 MiB services fit 1024 MiB capacity");
+    let over = "name: over\nservices:\n  c:\n    image: alpine\n";
+    let err = apply_stack_yaml(store, &cfg_default(), over)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+    assert!(err.to_string().contains("memory"), "{err}");
 }

@@ -10,6 +10,11 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
   refuses an apply that would exceed the reserved CPU/RAM budget, or when MC2's
   measured disk usage (data dir + named volumes) is already at the disk limit.
+- **Node capacity is host-derived.** The `--cpus` / `--memory-mib` flags are
+  gone; each node now advertises the host's real CPU/RAM (detected via
+  `num_cpus` and `/proc`/`sysctl`). Apply is also refused when a stack would
+  exceed that capacity, so a stack that can't be placed is rejected up front
+  instead of sitting `Pending`. `--limit-*` remains the operator's budget knob.
 - **Resource visibility.** `mc2 status` and `/v1/status` report host CPU/RAM/disk,
   the configured limits, MC2's reserved CPU/RAM from instance specs, and MC2's
   measured disk usage.
