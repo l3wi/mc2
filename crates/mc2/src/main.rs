@@ -18,6 +18,7 @@ mod context;
 mod help;
 mod prompt;
 mod setup;
+mod table;
 
 use cli::{
     Cli, Commands, CompletionsArgs, ContextCmd, ContextCommands, DoctorArgs, NodeCmd, NodeCommands,
@@ -307,19 +308,21 @@ fn context_ls() -> Result<()> {
         println!("Create one: mc2 context set <name> --api <url> [--token <key>]");
         return Ok(());
     }
-    println!("{:<3} {:<16} {:<44} MODE", "CUR", "NAME", "URL");
+    let mut t = table::Table::new().header(["CUR", "NAME", "URL", "MODE"]);
     for (name, entry) in &cfg.contexts {
         let cur = if cfg.current.as_deref() == Some(name.as_str()) {
             "*"
         } else {
             ""
         };
-        println!(
-            "{cur:<3} {name:<16} {:<44} {}",
-            entry.url,
-            context::mode_of(&entry.url).as_str()
-        );
+        t = t.row([
+            cur.to_string(),
+            name.clone(),
+            entry.url.clone(),
+            context::mode_of(&entry.url).as_str().to_string(),
+        ]);
     }
+    print!("{}", t.render());
     match cfg.current.as_deref() {
         None => println!(
             "\nno current context; default: local {}",

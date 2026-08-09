@@ -66,6 +66,39 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn mem_limit_json_roundtrip_is_lossless() {
+        let s = ServiceSpec {
+            image: "alpine".into(),
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
+            ports: vec![],
+            network: Default::default(),
+            env: BTreeMap::new(),
+            secrets: vec![],
+            volumes: vec![],
+            restart: "no".into(),
+            healthcheck: None,
+            labels: BTreeMap::new(),
+            command: None,
+            node_name: None,
+            node_selector: BTreeMap::new(),
+            ssh: None,
+            expose: vec![],
+            networks: vec![],
+            depends_on: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"mem_limit\":536870912"), "{json}");
+        let back: ServiceSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mem_limit_mib, 512);
+        // compose `mem_limit` in bytes still parses to MiB.
+        let bytes: ServiceSpec =
+            serde_json::from_str(r#"{"image":"alpine","mem_limit":1073741824}"#).unwrap();
+        assert_eq!(bytes.mem_limit_mib, 1024);
+    }
+
     const DEMO: &str = r#"
 name: demo
 services:

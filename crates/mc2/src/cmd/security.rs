@@ -70,10 +70,11 @@ pub(crate) async fn secret_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         println!("No secrets.");
         return Ok(());
     }
-    println!("{:<32} UPDATED", "NAME");
+    let mut t = crate::table::Table::new().header(["NAME", "UPDATED"]);
     for s in list {
-        println!("{:<32} {}", s.name, s.updated_at);
+        t = t.row([s.name, s.updated_at]);
     }
+    print!("{}", t.render());
     Ok(())
 }
 
@@ -151,10 +152,11 @@ pub(crate) async fn ssh_key_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         println!("No authorized keys.");
         return Ok(());
     }
-    println!("{:<24} {:<52} NAME", "FINGERPRINT", "PUBLIC KEY");
+    let mut t = crate::table::Table::new().header(["FINGERPRINT", "PUBLIC KEY", "NAME"]);
     for k in keys {
-        println!("{:<24} {:<52} {}", k.fingerprint, k.public_key, k.name);
+        t = t.row([k.fingerprint, k.public_key, k.name]);
     }
+    print!("{}", t.render());
     Ok(())
 }
 
@@ -230,15 +232,17 @@ pub(crate) async fn ssh_endpoints_ls(args: ListArgs, conn: &Conn) -> Result<()> 
         println!("No open SSH endpoints.");
         return Ok(());
     }
-    println!(
-        "{:<18} {:<16} {:<8} {:<22} BIND:PORT",
-        "INSTANCE", "STACK/SERVICE", "PHASE", "NODE"
-    );
+    let mut t = crate::table::Table::new().header([
+        "INSTANCE",
+        "STACK/SERVICE",
+        "PHASE",
+        "NODE",
+        "BIND:PORT",
+    ]);
     for e in endpoints {
         let bind = e["bind"].as_str().unwrap_or("-");
         let port = e["port"].as_u64().unwrap_or(0);
-        println!(
-            "{:<18} {:<16} {:<8} {:<22} {}:{}",
+        t = t.row([
             e["instanceId"]
                 .as_str()
                 .unwrap_or("-")
@@ -250,12 +254,12 @@ pub(crate) async fn ssh_endpoints_ls(args: ListArgs, conn: &Conn) -> Result<()> 
                 e["stack"].as_str().unwrap_or("-"),
                 e["service"].as_str().unwrap_or("-")
             ),
-            e["phase"].as_str().unwrap_or("-"),
-            e["nodeName"].as_str().unwrap_or("-"),
-            bind,
-            port
-        );
+            e["phase"].as_str().unwrap_or("-").to_string(),
+            e["nodeName"].as_str().unwrap_or("-").to_string(),
+            format!("{bind}:{port}"),
+        ]);
     }
+    print!("{}", t.render());
     Ok(())
 }
 

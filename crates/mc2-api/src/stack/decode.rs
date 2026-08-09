@@ -4,7 +4,17 @@ use crate::stack::schema::{
     default_proto, default_ssh_bind, default_ssh_user, default_true, DependsOnSpec, ExposeSpec,
     PortSpec, SshSpec,
 };
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serializer};
+
+/// Serialize `mem_limit_mib` as **bytes** (matching [`de_mem_limit`], which
+/// treats a bare number as bytes per compose semantics). This keeps a
+/// `ServiceSpec` JSON round-trip lossless: 512 MiB → `"mem_limit": 536870912`.
+pub(crate) fn se_mem_limit<S>(mib: &u64, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_u64(mib.saturating_mul(1024 * 1024))
+}
 
 pub(crate) fn de_expose<'de, D>(d: D) -> Result<Vec<ExposeSpec>, D::Error>
 where

@@ -5,7 +5,7 @@
 
 use crate::stack::decode::{
     de_command, de_depends_on, de_duration, de_env, de_expose, de_healthcheck_test, de_interval,
-    de_mem_limit, de_ports, de_ssh,
+    de_mem_limit, de_ports, de_ssh, se_mem_limit,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -116,6 +116,7 @@ pub struct ServiceSpec {
     #[serde(
         default = "default_memory_mib",
         rename = "mem_limit",
+        serialize_with = "se_mem_limit",
         deserialize_with = "de_mem_limit"
     )]
     pub mem_limit_mib: u64,

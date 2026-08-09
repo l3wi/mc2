@@ -33,21 +33,20 @@ pub(crate) async fn ps_cmd(args: PsArgs, conn: &Conn) -> Result<()> {
         println!("No instances.");
         return Ok(());
     }
-    println!(
-        "{:<8} {:<12} {:<6} {:<10} {:<36} ID",
-        "STACK", "SERVICE", "ORD", "PHASE", "NODE"
-    );
+    let mut t = crate::table::Table::new()
+        .header(["STACK", "SERVICE", "ORD", "PHASE", "NODE", "ID"])
+        .right_align([2]);
     for i in instances {
-        println!(
-            "{:<8} {:<12} {:<6} {:<10} {:<36} {}",
+        t = t.row([
             i.stack,
             i.service,
-            i.ordinal,
+            i.ordinal.to_string(),
             i.phase,
             i.node_id.unwrap_or_else(|| "-".into()),
-            i.id
-        );
+            i.id,
+        ]);
     }
+    print!("{}", t.render());
     Ok(())
 }
 
@@ -75,22 +74,29 @@ pub(crate) async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<36} {:<16} {:<10} {:>4} {:>8} {:<10} LAST_HEARTBEAT",
-        "ID", "NAME", "STATUS", "CPU", "MEM_MiB", "ARCH"
-    );
+    let mut t = crate::table::Table::new()
+        .header([
+            "ID",
+            "NAME",
+            "STATUS",
+            "CPU",
+            "MEM_MiB",
+            "ARCH",
+            "LAST_HEARTBEAT",
+        ])
+        .right_align([3, 4]);
     for n in nodes {
-        println!(
-            "{:<36} {:<16} {:<10} {:>4} {:>8} {:<10} {}",
+        t = t.row([
             n.id,
             n.name,
             n.status,
-            n.cpus,
-            n.memory_mib,
+            n.cpus.to_string(),
+            n.memory_mib.to_string(),
             n.arch,
-            n.last_heartbeat.unwrap_or_else(|| "-".into())
-        );
+            n.last_heartbeat.unwrap_or_else(|| "-".into()),
+        ]);
     }
+    print!("{}", t.render());
     Ok(())
 }
 
@@ -185,26 +191,40 @@ fn print_resources(res: &serde_json::Value) {
             n.to_string()
         }
     };
+    let body = crate::table::Table::new()
+        .row([
+            "limits:".to_string(),
+            format!(
+                "cpu {} · mem {} MiB · disk {} MiB",
+                unit(&lim["cpus"]),
+                unit(&lim["memoryMib"]),
+                unit(&lim["diskMib"])
+            ),
+        ])
+        .row([
+            "host:".to_string(),
+            format!(
+                "{} cpu · {} MiB · disk {} MiB ({} MiB free)",
+                host["cpus"].as_u64().unwrap_or(0),
+                host["memoryMib"].as_u64().unwrap_or(0),
+                host["diskTotalMib"].as_u64().unwrap_or(0),
+                host["diskFreeMib"].as_u64().unwrap_or(0)
+            ),
+        ])
+        .row([
+            "mc2 uses:".to_string(),
+            format!(
+                "{} cpu · {} MiB mem reserved · {} MiB disk",
+                used["cpus"].as_u64().unwrap_or(0),
+                used["memoryMib"].as_u64().unwrap_or(0),
+                res["mc2DiskUsedMib"].as_u64().unwrap_or(0)
+            ),
+        ])
+        .render_body();
     println!("  resources:");
-    println!(
-        "    limits:   cpu {} · mem {} MiB · disk {} MiB",
-        unit(&lim["cpus"]),
-        unit(&lim["memoryMib"]),
-        unit(&lim["diskMib"])
-    );
-    println!(
-        "    host:     {} cpu · {} MiB · disk {} MiB ({} MiB free)",
-        host["cpus"].as_u64().unwrap_or(0),
-        host["memoryMib"].as_u64().unwrap_or(0),
-        host["diskTotalMib"].as_u64().unwrap_or(0),
-        host["diskFreeMib"].as_u64().unwrap_or(0)
-    );
-    println!(
-        "    mc2 uses: {} cpu · {} MiB mem reserved · {} MiB disk",
-        used["cpus"].as_u64().unwrap_or(0),
-        used["memoryMib"].as_u64().unwrap_or(0),
-        res["mc2DiskUsedMib"].as_u64().unwrap_or(0)
-    );
+    for line in body.lines() {
+        println!("    {line}");
+    }
 }
 
 /// Server-wide network membership summary. `mc2 network` lists all networks;
@@ -371,22 +391,26 @@ fn print_network_summary(nets: &[serde_json::Value]) {
         println!("No networks.");
         return;
     }
-    println!(
-        "{:<16} {:<8} {:<7} {:<9} {:<10} {:<6}",
-        "NETWORK", "KIND", "STACKS", "SERVICES", "INSTANCES", "ACTIVE"
-    );
+    let mut t = crate::table::Table::new().header([
+        "NETWORK",
+        "KIND",
+        "STACKS",
+        "SERVICES",
+        "INSTANCES",
+        "ACTIVE",
+    ]);
     for n in nets {
         let (stacks, services, instances, active) = network_counts(n);
-        println!(
-            "{:<16} {:<8} {:<7} {:<9} {:<10} {:<6}",
-            n["name"].as_str().unwrap_or("-"),
-            n["kind"].as_str().unwrap_or("-"),
-            stacks,
-            services,
-            instances,
-            active
-        );
+        t = t.row([
+            n["name"].as_str().unwrap_or("-").to_string(),
+            n["kind"].as_str().unwrap_or("-").to_string(),
+            stacks.to_string(),
+            services.to_string(),
+            instances.to_string(),
+            active.to_string(),
+        ]);
     }
+    print!("{}", t.render());
 }
 
 fn print_network_detail(n: &serde_json::Value) {
@@ -469,20 +493,18 @@ pub(crate) async fn ingress_cmd(args: IngressArgs, conn: &Conn) -> Result<()> {
         println!("No ingress routes.");
         return Ok(());
     }
-    println!(
-        "{:<24} {:<12} {:<10} {:<8} {:<8} ID",
-        "HOST", "PATH", "SERVICE", "GUEST", "HOST_PORT"
-    );
+    let mut t =
+        crate::table::Table::new().header(["HOST", "PATH", "SERVICE", "GUEST", "HOST_PORT", "ID"]);
     for r in routes {
-        println!(
-            "{:<24} {:<12} {:<10} {:<8} {:<8} {}",
-            r["host"].as_str().unwrap_or("-"),
-            r["path"].as_str().unwrap_or("/"),
-            r["service"].as_str().unwrap_or("-"),
-            r["guestPort"].as_u64().unwrap_or(0),
-            r["hostPort"].as_u64().unwrap_or(0),
-            r["id"].as_str().unwrap_or("-")
-        );
+        t = t.row([
+            r["host"].as_str().unwrap_or("-").to_string(),
+            r["path"].as_str().unwrap_or("/").to_string(),
+            r["service"].as_str().unwrap_or("-").to_string(),
+            r["guestPort"].as_u64().unwrap_or(0).to_string(),
+            r["hostPort"].as_u64().unwrap_or(0).to_string(),
+            r["id"].as_str().unwrap_or("-").to_string(),
+        ]);
     }
+    print!("{}", t.render());
     Ok(())
 }
