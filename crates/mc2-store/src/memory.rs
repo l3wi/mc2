@@ -475,7 +475,7 @@ impl Store for MemoryStore {
         name: &str,
         public_key: &str,
     ) -> Result<SshAuthorizedKey, StoreError> {
-        validate_public_key(public_key).map_err(|e| StoreError::Other(anyhow::anyhow!(e)))?;
+        validate_public_key(public_key).map_err(StoreError::InvalidArgument)?;
         let now = Utc::now().to_rfc3339();
         let mut g = self.inner.write().await;
         let rec = if let Some(existing) = g.ssh_keys.get(name) {

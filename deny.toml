@@ -1,0 +1,35 @@
+# cargo-deny configuration: licenses, advisory severities, and dependency sources.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+#
+# Additions to the allow-list should be justified; prefer Apache-2.0 / MIT /
+# permissive-2-clause-style licenses for the transitive graph.
+
+[licenses]
+unlicensed = "deny"
+# cargo-deny allows unlisted licenses too; this list is the expected set for
+# the MC2 dependency graph (axum/tokio/serde ecosystem).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+]
+
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+# Audit DB update window. `cargo deny check advisories` fetches the RustSec
+# advisory database on each run (CI caches it via the action).
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

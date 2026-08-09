@@ -8,6 +8,21 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::info;
 
+/// Apply-time classification so the REST layer can map user errors to 400
+/// (validation / port allocation) instead of substring-matching messages.
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    /// Stack YAML parse/validation failure (user error).
+    #[error("{0}")]
+    Validation(String),
+    /// Host port allocation conflict (fixed-block / auto range).
+    #[error("{0}")]
+    Allocation(String),
+    /// Store, serialization, or scheduling failure.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyResult {
     pub stack: String,
@@ -49,13 +64,13 @@ async fn resolve_replica_ports(
     stack: &str,
     service: &str,
     base: &ServiceSpec,
-) -> Result<Vec<ServiceSpec>> {
+) -> Result<Vec<ServiceSpec>, ApplyError> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let scale = base.scale.max(1);
     let mut used_by_others: BTreeSet<u16> = BTreeSet::new();
     let mut existing: BTreeMap<(u32, u16), u16> = BTreeMap::new(); // (ordinal, target) → published
-    for inst in store.list_instances().await? {
+    for inst in store.list_instances().await.map_err(anyhow::Error::from)? {
         let Ok(s) = serde_json::from_str::<ServiceSpec>(&inst.spec_json) else {
             continue;
         };
@@ -88,11 +103,11 @@ async fn resolve_replica_ports(
                 })?;
                 let reuse = existing.contains_key(&(ord, p.target));
                 if used_by_others.contains(&cand) || (!reuse && local.contains(&cand)) {
-                    anyhow::bail!(
+                    return Err(ApplyError::Allocation(format!(
                         "published host port {cand} (from {} + replica {ord}) conflicts \
                          with another allocation in this stack",
                         p.published
-                    );
+                    )));
                 }
                 local.insert(cand);
                 p.published = cand;
@@ -113,8 +128,11 @@ async fn resolve_replica_ports(
 }
 
 /// Apply a stack document from YAML text.
-pub async fn apply_stack_yaml(store: Arc<dyn Store>, yaml: &str) -> Result<ApplyResult> {
-    let doc = parse_stack_yaml(yaml).map_err(anyhow::Error::msg)?;
+pub async fn apply_stack_yaml(
+    store: Arc<dyn Store>,
+    yaml: &str,
+) -> Result<ApplyResult, ApplyError> {
+    let doc = parse_stack_yaml(yaml).map_err(ApplyError::Validation)?;
     apply_stack(store, &doc, yaml).await
 }
 
@@ -122,7 +140,7 @@ pub async fn apply_stack(
     store: Arc<dyn Store>,
     doc: &StackDocument,
     raw_yaml: &str,
-) -> Result<ApplyResult> {
+) -> Result<ApplyResult, ApplyError> {
     store
         .upsert_stack(&doc.name, "{}", raw_yaml)
         .await

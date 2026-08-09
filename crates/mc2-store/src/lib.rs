@@ -55,6 +55,9 @@ pub enum StoreError {
     NotInitialized,
     #[error("unauthorized")]
     Unauthorized,
+    /// User-supplied input rejected (e.g. an invalid SSH public key).
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

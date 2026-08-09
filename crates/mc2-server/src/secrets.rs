@@ -25,25 +25,38 @@ pub fn filter_secret_refs<'a>(
     (to_inject, dropped)
 }
 
+/// Errors from setting/resolving cluster secrets. `Validation` maps to a 400
+/// at the REST layer; everything else is a 500.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    #[error("{0}")]
+    Validation(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 /// Encrypt and store a secret value by name.
 pub async fn set_secret(
     store: Arc<dyn Store>,
     key: &SecretsKey,
     name: &str,
     value: &str,
-) -> Result<SecretMeta> {
+) -> Result<SecretMeta, SecretError> {
     let name = name.trim();
     if name.is_empty() {
-        anyhow::bail!("secret name is required");
+        return Err(SecretError::Validation("secret name is required".into()));
     }
     if value.is_empty() {
-        anyhow::bail!("secret value must not be empty");
+        return Err(SecretError::Validation(
+            "secret value must not be empty".into(),
+        ));
     }
     let (nonce, ciphertext) = key.encrypt(value.as_bytes()).context("encrypt secret")?;
-    store
+    Ok(store
         .put_secret_blob(name, &nonce, &ciphertext)
         .await
-        .context("store secret")
+        .map_err(anyhow::Error::from)
+        .context("store secret")?)
 }
 
 /// Decrypt a secret by name (for agent injection only).

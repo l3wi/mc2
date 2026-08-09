@@ -28,3 +28,6 @@ tempfile = "3"
 [lib]
 name = "mc2_store"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

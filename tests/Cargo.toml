@@ -19,7 +19,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 axum = "0.8"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tracing = { workspace = true }
 
 
 [lib]
@@ -28,3 +27,6 @@ path = "src/lib.rs"
 
 # Integration test binaries (black-box across crates / process boundaries).
 # Unit tests stay next to production code under crates/*/src.
+
+[lints]
+workspace = true

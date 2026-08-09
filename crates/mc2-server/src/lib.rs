@@ -1,11 +1,11 @@
 //! MicroCommandControl orchestrator: state, REST API, scheduler, and the local
 //! node loop that drives the embedded microsandbox runtime.
 
+mod api;
 mod apply;
 mod auth;
 mod bootstrap;
 pub mod desired;
-mod http;
 mod ingress;
 mod ingress_files;
 mod network_serve;
@@ -18,10 +18,10 @@ mod ssh;
 mod ssh_serve;
 mod watcher;
 
+pub use api::router;
 pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
 pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
 pub use desired::build_desired_set;
-pub use http::router;
 pub use reschedule::reschedule_not_ready;
 pub use secrets::{decrypt_secret, set_secret};
 

@@ -12,7 +12,7 @@ env:
 
 jobs:
   rust:
-    name: fmt · clippy · test
+    name: fmt · clippy · test · doc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,10 +32,44 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
+
+      - name: Docs (rustdoc warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+
+      - name: Unused dependencies
+        run: |
+          cargo install cargo-machete --locked
+          cargo machete
 
       - name: Build mc2 binary
         run: cargo build -p mc2
+
+  # License + advisory gates. New advisories or unapproved licenses must be
+  # reviewed before tightening these to blocking.
+  security:
+    name: licenses · advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo-deny (licenses / sources)
+        uses: embarkstudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check all
+
+      - name: cargo-audit (advisories)
+        uses: rustsec/audit-check@v2
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

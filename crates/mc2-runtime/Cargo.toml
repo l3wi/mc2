@@ -13,7 +13,6 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
 # Official microsandbox Rust SDK (libkrun embed). `ssh` = in-process host SSH serve.
@@ -34,3 +33,6 @@ required-features = []
 [lib]
 name = "mc2_runtime"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

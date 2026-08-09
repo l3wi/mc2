@@ -15,3 +15,6 @@ serde_yaml = { workspace = true }
 [lib]
 name = "mc2_api"
 path = "src/lib.rs"
+
+[lints]
+workspace = true
