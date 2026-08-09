@@ -75,19 +75,18 @@ Then verify persistence:
 
 ```bash
 # 1. Write a marker inside the guest.
-cargo run -p mc2-runtime --example msb_shell -- smoke-volumes-keep-0 \
-  'echo hi > /data/marker'
+mc2 exec smoke-volumes/keep/0 /bin/sh -c 'echo hi > /data/marker'
 
-# 2. Remove the sandbox; the server recreates it on the next reconcile
-#    (MC2 has no stack-delete command yet — removal is per-sandbox).
-cargo run -p mc2-runtime --example msb_rm -- smoke-volumes-keep-0
+# 2. Tear down and re-apply; `down` keeps named volumes, so the recreate
+#    reuses the same `data` directory.
+mc2 down smoke-volumes
+mc2 up -f examples/06-persistent-volumes/stack.yaml
 
 # 3. Marker survives the recreate; the instance stays on the same node.
-cargo run -p mc2-runtime --example msb_shell -- smoke-volumes-keep-0 \
-  'cat /data/marker'
+mc2 exec smoke-volumes/keep/0 cat /data/marker
 mc2 ps
 
-# 4. Volume data remains on disk after sandbox removal.
+# 4. Volume data remains on disk after stack removal.
 ls /tmp/mc2-lab-volumes/mc2-smoke-volumes--data/
 ```
 

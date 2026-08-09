@@ -8,7 +8,7 @@ Start the server with a catalog directory:
 
 ```bash
 mkdir -p /tmp/mc2-ingress
-./target/debug/mc2 server \
+mc2 server \
   --bind 127.0.0.1:7443 \
   --no-auth \
   --ingress-config-dir /tmp/mc2-ingress
@@ -24,7 +24,7 @@ Apply the stack and start Traefik:
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 up -f examples/04-http-ingress/stack.yaml
+mc2 up -f examples/04-http-ingress/stack.yaml
 traefik --configFile=examples/04-http-ingress/traefik.static.yml
 curl -s -H 'Host: smoke-ingress.local' http://127.0.0.1:8088/
 ```

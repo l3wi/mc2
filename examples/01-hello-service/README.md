@@ -10,8 +10,8 @@ then run:
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 up -f examples/01-hello-service/stack.yaml
-./target/debug/mc2 ps
+mc2 up -f examples/01-hello-service/stack.yaml
+mc2 ps
 curl http://127.0.0.1:18091/
 ```
 

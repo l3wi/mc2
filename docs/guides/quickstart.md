@@ -12,25 +12,28 @@ through the embedded microsandbox SDK — no separate agent, no gRPC seam.
 | - | ----- | ----- |
 | CPU | amd64 or arm64 | **Apple Silicon only** |
 | Hypervisor | KVM (`/dev/kvm`) | Hypervisor.framework |
-| Rust | 1.91+ (for build from source) | same |
-| just | optional | optional |
+| `mc2` | on your PATH | same |
 
 ```bash
 # Host readiness
-cargo run -p mc2 -- doctor
-# optional: cargo run -p mc2 -- doctor --msb   # check msb CLI on PATH
+mc2 doctor
+# optional: mc2 doctor --msb   # check msb CLI on PATH
 ```
 
 The hypervisor is required to **run sandboxes**; the REST/scheduler side still serves without one (instances fail with a runtime error instead).
 
-## Build
+## Install
+
+Prebuilt binaries for Linux (amd64/arm64) and macOS (Apple Silicon) ship with
+every release:
 
 ```bash
-just build
-# or: cargo build -p mc2
+curl -fsSL https://github.com/l3wi/mc2/releases/latest/download/mc2-installer.sh | sh
 ```
 
-Release binaries (CI): `linux-amd64`, `linux-arm64`, `darwin-arm64` — see `.github/workflows/release.yml`.
+Or grab the checksummed `.tar.xz` for your platform from
+[releases](https://github.com/l3wi/mc2/releases). All commands below assume
+`mc2` is on your PATH.
 
 ## Run it (open lab install)
 
@@ -39,16 +42,16 @@ DATA=/tmp/mc2-lab
 mkdir -p "$DATA"
 
 # Terminal 1 — the orchestrator (no API token)
-./target/debug/mc2 server \
+mc2 server \
   --data-dir "$DATA" \
   --bind 127.0.0.1:7443 \
   --no-auth
 
 # Terminal 2 — operator
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 node ls
-./target/debug/mc2 up -f examples/01-hello-service/stack.yaml
-./target/debug/mc2 ps
+mc2 node ls
+mc2 up -f examples/01-hello-service/stack.yaml
+mc2 ps
 curl -s "$MC2_API/v1/status" | jq .
 ```
 
@@ -59,8 +62,8 @@ Useful server flags (all also env vars): `--node-name`, `--label KEY=VALUE`,
 ### Secrets (optional)
 
 ```bash
-./target/debug/mc2 secret set SMOKE_TOKEN --value 'lab-only'
-./target/debug/mc2 up -f examples/02-secrets/stack.yaml
+mc2 secret set SMOKE_TOKEN --value 'lab-only'
+mc2 up -f examples/02-secrets/stack.yaml
 ```
 
 Secrets are a **server-wide** store: `mc2 secret set` writes once, any stack
@@ -76,8 +79,8 @@ The stack schema is Compose-shaped. A two-service example with health-gated
 startup ordering lives in [examples/07-startup-ordering/](../../examples/07-startup-ordering/):
 
 ```bash
-./target/debug/mc2 up -f examples/07-startup-ordering/stack.yaml
-./target/debug/mc2 ps
+mc2 up -f examples/07-startup-ordering/stack.yaml
+mc2 ps
 # web stays "Pending: depends_on: waiting for db (service_healthy)"
 # until the db healthcheck passes, then converges to Running.
 ```
@@ -126,15 +129,14 @@ loop's L4 splice + DNS (`svc.<network>.svc.mc2`). Named networks are
 server-wide, so stacks can share one.
 
 ```bash
-./target/debug/mc2 up -f examples/03-networks/stack.yaml
-./target/debug/mc2 ps
+mc2 up -f examples/03-networks/stack.yaml
+mc2 ps
 # Network membership (default + named) with member instances and ports:
-./target/debug/mc2 network
-./target/debug/mc2 network smoke-networks
+mc2 network
+mc2 network smoke-networks
 
-# From the client sandbox (lab helper):
-cargo run -p mc2-runtime --example msb_shell -- smoke-networks-client-0 \
-  'wget -qO- http://echo.smoke-networks.svc.mc2:8080/'
+# From the client sandbox:
+mc2 exec smoke-networks/client/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
 # expect: NETWORK_OK
 ```
 
@@ -151,8 +153,8 @@ mkdir -p /tmp/mc2-ingress
 # Start the server with:
 #   --ingress-config-dir /tmp/mc2-ingress
 
-./target/debug/mc2 up -f examples/04-http-ingress/stack.yaml
-./target/debug/mc2 ps
+mc2 up -f examples/04-http-ingress/stack.yaml
+mc2 ps
 curl -s "$MC2_API/v1/ingress" | jq .
 # After instance Running and host port live:
 cat /tmp/mc2-ingress/catalog.json | jq .
@@ -171,7 +173,7 @@ Omit `--no-auth` on first bootstrap. Save the printed **API token** (operator RE
 ```bash
 export MC2_API=http://127.0.0.1:7443
 export MC2_API_KEY='mc2at_…'
-./target/debug/mc2 up -f examples/90-advanced/demo-reference.yaml
+mc2 up -f examples/90-advanced/demo-reference.yaml
 ```
 
 ## Setup wizard
@@ -215,7 +217,7 @@ Bootstrap with auth (omit `--no-auth`; save the printed token), then start with
 the ingress catalog + a public hostname:
 
 ```bash
-./target/debug/mc2 server \
+mc2 server \
   --data-dir /srv/mc2 \
   --ingress-config-dir /srv/mc2-ingress \
   --public-hostname mc2.example.com \

@@ -5,9 +5,9 @@ not yet provide a complete guest-side command that proves the injected value.
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
-./target/debug/mc2 up -f examples/02-secrets/stack.yaml
-./target/debug/mc2 ps
+mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
+mc2 up -f examples/02-secrets/stack.yaml
+mc2 ps
 ```
 
 Secret values are never listed by MC2. The `allowHosts` policy in the stack must

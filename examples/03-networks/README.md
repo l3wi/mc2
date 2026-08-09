@@ -5,16 +5,15 @@ over the stack's default network via `echo.<stack>.svc.mc2` DNS.
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
-./target/debug/mc2 up -f examples/03-networks/stack.yaml
-./target/debug/mc2 network
-./target/debug/mc2 network smoke-networks
+mc2 up -f examples/03-networks/stack.yaml
+mc2 network
+mc2 network smoke-networks
 ```
 
 After both services are running, test from the client sandbox:
 
 ```bash
-cargo run -p mc2-runtime --example msb_shell -- smoke-networks-client-0 \
-  'wget -qO- http://echo.smoke-networks.svc.mc2:8080/'
+mc2 exec smoke-networks/client/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
 ```
 
 Expected response: `NETWORK_OK`. Connectivity is a full mesh within a shared
