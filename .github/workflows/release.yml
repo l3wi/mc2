@@ -139,6 +139,13 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # microsandbox's msb_krun links libcap-ng on Linux; not auto-detected by
+      # cargo-dist, so install it explicitly in the Linux build containers.
+      # (Hand-maintained: re-apply after any `dist generate`.)
+      - name: Install Linux system deps (libcap-ng)
+        if: contains(matrix.targets, 'linux')
+        run: |
+          if command -v sudo >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y libcap-ng-dev; else apt-get update && apt-get install -y libcap-ng-dev; fi
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

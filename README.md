@@ -49,6 +49,26 @@ tooling, the parts msb leaves to you.
   reconcile loop. The same commands work on your laptop or a remote server
   (https + token).
 
+### What's possible
+
+- **Launch a swarm of agents.** `scale: 20` on an agent image puts each agent
+  in its own hardware-isolated microVM; `restart` keeps them alive through
+  crashes, and `mc2 exec` / `mc2 logs --follow` drop you into any of them.
+  Give the swarm its own network so agents can coordinate — or keep them fully
+  isolated.
+- **Power your existing Docker Compose with microVMs.** If you can write a
+  `docker-compose.yml`, you already know MC2 — the same `services`, `ports`,
+  `depends_on`, and `environment` shape now boots each service as a
+  hardware-isolated microVM, with no image builds or platform teams.
+- **Remote coding agents over SSH.** `ssh: true` on a dev VM, `mc2 ssh key
+  add`, and you SSH into it from anywhere over TLS — your keys and code never
+  leave your box.
+- **A throwaway test grid.** Bring up N identical VMs, run your suite across
+  all of them, then `mc2 rm --volumes` and they're gone — or keep a cache
+  volume for reuse.
+- **A fleet of headless browsers.** Thirty scraper VMs, each network-locked to
+  only the hosts it talks to, each disposable inside its own microVM.
+
 ## Install
 
 Prebuilt binaries for Linux (amd64/arm64) and macOS (Apple Silicon) ship with

@@ -2,7 +2,7 @@
 
 All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
-## Unreleased
+## 0.1.0
 
 ### Simpler SSH (`ssh: true`) + `mc2 up` prints SSH endpoints
 
