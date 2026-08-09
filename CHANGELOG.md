@@ -4,6 +4,37 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Rust best-practice cleanup (internal, no behavior change)
+
+- **Tooling baseline.** `cargo doc` is now warning-clean and enforced in CI
+  (`RUSTDOCFLAGS=-D warnings`); `[workspace.lints.rust] unsafe_code = "deny"`
+  codifies the zero-`unsafe` posture; `cargo clippy` runs with `--all-features`;
+  CI gains `cargo machete` plus non-blocking `cargo-deny` / `cargo-audit` jobs.
+  `just check` covers fmt + lint + test + doc + machete.
+- **Unused deps removed** (`cargo machete`-verified): `tracing` in `mc2`,
+  `thiserror` in `mc2-runtime`, `tracing` in `mc2-tests`.
+- **CLI split into modules.** `mc2/src/main.rs` (2123 LOC) becomes a thin
+  dispatcher; clap definitions live in `cli.rs`, REST plumbing in `client.rs`,
+  the grouped-help renderer in `help.rs`, and handlers in `cmd/` grouped along
+  the help surfaces (stacks / observe / access / security).
+- **REST split into `api/` with typed errors.** `http.rs` (1328 LOC) becomes
+  `api/` (meta / stacks / instances / secrets / ssh / ingress) with a shared
+  `ApiError`; `is_stack_client_error` string-matching is replaced by a typed
+  `ApplyError::{Validation,Allocation,Other}` (user errors → 400, store errors
+  → 500), `SecretError` for secrets, and `StoreError::InvalidArgument` for
+  invalid SSH public keys.
+- **Stack schema split into `stack/`.** `stack.rs` (1698 LOC) becomes
+  `schema.rs` (types) + `decode.rs` (compose-value deserializers) + `validate.rs`.
+- **Node loop tightened.** `reconcile()` drops its 10-arg signature (bundled
+  into `NodeRuntimeState`) and the nested health-probe block moves to
+  `node/health.rs`.
+- **Dead code removed**: `network_expose_guest_ports`,
+  `Store::list_instance_network`, `make_route_id`, and a vestigial
+  `let _ = key_names;`.
+- **Typed phases at boundaries.** Scheduler / reschedule / node reconcile use
+  `InstancePhase` / `NodeStatus` / `SandboxPhase` enums instead of scattered
+  string literals (persistence stays string-based — see ADR-0002).
+
 ### CLI surface cleanup
 
 - **Grouped top-level help.** `mc2 --help` (and bare `mc2`) now renders

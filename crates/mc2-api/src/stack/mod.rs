@@ -1,6 +1,6 @@
 //! Compose-style stack YAML schema (mc2/v1): parse, validate, and naming
-//! helpers. The schema types live in [`schema`], compose-value deserializers
-//! in [`decode`], and semantic validation in [`validate`].
+//! helpers. The schema types live in `schema`, compose-value deserializers in
+//! `decode`, and semantic validation in `validate`.
 
 mod decode;
 mod schema;

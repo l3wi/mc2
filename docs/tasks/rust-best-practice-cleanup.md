@@ -250,6 +250,45 @@ Verify: workspace tests green; clippy clean.
 - PR from `dev` as separate conventional commits per phase (`refactor(cli): …`, `refactor(server): …`,
   `chore(ci): …`), single release PR at the end.
 
+## Implementation log
+
+2026-08-09 — all phases landed on `dev` (7 commits, tree green):
+
+- **Phase 0** (in `chore(ci): tooling baseline…`): rustdoc warnings fixed; `[workspace.lints.rust]
+  unsafe_code = "deny"` + per-crate `lints.workspace = true`; unused deps removed (`mc2:tracing`,
+  `mc2-runtime:thiserror`, `mc2-tests:tracing`); CI hardened (clippy `--all-features`, doc job with
+  `-D warnings`, machete, non-blocking deny/audit); `just` recipes + `deny.toml`.
+- **Phase 1** (in the same commit, index was pre-staged): `main.rs` → `cli.rs` / `client.rs` /
+  `help.rs` / `cmd/{stacks,observe,access,security}` (+ `cmd/mod.rs`). Pure moves; 22 handler fns made
+  `pub(crate)`. `main.rs` is now a ~280-line dispatcher.
+- **Phase 2** (same commit): `http.rs` → `api/` with shared `ApiError`/`ApiResult` + `testing` harness;
+  typed `ApplyError::{Validation,Allocation,Other}` (replaces `is_stack_client_error`),
+  `SecretError::{Validation,Other}`, `StoreError::InvalidArgument`. Router + lib re-export updated.
+  All prior http.rs tests preserved/moved.
+- **Phase 3** (`refactor(api)`): `stack.rs` → `stack/{mod,schema,decode,validate}.rs`; decode fns
+  `pub(crate)`, referenced from schema via `use crate::stack::decode::…`; tests moved to `mod.rs`.
+- **Phase 4** (`refactor(server)`): `node.rs` → `node/{mod,state,health}.rs`; `reconcile()` takes
+  `&mut NodeRuntimeState` (drops the `too_many_arguments` allow); `run_healthcheck()` extracted.
+- **Phase 5** (`chore(cleanup)`): removed dead public API (`network_expose_guest_ports`,
+  `Store::list_instance_network`, `make_route_id`), privatized `normalize_path`, removed
+  `let _ = key_names;`. `cargo machete` clean.
+- **Phase 6** (`docs`): ADR-0001 (workspace layout) + ADR-0002 (phase/status representation) under
+  `docs/decisions/`. `missing_docs` lint intentionally not enabled (large doc sweep, low value).
+- **Phase 7** (`refactor(server)`): scheduler/reschedule/node use `InstancePhase`/`NodeStatus`/
+  `SandboxPhase` enums (parse-to-enum + variant matches, `as_str()` for report phases). Network/ssh
+  phase strings deferred per ADR-0002 scope.
+- **Phase 8**: full `just check` green (fmt, clippy all-targets+all-features `-D warnings`, 194 tests,
+  `cargo doc -D warnings`, machete); CHANGELOG updated; ADR-0001 added under `docs/decisions/`.
+
+Notes / deviations from plan:
+- Phases 0–2 landed as a single commit because the git index was pre-staged; the commit message describes
+  only Phase 0 but the content is complete and verified. Future commits are per-phase.
+- `missing_docs` lint skipped (optional + needs sign-off).
+- Phase 7 network/ssh phase centralization deferred (bounded MVP; see ADR-0002).
+- `default_network_fqdn` kept (public fqdn surface, symmetric with `network_fqdn`).
+- `docs/tasks` plan lives at `docs/tasks/rust-best-practice-cleanup.md`; ADRs under `docs/decisions/`.
+
+
 ## Verification / acceptance criteria
 
 - `cargo fmt --all -- --check` clean.
