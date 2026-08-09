@@ -2,6 +2,25 @@
 
 All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
+## Unreleased
+
+### CLI surface cleanup
+
+- **Grouped top-level help.** `mc2 --help` (and bare `mc2`) now renders
+  commands under `Stacks` / `Observe` / `Access` / `Security` / `Admin`
+  headings (clap has no native subcommand grouping; a custom renderer splices
+  clap's default help, the same approach the msb CLI uses). Subcommand help is
+  unchanged.
+- **Connection flags are global.** `--api` / `--token` / `--context` /
+  `--allow-insecure-http` move off every subcommand and onto the top-level
+  command (accepted before or after the subcommand). Resolution order and the
+  `MC2_API` / `MC2_API_KEY` / `MC2_CONTEXT` env vars are unchanged.
+- **`mc2 ssh` keys are flat.** `mc2 ssh key add|show|ls|rm` → `mc2 ssh add-key|
+  show-key|keys|rm-key`.
+- **`rm` folds into `down`.** `mc2 down <stack> [--volumes]` (docker-compose
+  parity); `rm` remains a hidden alias. `mc2 context set <name> --api <url>
+  [--token <key>]` is unchanged — the global flags are the source of the URL/key.
+
 ## 0.1.0
 
 ### Simpler SSH (`ssh: true`) + `mc2 up` prints SSH endpoints

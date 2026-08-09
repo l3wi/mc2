@@ -2,13 +2,14 @@
 //!
 //! ```text
 //! mc2 server   # the orchestrator (single process)
-//! mc2 apply    # operator: apply a stack
-//! mc2 node ls  # show the local node
+//! mc2 up       # bring up a stack (reconcile desired state)
+//! mc2 ps       # list instances
 //! ```
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use context::{load as load_config, resolve, save, ClientMode, Conn};
+use std::io::IsTerminal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod context;
@@ -26,48 +27,75 @@ mod setup;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Control plane REST base URL (overrides MC2_API and the current context)
+    #[arg(
+        long,
+        global = true,
+        default_value = "",
+        env = "MC2_API",
+        hide_default_value = true
+    )]
+    api: String,
+
+    /// Operator API bearer token
+    #[arg(long, global = true, env = "MC2_API_KEY")]
+    token: Option<String>,
+
+    /// Named context from ~/.mc2/config.toml (overrides the current context)
+    #[arg(long, global = true, env = "MC2_CONTEXT")]
+    context: Option<String>,
+
+    /// Allow plaintext http:// for a remote (non-loopback) control plane.
+    /// Prefer https:// + TLS; the operator token travels unencrypted otherwise.
+    #[arg(long, global = true)]
+    allow_insecure_http: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the MC2 orchestrator (single process)
-    Server(mc2_server::ServerArgs),
     /// Bring up a stack: publish desired state and converge (idempotent)
     Up(UpArgs),
-    /// Tear down a stack (instances + definition; volumes retained)
+    /// Tear down a stack (instances + definition; volumes retained).
+    /// `--volumes` also deletes named volumes; `rm` is an alias for `down`.
+    #[command(alias = "rm")]
     Down(DownArgs),
-    /// Tear down a stack, optionally deleting its named volumes
-    Rm(RmArgs),
     /// Validate and print a normalized stack config
     Config(ConfigArgs),
-    /// Run a command inside an instance's sandbox
-    Exec(ExecArgs),
+    /// List instances (desired sandboxes)
+    Ps(PsArgs),
+
     /// Print recent sandbox logs for an instance
     Logs(LogsArgs),
     /// Cluster status (health + version + counts)
     Status(StatusArgs),
-    /// Node operations
-    Node(NodeCmd),
-    /// List instances (desired sandboxes)
-    Ps(PsArgs),
     /// Server-wide network membership summary (default + named networks)
     Network(NetworkArgs),
     /// Desired ingress routes
     Ingress(IngressArgs),
-    /// Secrets (encrypted at rest; values never listed)
-    Secret(SecretCmd),
+
+    /// Run a command inside an instance's sandbox
+    Exec(ExecArgs),
     /// SSH authorized keys + endpoints
     Ssh(SshCmd),
+
+    /// Secrets (encrypted at rest; values never listed)
+    Secret(SecretCmd),
+    /// Manage named API contexts (local/remote)
+    Context(ContextCmd),
+
+    /// Run the MC2 orchestrator (single process)
+    Server(mc2_server::ServerArgs),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
+    /// Node operations
+    Node(NodeCmd),
+    /// Interactive setup wizard (server / client)
+    Setup(SetupCmd),
     /// Generate shell completions
     Completions(CompletionsArgs),
     /// Show version info
     Version,
-    /// Manage named API contexts (local/remote)
-    Context(ContextCmd),
-    /// Interactive setup wizard (server / client)
-    Setup(SetupCmd),
 }
 
 #[derive(Debug, Parser)]
@@ -78,8 +106,15 @@ struct SshCmd {
 
 #[derive(Debug, Subcommand)]
 enum SshCommands {
-    /// Manage authorized public keys
-    Key(SshKeyCmd),
+    /// Add or replace an authorized public key
+    AddKey(SshKeyAddArgs),
+    /// Show one authorized public key
+    ShowKey(SshKeyShowArgs),
+    /// List authorized public keys
+    #[command(name = "keys", alias = "key-ls")]
+    Keys(ListArgs),
+    /// Remove an authorized public key
+    RmKey(SshKeyRmArgs),
     /// List open SSH endpoints
     #[command(name = "ls", alias = "list")]
     Ls(ListArgs),
@@ -92,24 +127,6 @@ enum SshCommands {
 }
 
 #[derive(Debug, Parser)]
-struct SshKeyCmd {
-    #[command(subcommand)]
-    command: SshKeyCommands,
-}
-
-#[derive(Debug, Subcommand)]
-enum SshKeyCommands {
-    /// Add or replace an authorized public key
-    Add(SshKeyAddArgs),
-    /// Show one authorized public key
-    Show(SshKeyShowArgs),
-    #[command(name = "ls", alias = "list")]
-    Ls(ListArgs),
-    #[command(name = "rm", alias = "delete")]
-    Rm(SshKeyRmArgs),
-}
-
-#[derive(Debug, Parser)]
 struct SshKeyAddArgs {
     name: String,
     /// Public key line (or use --file)
@@ -118,23 +135,17 @@ struct SshKeyAddArgs {
     /// Path to .pub file
     #[arg(long)]
     file: Option<String>,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
 struct SshKeyRmArgs {
     name: String,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
 struct SshInstanceArgs {
     /// Instance id
     id: String,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -147,8 +158,6 @@ struct SshOpenArgs {
     bind: String,
     #[arg(long, default_value_t = 0)]
     port: u16,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -175,15 +184,11 @@ struct SecretSetArgs {
     /// Secret value (prefer env MC2_SECRET_VALUE or stdin for scripts)
     #[arg(long, env = "MC2_SECRET_VALUE")]
     value: Option<String>,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
 struct SecretRmArgs {
     name: String,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -199,31 +204,15 @@ struct UpArgs {
     /// metadata.name (defaults to the file name) are filled in when missing.
     #[arg(short = 'f', long = "file")]
     file: String,
-
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
 struct DownArgs {
     /// Stack name
     stack: String,
-
-    #[command(flatten)]
-    op: OperatorArgs,
-}
-
-#[derive(Debug, Parser)]
-struct RmArgs {
-    /// Stack name
-    stack: String,
-
     /// Also delete the stack's named volumes (default: retained)
     #[arg(long)]
     volumes: bool,
-
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -240,8 +229,6 @@ struct ExecArgs {
     /// Command to run in the sandbox
     #[arg(required = true, num_args = 1..)]
     cmd: Vec<String>,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -254,8 +241,6 @@ struct LogsArgs {
     /// Keep streaming new entries as they arrive
     #[arg(long)]
     follow: bool,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -271,26 +256,6 @@ enum NodeCommands {
     Ls(ListArgs),
 }
 
-#[derive(Debug, Parser)]
-struct OperatorArgs {
-    /// Control plane REST base URL (overrides MC2_API and the current context)
-    #[arg(long, default_value = "", env = "MC2_API", hide_default_value = true)]
-    api: String,
-
-    /// Operator API bearer token
-    #[arg(long, env = "MC2_API_KEY")]
-    token: Option<String>,
-
-    /// Named context from ~/.mc2/config.toml (overrides the current context)
-    #[arg(long, env = "MC2_CONTEXT")]
-    context: Option<String>,
-
-    /// Allow plaintext http:// for a remote (non-loopback) control plane.
-    /// Prefer https:// + TLS; the operator token travels unencrypted otherwise.
-    #[arg(long)]
-    allow_insecure_http: bool,
-}
-
 /// Output format for listing commands.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum OutputFormat {
@@ -301,11 +266,9 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Common listing args: connection + output format.
+/// Common listing args: output format (connection is global).
 #[derive(Debug, Parser)]
 struct ListArgs {
-    #[command(flatten)]
-    op: OperatorArgs,
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -313,8 +276,6 @@ struct ListArgs {
 
 #[derive(Debug, Parser)]
 struct StatusArgs {
-    #[command(flatten)]
-    op: OperatorArgs,
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -322,8 +283,6 @@ struct StatusArgs {
 
 #[derive(Debug, Parser)]
 struct PsArgs {
-    #[command(flatten)]
-    op: OperatorArgs,
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -339,8 +298,6 @@ struct PsArgs {
 struct NetworkArgs {
     /// Network name, or <stack>/<service>/<ordinal> for per-instance connectivity (all networks when omitted)
     network: Option<String>,
-    #[command(flatten)]
-    op: OperatorArgs,
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -348,8 +305,6 @@ struct NetworkArgs {
 
 #[derive(Debug, Parser)]
 struct IngressArgs {
-    #[command(flatten)]
-    op: OperatorArgs,
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -358,8 +313,6 @@ struct IngressArgs {
 #[derive(Debug, Parser)]
 struct SshKeyShowArgs {
     name: String,
-    #[command(flatten)]
-    op: OperatorArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -428,102 +381,115 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let cli = Cli::parse();
+    if try_show_grouped_top_level_help() {
+        return Ok(());
+    }
+    let Cli {
+        command,
+        api,
+        token,
+        context,
+        allow_insecure_http,
+    } = Cli::parse();
 
-    match cli.command {
+    // Effective connection for operator commands (flags > env > context > default).
+    let resolve = || {
+        resolve_op(
+            &api,
+            token.as_deref(),
+            context.as_deref(),
+            allow_insecure_http,
+        )
+    };
+
+    match command {
         Commands::Server(args) => mc2_server::run(args).await?,
 
-        Commands::Up(mut args) => {
-            resolve_op(&mut args.op)?;
-            up_cmd(args).await?
+        Commands::Up(args) => {
+            let conn = resolve()?;
+            up_cmd(args, &conn).await?
         }
-        Commands::Down(mut args) => {
-            resolve_op(&mut args.op)?;
-            down_cmd(args).await?
-        }
-        Commands::Rm(mut args) => {
-            resolve_op(&mut args.op)?;
-            rm_cmd(args).await?
+        Commands::Down(args) => {
+            let conn = resolve()?;
+            down_cmd(args, &conn).await?
         }
         Commands::Config(args) => config_cmd(args)?,
-        Commands::Exec(mut args) => {
-            resolve_op(&mut args.op)?;
-            exec_cmd(args).await?
+        Commands::Exec(args) => {
+            let conn = resolve()?;
+            exec_cmd(args, &conn).await?
         }
-        Commands::Logs(mut args) => {
-            resolve_op(&mut args.op)?;
-            logs_cmd(args).await?
+        Commands::Logs(args) => {
+            let conn = resolve()?;
+            logs_cmd(args, &conn).await?
         }
-        Commands::Status(mut args) => {
-            let conn = resolve_op(&mut args.op)?;
+        Commands::Status(args) => {
+            let conn = resolve()?;
             status_cmd(args, &conn).await?
         }
         Commands::Node(NodeCmd {
-            command: NodeCommands::Ls(mut args),
+            command: NodeCommands::Ls(args),
         }) => {
-            resolve_op(&mut args.op)?;
-            node_ls(args).await?
+            let conn = resolve()?;
+            node_ls(args, &conn).await?
         }
-        Commands::Ps(mut args) => {
-            resolve_op(&mut args.op)?;
-            ps_cmd(args).await?
+        Commands::Ps(args) => {
+            let conn = resolve()?;
+            ps_cmd(args, &conn).await?
         }
-        Commands::Network(mut args) => {
-            resolve_op(&mut args.op)?;
-            network_cmd(args).await?
+        Commands::Network(args) => {
+            let conn = resolve()?;
+            network_cmd(args, &conn).await?
         }
-        Commands::Ingress(mut args) => {
-            resolve_op(&mut args.op)?;
-            ingress_cmd(args).await?
+        Commands::Ingress(args) => {
+            let conn = resolve()?;
+            ingress_cmd(args, &conn).await?
         }
         Commands::Secret(SecretCmd { command }) => match command {
-            SecretCommands::Set(mut a) => {
-                resolve_op(&mut a.op)?;
-                secret_set(a).await?
+            SecretCommands::Set(a) => {
+                let conn = resolve()?;
+                secret_set(a, &conn).await?
             }
-            SecretCommands::Ls(mut a) => {
-                resolve_op(&mut a.op)?;
-                secret_ls(a).await?
+            SecretCommands::Ls(a) => {
+                let conn = resolve()?;
+                secret_ls(a, &conn).await?
             }
-            SecretCommands::Rm(mut a) => {
-                resolve_op(&mut a.op)?;
-                secret_rm(a).await?
+            SecretCommands::Rm(a) => {
+                let conn = resolve()?;
+                secret_rm(a, &conn).await?
             }
         },
         Commands::Ssh(SshCmd { command }) => match command {
-            SshCommands::Key(SshKeyCmd { command }) => match command {
-                SshKeyCommands::Add(mut a) => {
-                    resolve_op(&mut a.op)?;
-                    ssh_key_add(a).await?
-                }
-                SshKeyCommands::Show(mut a) => {
-                    resolve_op(&mut a.op)?;
-                    ssh_key_show(a).await?
-                }
-                SshKeyCommands::Ls(mut a) => {
-                    resolve_op(&mut a.op)?;
-                    ssh_key_ls(a).await?
-                }
-                SshKeyCommands::Rm(mut a) => {
-                    resolve_op(&mut a.op)?;
-                    ssh_key_rm(a).await?
-                }
-            },
-            SshCommands::Ls(mut a) => {
-                resolve_op(&mut a.op)?;
-                ssh_endpoints_ls(a).await?
+            SshCommands::AddKey(a) => {
+                let conn = resolve()?;
+                ssh_key_add(a, &conn).await?
             }
-            SshCommands::Show(mut a) => {
-                resolve_op(&mut a.op)?;
-                ssh_instance_show(a).await?
+            SshCommands::ShowKey(a) => {
+                let conn = resolve()?;
+                ssh_key_show(a, &conn).await?
             }
-            SshCommands::Open(mut a) => {
-                resolve_op(&mut a.op)?;
-                ssh_instance_open(a).await?
+            SshCommands::Keys(a) => {
+                let conn = resolve()?;
+                ssh_key_ls(a, &conn).await?
             }
-            SshCommands::Close(mut a) => {
-                resolve_op(&mut a.op)?;
-                ssh_instance_close(a).await?
+            SshCommands::RmKey(a) => {
+                let conn = resolve()?;
+                ssh_key_rm(a, &conn).await?
+            }
+            SshCommands::Ls(a) => {
+                let conn = resolve()?;
+                ssh_endpoints_ls(a, &conn).await?
+            }
+            SshCommands::Show(a) => {
+                let conn = resolve()?;
+                ssh_instance_show(a, &conn).await?
+            }
+            SshCommands::Open(a) => {
+                let conn = resolve()?;
+                ssh_instance_open(a, &conn).await?
+            }
+            SshCommands::Close(a) => {
+                let conn = resolve()?;
+                ssh_instance_close(a, &conn).await?
             }
         },
         Commands::Doctor(args) => {
@@ -536,7 +502,7 @@ async fn main() -> Result<()> {
         Commands::Context(ContextCmd { command }) => match command {
             ContextCommands::Ls => context_ls()?,
             ContextCommands::Use(a) => context_use(&a.name)?,
-            ContextCommands::Set(a) => context_set(&a.name, &a.api, a.token.as_deref())?,
+            ContextCommands::Set(a) => context_set(&a.name, &api, token.as_deref())?,
         },
         Commands::Setup(args) => setup_cmd(args).await?,
         Commands::Version => {
@@ -656,34 +622,26 @@ fn operator_post(
     req
 }
 
-/// Resolve the effective connection (flags > env > context > current > default),
-/// enforce the remote-plaintext guard, then rewrite `op` so downstream handlers
-/// see the final URL + token. Returns the resolved connection for mode-aware
-/// commands (`mc2 status`).
-fn resolve_op(op: &mut OperatorArgs) -> Result<Conn> {
-    let allow_insecure_http =
-        op.allow_insecure_http || context::env_truthy("MC2_ALLOW_INSECURE_HTTP");
+/// Resolve the effective connection (flags > env > context > current > default)
+/// and enforce the remote-plaintext guard.
+fn resolve_op(
+    api: &str,
+    token: Option<&str>,
+    context: Option<&str>,
+    allow_insecure_http: bool,
+) -> Result<Conn> {
+    let allow = allow_insecure_http || context::env_truthy("MC2_ALLOW_INSECURE_HTTP");
     let cfg = load_config()?;
-    let api_flag = if op.api.is_empty() {
-        None
-    } else {
-        Some(op.api.as_str())
-    };
-    let conn = resolve(
-        &cfg,
-        api_flag,
-        op.token.as_deref(),
-        op.context.as_deref(),
-        allow_insecure_http,
-    )?;
-    op.api = conn.url.clone();
-    op.token = conn.token.clone();
-    Ok(conn)
+    let api_flag = if api.is_empty() { None } else { Some(api) };
+    resolve(&cfg, api_flag, token, context, allow)
 }
 
 fn context_set(name: &str, url: &str, token: Option<&str>) -> Result<()> {
     let mut cfg = load_config()?;
-    let url = url.trim_end_matches('/').to_string();
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        bail!("context '{name}' needs --api <url> (or set MC2_API)");
+    }
     if context::mode_of(&url) == ClientMode::Remote
         && url.to_ascii_lowercase().starts_with("http://")
     {
@@ -763,7 +721,7 @@ async fn setup_cmd(args: SetupCmd) -> Result<()> {
     Ok(())
 }
 
-async fn secret_set(args: SecretSetArgs) -> Result<()> {
+async fn secret_set(args: SecretSetArgs, conn: &Conn) -> Result<()> {
     let value = match args.value {
         Some(v) => v,
         None => {
@@ -780,12 +738,12 @@ async fn secret_set(args: SecretSetArgs) -> Result<()> {
     }
     let url = format!(
         "{}/v1/secrets/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.name)
     );
     let client = reqwest::Client::new();
     let mut req = client.put(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req
@@ -803,10 +761,10 @@ async fn secret_set(args: SecretSetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn secret_ls(args: ListArgs) -> Result<()> {
-    let url = format!("{}/v1/secrets", args.op.api.trim_end_matches('/'));
+async fn secret_ls(args: ListArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/secrets", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -832,15 +790,15 @@ async fn secret_ls(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn secret_rm(args: SecretRmArgs) -> Result<()> {
+async fn secret_rm(args: SecretRmArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/secrets/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.name)
     );
     let client = reqwest::Client::new();
     let mut req = client.delete(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
@@ -853,7 +811,7 @@ async fn secret_rm(args: SecretRmArgs) -> Result<()> {
     Err(api_error("secret rm", status, &body))
 }
 
-async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
+async fn ssh_key_add(args: SshKeyAddArgs, conn: &Conn) -> Result<()> {
     let public_key = if let Some(k) = args.key {
         k
     } else if let Some(path) = args.file {
@@ -863,14 +821,14 @@ async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
     };
     let url = format!(
         "{}/v1/ssh/keys/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.name)
     );
     let client = reqwest::Client::new();
     let mut req = client.put(&url).json(&serde_json::json!({
         "publicKey": public_key.trim()
     }));
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("PUT ssh key")?;
@@ -883,11 +841,11 @@ async fn ssh_key_add(args: SshKeyAddArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_key_ls(args: ListArgs) -> Result<()> {
-    let url = format!("{}/v1/ssh/keys", args.op.api.trim_end_matches('/'));
+async fn ssh_key_ls(args: ListArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/ssh/keys", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET ssh keys")?;
@@ -913,15 +871,15 @@ async fn ssh_key_ls(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_key_rm(args: SshKeyRmArgs) -> Result<()> {
+async fn ssh_key_rm(args: SshKeyRmArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/ssh/keys/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.name)
     );
     let client = reqwest::Client::new();
     let mut req = client.delete(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("DELETE ssh key")?;
@@ -934,11 +892,11 @@ async fn ssh_key_rm(args: SshKeyRmArgs) -> Result<()> {
     Err(api_error("ssh key rm", status, &body))
 }
 
-async fn ssh_endpoints_ls(args: ListArgs) -> Result<()> {
-    let url = format!("{}/v1/ssh/endpoints", args.op.api.trim_end_matches('/'));
+async fn ssh_endpoints_ls(args: ListArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/ssh/endpoints", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET ssh endpoints")?;
@@ -992,15 +950,15 @@ async fn ssh_endpoints_ls(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_instance_show(args: SshInstanceArgs) -> Result<()> {
+async fn ssh_instance_show(args: SshInstanceArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/instances/{}/ssh",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.id)
     );
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET instance ssh")?;
@@ -1013,10 +971,10 @@ async fn ssh_instance_show(args: SshInstanceArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_instance_open(args: SshOpenArgs) -> Result<()> {
+async fn ssh_instance_open(args: SshOpenArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/instances/{}/ssh",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.id)
     );
     let client = reqwest::Client::new();
@@ -1026,7 +984,7 @@ async fn ssh_instance_open(args: SshOpenArgs) -> Result<()> {
         "port": args.port,
         "authorizedKeys": args.keys,
     }));
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("PUT instance ssh open")?;
@@ -1039,10 +997,10 @@ async fn ssh_instance_open(args: SshOpenArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ssh_instance_close(args: SshInstanceArgs) -> Result<()> {
+async fn ssh_instance_close(args: SshInstanceArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/instances/{}/ssh",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.id)
     );
     let client = reqwest::Client::new();
@@ -1050,7 +1008,7 @@ async fn ssh_instance_close(args: SshInstanceArgs) -> Result<()> {
         "enabled": false,
         "authorizedKeys": []
     }));
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("PUT instance ssh close")?;
@@ -1076,13 +1034,13 @@ fn urlencoding_simple(s: &str) -> String {
         .collect()
 }
 
-async fn up_cmd(args: UpArgs) -> Result<()> {
+async fn up_cmd(args: UpArgs, conn: &Conn) -> Result<()> {
     // Token optional when server was bootstrapped with --no-auth.
     let raw = std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
     let yaml = fill_stack_defaults(&raw, &args.file);
-    let url = format!("{}/v1/stacks:apply", args.op.api.trim_end_matches('/'));
+    let url = format!("{}/v1/stacks:apply", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_post(&client, &url, args.op.token.as_deref())
+    let res = operator_post(&client, &url, conn.token.as_deref())
         .json(&serde_json::json!({ "yaml": yaml }))
         .send()
         .await
@@ -1136,33 +1094,11 @@ fn print_ssh_endpoints(body: &str) {
     }
 }
 
-/// Tear down a stack (instances + definition); named volumes retained.
-async fn down_cmd(args: DownArgs) -> Result<()> {
-    let url = format!(
-        "{}/v1/stacks/{}",
-        args.op.api.trim_end_matches('/'),
-        urlencoding_simple(&args.stack)
-    );
-    let client = reqwest::Client::new();
-    let mut req = client.delete(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
-        req = req.bearer_auth(t);
-    }
-    let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
-    let status = res.status();
-    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
-        println!("stack '{}' down", args.stack);
-        return Ok(());
-    }
-    let body = res.text().await.unwrap_or_default();
-    Err(api_error("down", status, &body))
-}
-
 /// Tear down a stack; `--volumes` also deletes its named volumes.
-async fn rm_cmd(args: RmArgs) -> Result<()> {
+async fn down_cmd(args: DownArgs, conn: &Conn) -> Result<()> {
     let mut url = format!(
         "{}/v1/stacks/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.stack)
     );
     if args.volumes {
@@ -1170,21 +1106,21 @@ async fn rm_cmd(args: RmArgs) -> Result<()> {
     }
     let client = reqwest::Client::new();
     let mut req = client.delete(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
     let status = res.status();
     if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
         if args.volumes {
-            println!("stack '{}' removed (volumes deleted)", args.stack);
+            println!("stack '{}' down (volumes deleted)", args.stack);
         } else {
-            println!("stack '{}' removed", args.stack);
+            println!("stack '{}' down", args.stack);
         }
         return Ok(());
     }
     let body = res.text().await.unwrap_or_default();
-    Err(api_error("rm", status, &body))
+    Err(api_error("down", status, &body))
 }
 
 /// Validate and print the normalized stack config (what `mc2 up` would send).
@@ -1198,12 +1134,11 @@ fn config_cmd(args: ConfigArgs) -> Result<()> {
 
 /// Run a command inside the instance's sandbox; mirror output and exit with
 /// the command's exit code. Piped stdin is forwarded to the sandbox.
-async fn exec_cmd(args: ExecArgs) -> Result<()> {
-    let base = args.op.api.trim_end_matches('/');
-    let id = resolve_instance_id(&args.op, &args.instance).await?;
+async fn exec_cmd(args: ExecArgs, conn: &Conn) -> Result<()> {
+    let base = conn.url.trim_end_matches('/');
+    let id = resolve_instance_id(conn, &args.instance).await?;
     let url = format!("{base}/v1/instances/{}/exec", urlencoding_simple(&id));
     let stdin = {
-        use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
             None
         } else {
@@ -1219,7 +1154,7 @@ async fn exec_cmd(args: ExecArgs) -> Result<()> {
     let mut req = client
         .post(&url)
         .json(&serde_json::json!({ "cmd": args.cmd, "stdin": stdin }));
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("POST {url}"))?;
@@ -1243,9 +1178,9 @@ async fn exec_cmd(args: ExecArgs) -> Result<()> {
 }
 
 /// Print recent sandbox logs for an instance; `--follow` streams new entries.
-async fn logs_cmd(args: LogsArgs) -> Result<()> {
-    let base = args.op.api.trim_end_matches('/');
-    let id = resolve_instance_id(&args.op, &args.instance).await?;
+async fn logs_cmd(args: LogsArgs, conn: &Conn) -> Result<()> {
+    let base = conn.url.trim_end_matches('/');
+    let id = resolve_instance_id(conn, &args.instance).await?;
     let mut url = format!("{base}/v1/instances/{}/logs", urlencoding_simple(&id));
     let mut params: Vec<String> = Vec::new();
     if let Some(tail) = args.tail {
@@ -1259,7 +1194,7 @@ async fn logs_cmd(args: LogsArgs) -> Result<()> {
     }
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("GET {url}"))?;
@@ -1392,10 +1327,10 @@ fn sanitize_stack_name(source: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-async fn ps_cmd(args: PsArgs) -> Result<()> {
-    let url = format!("{}/v1/instances", args.op.api.trim_end_matches('/'));
+async fn ps_cmd(args: PsArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/instances", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1438,10 +1373,10 @@ async fn ps_cmd(args: PsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn node_ls(args: ListArgs) -> Result<()> {
-    let url = format!("{}/v1/nodes", args.op.api.trim_end_matches('/'));
+async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/nodes", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1483,7 +1418,7 @@ async fn node_ls(args: ListArgs) -> Result<()> {
 
 /// Cluster status: health + version + counts, mode/context-aware.
 async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
-    let base = args.op.api.trim_end_matches('/');
+    let base = conn.url.trim_end_matches('/');
     let client = reqwest::Client::new();
     let health = operator_get(&client, &format!("{base}/health"), None)
         .send()
@@ -1495,14 +1430,10 @@ async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
             health.status()
         );
     }
-    let res = operator_get(
-        &client,
-        &format!("{base}/v1/status"),
-        args.op.token.as_deref(),
-    )
-    .send()
-    .await
-    .with_context(|| format!("GET {base}/v1/status"))?;
+    let res = operator_get(&client, &format!("{base}/v1/status"), conn.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("GET {base}/v1/status"))?;
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1561,7 +1492,7 @@ async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
 }
 
 /// Resolve `<stack>/<service>/<ordinal>` to an instance id; pass UUIDs through.
-async fn resolve_instance_id(op: &OperatorArgs, id_or_ref: &str) -> Result<String> {
+async fn resolve_instance_id(conn: &Conn, id_or_ref: &str) -> Result<String> {
     if !id_or_ref.contains('/') {
         return Ok(id_or_ref.to_string());
     }
@@ -1573,9 +1504,9 @@ async fn resolve_instance_id(op: &OperatorArgs, id_or_ref: &str) -> Result<Strin
     let ordinal: u32 = ordinal
         .parse()
         .with_context(|| format!("ordinal must be a number, got {ordinal}"))?;
-    let url = format!("{}/v1/instances", op.api.trim_end_matches('/'));
+    let url = format!("{}/v1/instances", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1593,18 +1524,18 @@ async fn resolve_instance_id(op: &OperatorArgs, id_or_ref: &str) -> Result<Strin
 /// `mc2 network <name>` shows one network's instances and their ports;
 /// `mc2 network <stack>/<service>/<ordinal>` shows one instance's observed
 /// network connectivity (exposes/edges).
-async fn network_cmd(args: NetworkArgs) -> Result<()> {
+async fn network_cmd(args: NetworkArgs, conn: &Conn) -> Result<()> {
     // An instance reference (contains `/`) shows observed per-instance connectivity.
     let Some(target) = args.network.clone() else {
-        return network_summary_cmd(args).await;
+        return network_summary_cmd(args, conn).await;
     };
     if target.contains('/') {
-        return network_instance_cmd(args, &target).await;
+        return network_instance_cmd(args, conn, &target).await;
     }
 
-    let url = format!("{}/v1/networks", args.op.api.trim_end_matches('/'));
+    let url = format!("{}/v1/networks", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1644,10 +1575,10 @@ async fn network_cmd(args: NetworkArgs) -> Result<()> {
 }
 
 /// `mc2 network` with no argument: table of every network.
-async fn network_summary_cmd(args: NetworkArgs) -> Result<()> {
-    let url = format!("{}/v1/networks", args.op.api.trim_end_matches('/'));
+async fn network_summary_cmd(args: NetworkArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/networks", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1667,15 +1598,15 @@ async fn network_summary_cmd(args: NetworkArgs) -> Result<()> {
 }
 
 /// `mc2 network <stack>/<service>/<ordinal>`: observed connectivity for one instance.
-async fn network_instance_cmd(args: NetworkArgs, target: &str) -> Result<()> {
-    let id = resolve_instance_id(&args.op, target).await?;
+async fn network_instance_cmd(args: NetworkArgs, conn: &Conn, target: &str) -> Result<()> {
+    let id = resolve_instance_id(conn, target).await?;
     let url = format!(
         "{}/v1/instances/{}/network",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&id)
     );
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1825,10 +1756,10 @@ fn print_network_detail(n: &serde_json::Value) {
 }
 
 /// Desired ingress routes.
-async fn ingress_cmd(args: IngressArgs) -> Result<()> {
-    let url = format!("{}/v1/ingress", args.op.api.trim_end_matches('/'));
+async fn ingress_cmd(args: IngressArgs, conn: &Conn) -> Result<()> {
+    let url = format!("{}/v1/ingress", conn.url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let res = operator_get(&client, &url, args.op.token.as_deref())
+    let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -1866,15 +1797,15 @@ async fn ingress_cmd(args: IngressArgs) -> Result<()> {
 }
 
 /// Show one authorized public key.
-async fn ssh_key_show(args: SshKeyShowArgs) -> Result<()> {
+async fn ssh_key_show(args: SshKeyShowArgs, conn: &Conn) -> Result<()> {
     let url = format!(
         "{}/v1/ssh/keys/{}",
-        args.op.api.trim_end_matches('/'),
+        conn.url.trim_end_matches('/'),
         urlencoding_simple(&args.name)
     );
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
-    if let Some(t) = args.op.token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(t) = conn.token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.context("GET ssh key")?;
@@ -1889,16 +1820,220 @@ async fn ssh_key_show(args: SshKeyShowArgs) -> Result<()> {
 
 /// Generate shell completions to stdout.
 fn completions_cmd(args: CompletionsArgs) -> Result<()> {
-    use clap::CommandFactory;
     let mut cmd = Cli::command();
     clap_complete::generate(args.shell, &mut cmd, "mc2", &mut std::io::stdout());
     Ok(())
 }
 
+// -------------------------------------------------------------------------------------------------
+// Grouped top-level help (`mc2` / `mc2 --help`): clap has no native subcommand
+// grouping, so the default "Commands:" block is spliced out and re-rendered
+// under the same visual groups Docker and the msb CLI use. Subcommand help
+// (e.g. `mc2 up --help`) is untouched and stays clap-native.
+// -------------------------------------------------------------------------------------------------
+
+/// A visual group for top-level command help.
+struct CommandGroup {
+    heading: &'static str,
+    commands: &'static [&'static str],
+}
+
+const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
+    CommandGroup {
+        heading: "Stacks",
+        commands: &["up", "down", "config", "ps"],
+    },
+    CommandGroup {
+        heading: "Observe",
+        commands: &["logs", "status", "network", "ingress"],
+    },
+    CommandGroup {
+        heading: "Access",
+        commands: &["exec", "ssh"],
+    },
+    CommandGroup {
+        heading: "Security",
+        commands: &["secret", "context"],
+    },
+    CommandGroup {
+        heading: "Admin",
+        commands: &[
+            "server",
+            "doctor",
+            "node",
+            "setup",
+            "completions",
+            "version",
+        ],
+    },
+];
+
+/// Rendered help text for one top-level command.
+#[derive(Clone)]
+struct CommandHelpLine {
+    name: String,
+    help: String,
+}
+
+/// ANSI styling state for the custom top-level help.
+struct HelpStyles {
+    enabled: bool,
+}
+
+impl HelpStyles {
+    /// Enable styling only on a TTY and when NO_COLOR is not set.
+    fn detect() -> Self {
+        Self {
+            enabled: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
+    /// Style a group heading like clap's header style.
+    fn header(&self, value: &str) -> String {
+        if self.enabled {
+            format!("\x1b[1;33m{value}\x1b[0m")
+        } else {
+            value.to_string()
+        }
+    }
+
+    /// Style a command literal like clap's literal style.
+    fn literal(&self, value: &str) -> String {
+        if self.enabled {
+            format!("\x1b[1;34m{value}\x1b[0m")
+        } else {
+            value.to_string()
+        }
+    }
+
+    /// Style colon-heading lines (e.g. `Usage:`, `Options:`) in clap's style,
+    /// preserving every line's trailing newline so spacing is untouched.
+    fn section(&self, value: &str) -> String {
+        value
+            .split_inclusive('\n')
+            .map(|line| {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.ends_with(':') {
+                    format!("{}\n", self.header(trimmed))
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+}
+
+/// Return whether the current invocation asks only for top-level help
+/// (bare `mc2`, or `mc2 -h` / `mc2 --help`).
+fn is_top_level_help_request() -> bool {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.is_empty() {
+        return true;
+    }
+    args.iter().all(|a| a == "-h" || a == "--help")
+}
+
+/// Print grouped top-level help for `mc2` and `mc2 --help`.
+fn try_show_grouped_top_level_help() -> bool {
+    if !is_top_level_help_request() {
+        return false;
+    }
+    print!("{}", render_grouped_top_level_help());
+    true
+}
+
+/// Render top-level help with visually grouped commands.
+fn render_grouped_top_level_help() -> String {
+    let mut cmd = Cli::command();
+    let styles = HelpStyles::detect();
+    let mut buf = Vec::new();
+    cmd.write_long_help(&mut buf)
+        .expect("clap help should render");
+    let default_help = String::from_utf8(buf).expect("clap help should be valid UTF-8");
+    let Some((prefix, _)) = default_help.split_once("\nCommands:\n") else {
+        return default_help;
+    };
+    let Some((_, suffix)) = default_help.split_once("\nOptions:\n") else {
+        return default_help;
+    };
+
+    let mut out = String::new();
+    out.push_str(&styles.section(prefix));
+    out.push('\n');
+    out.push_str(&render_grouped_commands(&cmd, &styles));
+    out.push('\n');
+    out.push_str(&styles.header("Options:"));
+    out.push('\n');
+    out.push_str(&styles.section(suffix));
+    out
+}
+
+/// Render top-level commands under the configured visual groups.
+fn render_grouped_commands(cmd: &clap::Command, styles: &HelpStyles) -> String {
+    let lines = visible_command_help_lines(cmd);
+    let name_width = lines.iter().map(|l| l.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    let mut rendered: Vec<&str> = Vec::new();
+
+    for (index, group) in TOP_LEVEL_COMMAND_GROUPS.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&styles.header(&format!("{}:", group.heading)));
+        out.push('\n');
+        for command in group.commands {
+            if let Some(line) = lines.iter().find(|l| l.name == *command) {
+                out.push_str(&format_command_help_line(line, name_width, styles));
+                rendered.push(line.name.as_str());
+            }
+        }
+    }
+
+    let mut other: Vec<CommandHelpLine> = lines
+        .iter()
+        .filter(|l| !rendered.contains(&l.name.as_str()))
+        .cloned()
+        .collect();
+    if !other.iter().any(|l| l.name == "help") {
+        other.push(CommandHelpLine {
+            name: "help".to_string(),
+            help: "Print this message or the help of the given subcommand(s)".to_string(),
+        });
+    }
+
+    out.push('\n');
+    out.push_str(&styles.header("Other:"));
+    out.push('\n');
+    for line in &other {
+        out.push_str(&format_command_help_line(line, name_width, styles));
+    }
+    out
+}
+
+/// Collect visible top-level commands from clap.
+fn visible_command_help_lines(cmd: &clap::Command) -> Vec<CommandHelpLine> {
+    cmd.get_subcommands()
+        .filter(|c| !c.is_hide_set())
+        .map(|c| CommandHelpLine {
+            name: c.get_name().to_string(),
+            help: c.get_about().map(ToString::to_string).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Format one command help line with clap-like spacing.
+fn format_command_help_line(
+    line: &CommandHelpLine,
+    name_width: usize,
+    styles: &HelpStyles,
+) -> String {
+    let padded = format!("{:<width$}", line.name, width = name_width);
+    format!("  {} {}\n", styles.literal(&padded), line.help)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn cli_parses_help() {
@@ -1973,14 +2108,14 @@ mod tests {
 
     #[tokio::test]
     async fn uuid_refs_pass_through_without_lookup() {
-        let op = OperatorArgs {
-            api: "http://127.0.0.1:1".into(),
+        let conn = Conn {
+            url: "http://127.0.0.1:1".into(),
             token: None,
             context: None,
-            allow_insecure_http: false,
+            mode: ClientMode::Local,
         };
         // No slash → no network call, returned verbatim.
-        let id = resolve_instance_id(&op, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99")
+        let id = resolve_instance_id(&conn, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99")
             .await
             .unwrap();
         assert_eq!(id, "6e6a2d3f-b4dc-4c09-a317-4aac91ff0c99");

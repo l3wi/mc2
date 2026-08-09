@@ -42,9 +42,12 @@ fn help_lists_core_commands() {
     assert!(stdout.contains("server"));
     assert!(stdout.contains("up"));
     assert!(stdout.contains("down"));
-    assert!(stdout.contains("rm"));
     assert!(stdout.contains("config"));
     assert!(stdout.contains("secret"));
+    assert!(
+        !stdout.contains("  rm"),
+        "rm folded into down (alias, not a top-level command): {stdout}"
+    );
     assert!(
         !stdout.contains("  apply"),
         "apply removed (compose language): {stdout}"
@@ -53,6 +56,23 @@ fn help_lists_core_commands() {
         !stdout.contains("  agent"),
         "agent command removed: {stdout}"
     );
+}
+
+#[test]
+fn help_groups_top_level_commands() {
+    let out = mc2().arg("--help").output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for heading in [
+        "Stacks:",
+        "Observe:",
+        "Access:",
+        "Security:",
+        "Admin:",
+        "Other:",
+    ] {
+        assert!(stdout.contains(heading), "missing {heading}: {stdout}");
+    }
 }
 
 #[test]
@@ -209,11 +229,16 @@ fn help_lists_parity_commands() {
 }
 
 #[test]
-fn ssh_key_help_lists_show() {
-    let out = mc2().args(["ssh", "key", "--help"]).output().expect("run");
+fn ssh_help_lists_flattened_key_commands() {
+    let out = mc2().args(["ssh", "--help"]).output().expect("run");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("show"), "{stdout}");
+    for cmd in ["add-key", "show-key", "keys", "rm-key", "open", "close"] {
+        assert!(stdout.contains(cmd), "missing {cmd}: {stdout}");
+    }
+    // The old `ssh key <sub>` subgroup is gone (flattened into add-key/keys/rm-key).
+    let old = mc2().args(["ssh", "key", "--help"]).output().expect("run");
+    assert!(!old.status.success(), "old `ssh key` subgroup must be gone");
 }
 
 #[test]
@@ -571,13 +596,13 @@ fn live_server_end_to_end() {
     assert!(String::from_utf8_lossy(&ls.stdout).contains("SMOKE"));
     assert!(srv.run(&["secret", "rm", "SMOKE"]).status.success());
 
-    // SSH keys lifecycle.
+    // SSH keys lifecycle (flattened: add-key / keys / rm-key).
     let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJustAFakeKeyMaterialHere0000 test@mc2";
     assert!(srv
-        .run(&["ssh", "key", "add", "dev", "--key", key])
+        .run(&["ssh", "add-key", "dev", "--key", key])
         .status
         .success());
-    assert!(String::from_utf8_lossy(&srv.run(&["ssh", "key", "ls"]).stdout).contains("dev"));
+    assert!(String::from_utf8_lossy(&srv.run(&["ssh", "keys"]).stdout).contains("dev"));
 
     // `ssh: true` on a service → `mc2 up` prints the declared SSH front end.
     let ssh_stack = srv._dir.path().join("ssh.yaml");
@@ -599,7 +624,7 @@ fn live_server_end_to_end() {
         "up ssh auto port: {up_ssh_out}"
     );
     assert!(srv.run(&["down", "sshsmoke"]).status.success());
-    assert!(srv.run(&["ssh", "key", "rm", "dev"]).status.success());
+    assert!(srv.run(&["ssh", "rm-key", "dev"]).status.success());
 
     // Contexts + mode-aware status JSON (context is client-local, no --api).
     assert!(srv

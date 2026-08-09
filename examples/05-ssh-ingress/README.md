@@ -11,7 +11,7 @@ with `--ingress-config-dir /tmp/mc2-ssh-ingress/`. Register a public
 key, apply the stack, and start Traefik:
 
 ```bash
-mc2 ssh key add developer --file ~/.ssh/id_ed25519.pub
+mc2 ssh add-key developer --file ~/.ssh/id_ed25519.pub
 mc2 up -f examples/05-ssh-ingress/stack.yaml
 traefik --configFile=examples/05-ssh-ingress/traefik.static.yml
 mc2 ssh ls
@@ -44,7 +44,7 @@ ingress:
 
 Without `ingress.tcp` (direct MC2 SSH only) you can use the short form —
 `ssh: true` enables SSH with all defaults and authenticates with **every
-registered key** (`mc2 ssh key add`):
+registered key** (`mc2 ssh add-key`):
 
 ```yaml
 services:
@@ -66,7 +66,7 @@ SSH fields:
   `root`.
 - `sftp` — enables SFTP support for the SSH session.
 - `authorizedKeys` — names in MC2’s SSH-key registry, not raw public
-  keys. Register each name with `mc2 ssh key add` first.
+  keys. Register each name with `mc2 ssh add-key` first.
 
 TCP ingress fields:
 

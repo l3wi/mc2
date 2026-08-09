@@ -287,7 +287,7 @@ or the long map form:
 | `port` | `0` | Agent backend port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
 | `user` | `root` | SSH username presented to the SDK. |
 | `sftp` | `true` | Enable SFTP on the session. |
-| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh key add`). Empty → **all registered keys** authenticate. |
+| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh add-key`). Empty → **all registered keys** authenticate. |
 
 `mc2 up` prints the declared SSH ports and any `ingress.tcp` entrypoint per
 service (auto ports resolve on first reconcile — see `mc2 ssh ls`).

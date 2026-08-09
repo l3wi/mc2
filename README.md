@@ -33,7 +33,7 @@ tooling, the parts msb leaves to you.
   `ingress` in a git-committable file. Unknown keys are rejected, not ignored.
 - **Desired state, converged.** `mc2 up` reconciles replicas, restart
   policies, and health-gated startup ordering (`depends_on: {db: {condition:
-  service_healthy}}`); `mc2 down` / `mc2 rm` tear down. No run-once, no drift.
+  service_healthy}}`); `mc2 down` (alias `rm`, add `--volumes`) tears down. No run-once, no drift.
 - **A local, private sandbox and app host.** The embedded SDK keeps every
   microVM on your box (or a server you control) — no account, no egress of
   your code or data. `mc2 exec` and `mc2 logs --follow` are built in.
@@ -60,11 +60,11 @@ tooling, the parts msb leaves to you.
   `docker-compose.yml`, you already know MC2 — the same `services`, `ports`,
   `depends_on`, and `environment` shape now boots each service as a
   hardware-isolated microVM, with no image builds or platform teams.
-- **Remote coding agents over SSH.** `ssh: true` on a dev VM, `mc2 ssh key
-  add`, and you SSH into it from anywhere over TLS — your keys and code never
+- **Remote coding agents over SSH.** `ssh: true` on a dev VM, `mc2 ssh add-key`,
+  and you SSH into it from anywhere over TLS — your keys and code never
   leave your box.
 - **A throwaway test grid.** Bring up N identical VMs, run your suite across
-  all of them, then `mc2 rm --volumes` and they're gone — or keep a cache
+  all of them, then `mc2 down --volumes` and they're gone — or keep a cache
   volume for reuse.
 - **A fleet of headless browsers.** Thirty scraper VMs, each network-locked to
   only the hosts it talks to, each disposable inside its own microVM.
@@ -122,8 +122,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | `mc2 server` | The orchestrator (SQLite, REST, scheduler, embedded msb runtime) |
 | `mc2 node ls` | Show the local node (capacity, status) |
 | `mc2 up -f stack.yaml` | Bring up a stack (publish desired state, converge) |
-| `mc2 down <stack>` | Tear down a stack (instances + definition; volumes retained) |
-| `mc2 rm <stack> [--volumes]` | Tear down + optionally delete named volumes |
+| `mc2 down <stack> [--volumes]` | Tear down a stack (instances + definition; volumes retained unless `--volumes`; `rm` is an alias) |
 | `mc2 config -f stack.yaml` | Validate and print a normalized stack config |
 | `mc2 ps [--stack s] [--service s]` | List instances / phases |
 | `mc2 exec <instance> <cmd…>` | Run a command inside a sandbox (piped stdin forwarded) |
@@ -132,7 +131,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | `mc2 network [name \| inst-ref]` | Network membership summary; `<name>` detail; `<stack>/<service>/<ordinal>` per-instance connectivity |
 | `mc2 ingress` | Desired ingress routes |
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
-| `mc2 ssh key\|open\|close\|ls` | SSH keys + open/close endpoints |
+| `mc2 ssh add-key\|keys\|show-key\|rm-key\|ls\|open\|close` | SSH keys + open/close endpoints |
 | `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |
 | `mc2 setup` | Interactive setup wizard (server / client trees) |
 | `mc2 doctor` | Host / msb readiness checks |
