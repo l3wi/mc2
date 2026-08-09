@@ -1,0 +1,24 @@
+# release-plz config for the `main` branch (production releases).
+#
+# Version policy: `main` is the release line. Hotfixes merged directly to
+# `main` bump PATCH (conventional `fix:` → x.Y.z+1); feature batches arrive via
+# the dev → main release PR, which adopts the version already bumped on `dev`
+# (release-plz takes max(current, computed), so it never double-bumps).
+# Tags are created here; cargo-dist builds + publishes the GitHub Release.
+
+[workspace]
+# release-plz manages CHANGELOG.md (regenerates from conventional commits).
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+# No noisy `cargo update` inside release PRs.
+dependencies_update = false
+# cargo-dist (release.yml) creates the GitHub Release; release-plz only tags.
+git_release_enable = false
+# Internal workspace crates; never `cargo publish` to crates.io.
+publish = false
+# App-centric workspace: skip cargo-semver-checks (needs nightly, slow).
+semver_check = false
+
+[changelog]
+# Only full releases appear in the changelog; nightly `-dev.*` tags are ignored.
+tag_pattern = "v[0-9]+.[0-9]+.[0-9]+"

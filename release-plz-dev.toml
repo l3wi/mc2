@@ -1,0 +1,24 @@
+# release-plz config for the `dev` branch (minor-version line + nightlies).
+#
+# Version policy: `dev` is the "next minor" line — every merge into `dev`
+# bumps MINOR (x.Y.Z → x.(Y+1).0) via a release PR, and nightlies cut
+# `vX.Y.Z-dev.<date>` prerelease tags from `dev`. No release tags are created
+# on `dev` (releases happen on `main`); the force-minor regex makes the bump
+# deterministic regardless of conventional-commit type.
+
+[workspace]
+# Force a MINOR bump for every merge into dev.
+custom_minor_increment_regex = ".*"
+# release-plz manages CHANGELOG.md (regenerates from conventional commits).
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+dependencies_update = false
+# cargo-dist (release.yml) creates GitHub Releases from tags; dev only bumps
+# the version via its release PR (no tag, so nightlies stay prereleases).
+git_release_enable = false
+publish = false
+semver_check = false
+
+[changelog]
+# Only full releases appear in the changelog; nightly `-dev.*` tags are ignored.
+tag_pattern = "v[0-9]+.[0-9]+.[0-9]+"
