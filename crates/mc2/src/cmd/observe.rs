@@ -183,6 +183,7 @@ fn print_resources(res: &serde_json::Value) {
     let lim = &res["limits"];
     let host = &res["host"];
     let used = &res["reserved"];
+    // CPU: `0` = unlimited. Memory/disk: `0` = unlimited (no unit suffix).
     let unit = |n: &serde_json::Value| {
         let n = n.as_u64().unwrap_or(0);
         if n == 0 {
@@ -191,23 +192,32 @@ fn print_resources(res: &serde_json::Value) {
             n.to_string()
         }
     };
+    let mib = |n: &serde_json::Value| {
+        let n = n.as_u64().unwrap_or(0);
+        if n == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{n} MiB")
+        }
+    };
     let body = crate::table::Table::new()
         .header(["METRIC", "CPU", "MEMORY", "DISK"])
+        .right_align([1, 2, 3])
         .row([
             "Host".to_string(),
             host["cpus"].as_u64().unwrap_or(0).to_string(),
             format!("{} MiB", host["memoryMib"].as_u64().unwrap_or(0)),
             format!(
-                "{} MiB ({} MiB free)",
-                host["diskTotalMib"].as_u64().unwrap_or(0),
-                host["diskFreeMib"].as_u64().unwrap_or(0)
+                "{:.1}/{:.1} GB",
+                host["diskFreeMib"].as_u64().unwrap_or(0) as f64 / 1024.0,
+                host["diskTotalMib"].as_u64().unwrap_or(0) as f64 / 1024.0
             ),
         ])
         .row([
             "Limits".to_string(),
             unit(&lim["cpus"]),
-            format!("{} MiB", unit(&lim["memoryMib"])),
-            format!("{} MiB", unit(&lim["diskMib"])),
+            mib(&lim["memoryMib"]),
+            mib(&lim["diskMib"]),
         ])
         .row([
             "MC2".to_string(),
