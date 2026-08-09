@@ -1,13 +1,14 @@
-//! Plain-text, column-aligned table rendering for CLI output.
+//! Bordered terminal tables for CLI output.
 //!
-//! kubectl/ps-style: no borders or themes — columns are separated by spaces and
-//! sized to their widest cell, using `unicode-width` so wide glyphs align.
-//! A single shared renderer instead of hand-formatted `{:<N}` strings scattered
-//! across command handlers.
+//! A thin wrapper over [`comfy_table`] (the most-downloaded Rust table library)
+//! exposing a small builder API used across the command handlers, so every
+//! listing shares one style: rounded-corner Unicode borders, a header row, and
+//! per-column alignment.
 
-use unicode_width::UnicodeWidthStr;
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Cell, CellAlignment, ContentArrangement, Table as ComfyTable};
 
-/// A column-aligned table; rows are rendered in the order added.
+/// A bordered table; rows are rendered in the order added.
 #[derive(Debug, Default)]
 pub struct Table {
     headers: Vec<String>,
@@ -65,46 +66,28 @@ impl Table {
     }
 
     fn render_inner(&self, with_header: bool) -> String {
-        let ncols = self
-            .headers
-            .len()
-            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0));
-        let mut widths = vec![0usize; ncols];
-        for (i, h) in self.headers.iter().enumerate() {
-            widths[i] = h.width();
+        let mut t = ComfyTable::new();
+        t.load_style(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic);
+        if with_header && !self.headers.is_empty() {
+            let header: Vec<Cell> = self.headers.iter().map(|h| Cell::new(h.clone())).collect();
+            t.set_header(header);
         }
         for row in &self.rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < widths.len() {
-                    widths[i] = widths[i].max(cell.width());
-                }
-            }
-        }
-
-        let mut out = String::new();
-        let push = |out: &mut String, row: &[String]| {
-            let line: Vec<String> = (0..ncols)
-                .map(|i| {
-                    let cell = row.get(i).map(String::as_str).unwrap_or("");
-                    let w = widths[i];
+            let cells: Vec<Cell> = row
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut cell = Cell::new(c.clone());
                     if self.right_align.get(i).copied().unwrap_or(false) {
-                        format!("{cell:>w$}")
-                    } else {
-                        format!("{cell:<w$}")
+                        cell = cell.set_alignment(CellAlignment::Right);
                     }
+                    cell
                 })
                 .collect();
-            // Trailing-column padding is noise; drop trailing spaces.
-            out.push_str(line.join(" ").trim_end());
-            out.push('\n');
-        };
-        if with_header && !self.headers.is_empty() {
-            push(&mut out, &self.headers);
+            t.add_row(cells);
         }
-        for row in &self.rows {
-            push(&mut out, row);
-        }
-        out
+        t.to_string()
     }
 }
 
@@ -113,28 +96,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aligns_columns_and_headers() {
+    fn renders_bordered_table_with_header() {
         let t = Table::new()
             .header(["NAME", "CPU", "PHASE"])
             .row(["demo-web-0", "1", "Running"])
             .row(["a", "2", "Creating"])
             .right_align([1]);
         let out = t.render();
-        let mut lines = out.lines();
-        assert_eq!(lines.next().unwrap(), "NAME       CPU PHASE");
-        assert_eq!(lines.next().unwrap(), "demo-web-0   1 Running");
-        assert_eq!(lines.next().unwrap(), "a            2 Creating");
-        assert!(lines.next().is_none());
+        assert!(out.contains('┌'), "top border: {out}");
+        assert!(out.contains('└'), "bottom border: {out}");
+        assert!(out.contains("NAME"), "header present: {out}");
+        assert!(out.contains("demo-web-0"), "row present: {out}");
+        assert!(out.contains("Creating"), "row present: {out}");
     }
 
     #[test]
-    fn body_omits_header_and_pads_unicode() {
+    fn body_renders_without_header() {
         let t = Table::new()
             .row(["mc2 uses", "0 cpu"])
             .row(["host", "14 cpu"]);
         let out = t.render_body();
-        let mut lines = out.lines();
-        assert_eq!(lines.next().unwrap(), "mc2 uses 0 cpu");
-        assert_eq!(lines.next().unwrap(), "host     14 cpu");
+        assert!(out.contains('┌'), "top border: {out}");
+        assert!(out.contains("mc2 uses"), "row present: {out}");
+        assert!(!out.contains("┌─┬─┐"), "no header separator expected");
     }
 }

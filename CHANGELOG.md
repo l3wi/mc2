@@ -16,10 +16,11 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ### CLI + fixes
 
-- **Reusable table renderer.** `mc2 ps` / `node ls` / `network` / `ingress` /
+- **Bordered tables.** `mc2 ps` / `node ls` / `network` / `ingress` /
   `secret ls` / `ssh keys` / `ssh endpoints` / `context ls` and the `status`
-  resources block now use a shared, unicode-width-aware column renderer
-  (`crate::table`) instead of hand-formatted `{:<N}` strings.
+  resources block now render as bordered tables with headers via a shared
+  `crate::table` wrapper over **comfy-table** (the most-downloaded Rust table
+  library), replacing hand-formatted `{:<N}` strings.
 - **Fix: `mem_limit` JSON round-trip.** `ServiceSpec` now serializes
   `mem_limit` as bytes (matching compose semantics), so a stored/re-read spec
   keeps the same MiB value (512 MiB no longer comes back as 1 MiB). This also
