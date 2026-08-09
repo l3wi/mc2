@@ -10,7 +10,7 @@ use crate::desired::build_desired_set;
 use crate::ingress_files::{warn_ingress_dir_unset, SelfIngressRoute};
 use anyhow::{Context, Result};
 use mc2_runtime::{
-    desired_recreate_hash, InstanceReport, NetworkObserved, NodeRuntime, SandboxPhase,
+    desired_recreate_hash, InstanceReport, NetworkObserved, NetworkPhase, NodeRuntime, SandboxPhase,
 };
 use mc2_store::{InstancePhase, NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
@@ -549,28 +549,28 @@ fn network_summary_phase(f: &NetworkObserved) -> String {
     let mut has_failed = false;
     let mut has_pending = false;
     for e in &f.exposes {
-        match e.phase.as_str() {
-            "Ready" => has_ready = true,
-            "Failed" => has_failed = true,
+        match NetworkPhase::parse(&e.phase) {
+            NetworkPhase::Ready => has_ready = true,
+            NetworkPhase::Failed => has_failed = true,
             _ => has_pending = true,
         }
     }
     for e in &f.edges {
-        match e.phase.as_str() {
-            "Ready" => has_ready = true,
-            "Failed" => has_failed = true,
+        match NetworkPhase::parse(&e.phase) {
+            NetworkPhase::Ready => has_ready = true,
+            NetworkPhase::Failed => has_failed = true,
             _ => has_pending = true,
         }
     }
     if f.exposes.is_empty() && f.edges.is_empty() {
-        return "Pending".into();
+        return NetworkPhase::Pending.as_str().into();
     }
     match (has_failed, has_pending, has_ready) {
-        (true, _, true) => "Mixed".into(),
-        (true, _, false) => "Failed".into(),
-        (false, true, _) => "Pending".into(),
-        (false, false, true) => "Ready".into(),
-        _ => "Pending".into(),
+        (true, _, true) => NetworkPhase::Mixed.as_str().into(),
+        (true, _, false) => NetworkPhase::Failed.as_str().into(),
+        (false, true, _) => NetworkPhase::Pending.as_str().into(),
+        (false, false, true) => NetworkPhase::Ready.as_str().into(),
+        _ => NetworkPhase::Pending.as_str().into(),
     }
 }
 

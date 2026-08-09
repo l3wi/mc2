@@ -55,6 +55,36 @@ pub struct NetworkEdgeStatus {
     pub message: String,
 }
 
+/// Network edge/expose phase. Persisted and serialized as a string; use
+/// [`Self::as_str`] / [`Self::parse`] at module boundaries instead of literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPhase {
+    Pending,
+    Ready,
+    Failed,
+    Mixed,
+}
+
+impl NetworkPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Ready => "Ready",
+            Self::Failed => "Failed",
+            Self::Mixed => "Mixed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "Ready" => Self::Ready,
+            "Failed" => Self::Failed,
+            "Mixed" => Self::Mixed,
+            _ => Self::Pending,
+        }
+    }
+}
+
 /// Guest ports that need narrow Host egress allows at create time.
 ///
 /// Includes all mesh edge ports (even if backend is not yet local) so a later
@@ -65,4 +95,20 @@ pub fn network_host_allow_ports(network: &DesiredNetwork) -> Vec<u16> {
     ports.sort_unstable();
     ports.dedup();
     ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_parse_as_str_roundtrip() {
+        for s in ["Pending", "Ready", "Failed", "Mixed"] {
+            let p = NetworkPhase::parse(s);
+            assert_eq!(p.as_str(), s, "roundtrip {s}");
+        }
+        // Unknown → Pending (fail-open default).
+        assert_eq!(NetworkPhase::parse("bogus"), NetworkPhase::Pending);
+        assert_eq!(NetworkPhase::parse("Ready"), NetworkPhase::Ready);
+    }
 }

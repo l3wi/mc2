@@ -138,7 +138,7 @@ pub fn desired_from_put(
         desired_key_names_json: Some(
             serde_json::to_string(&authorized_keys).unwrap_or_else(|_| "[]".into()),
         ),
-        phase: "Closed".into(),
+        phase: mc2_runtime::SshPhase::Closed.as_str().into(),
         bind: None,
         port: None,
         message: None,

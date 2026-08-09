@@ -34,6 +34,10 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 - **Typed phases at boundaries.** Scheduler / reschedule / node reconcile use
   `InstancePhase` / `NodeStatus` / `SandboxPhase` enums instead of scattered
   string literals (persistence stays string-based — see ADR-0002).
+- **Network/SSH phase enums.** `NetworkPhase` (Pending/Ready/Failed/Mixed) and
+  `SshPhase` (Closed/Opening/Open/Failed) now back the observed status
+  constructions and comparisons in the node loop, network dataplane, and SSH
+  serve layers.
 
 ### CLI surface cleanup
 

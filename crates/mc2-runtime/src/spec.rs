@@ -64,6 +64,36 @@ pub struct DesiredSandbox {
     pub network: DesiredNetwork,
 }
 
+/// Host-side SSH serve phase. Persisted and serialized as a string; use
+/// [`Self::as_str`] / [`Self::parse`] at module boundaries instead of literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshPhase {
+    Closed,
+    Opening,
+    Open,
+    Failed,
+}
+
+impl SshPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "Closed",
+            Self::Opening => "Opening",
+            Self::Open => "Open",
+            Self::Failed => "Failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "Open" => Self::Open,
+            "Opening" => Self::Opening,
+            "Failed" => Self::Failed,
+            _ => Self::Closed,
+        }
+    }
+}
+
 /// Observed SSH serve state for one instance (reported to the store).
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +134,17 @@ mod tests {
     use super::*;
     use crate::sandbox_name;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn ssh_phase_parse_as_str_roundtrip() {
+        for s in ["Closed", "Opening", "Open", "Failed"] {
+            let p = SshPhase::parse(s);
+            assert_eq!(p.as_str(), s, "roundtrip {s}");
+        }
+        // Unknown → Closed (fail-closed default).
+        assert_eq!(SshPhase::parse("bogus"), SshPhase::Closed);
+        assert_eq!(SshPhase::parse("Open"), SshPhase::Open);
+    }
 
     #[test]
     fn start_parts_default() {

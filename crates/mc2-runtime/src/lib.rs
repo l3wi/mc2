@@ -15,7 +15,7 @@ pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod networks;
 pub use networks::{
     network_host_allow_ports, DesiredNetwork, NetworkAllowDesired, NetworkEdgeStatus,
-    NetworkExposeDesired, NetworkExposeStatus, NetworkObserved,
+    NetworkExposeDesired, NetworkExposeStatus, NetworkObserved, NetworkPhase,
 };
 pub mod ingress {
     pub use crate::ingress_render::*;
@@ -24,7 +24,7 @@ pub use ingress_render::{
     render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, ReadyIngressRoute,
 };
 pub use spec::{
-    DesiredSandbox, DesiredSsh, InjectedSecret, InstanceReport, SandboxPhase, SshObserved,
+    DesiredSandbox, DesiredSsh, InjectedSecret, InstanceReport, SandboxPhase, SshObserved, SshPhase,
 };
 pub use spec_hash::desired_recreate_hash;
 

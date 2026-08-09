@@ -14,6 +14,7 @@
 
 use mc2_runtime::{
     DesiredSandbox, InstanceReport, NetworkEdgeStatus, NetworkExposeStatus, NetworkObserved,
+    NetworkPhase,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -232,7 +233,7 @@ impl NetworkTable {
                 observed.exposes.push(NetworkExposeStatus {
                     guest_port: b.guest_port,
                     host_port: b.host_port,
-                    phase: "Ready".into(),
+                    phase: NetworkPhase::Ready.as_str().into(),
                     message: String::new(),
                 });
             }
@@ -241,7 +242,7 @@ impl NetworkTable {
                 observed.exposes.push(NetworkExposeStatus {
                     guest_port: ex.guest_port,
                     host_port: 0,
-                    phase: "Failed".into(),
+                    phase: NetworkPhase::Failed.as_str().into(),
                     message: "expose not prepared before create".into(),
                 });
             }
@@ -252,16 +253,19 @@ impl NetworkTable {
             let key = (a.to_service.clone(), a.port);
             let (phase, message) = if self.failed_splices.contains(&key) {
                 (
-                    "Failed",
+                    NetworkPhase::Failed.as_str(),
                     "network splice could not bind port (collision?)".to_string(),
                 )
             } else {
                 let has = self.splices.contains_key(&key);
                 let up = backends.get(&key).map(|v| !v.is_empty()).unwrap_or(false);
                 if has && up {
-                    ("Ready", String::new())
+                    (NetworkPhase::Ready.as_str(), String::new())
                 } else {
-                    ("Pending", "waiting for backend".to_string())
+                    (
+                        NetworkPhase::Pending.as_str(),
+                        "waiting for backend".to_string(),
+                    )
                 }
             };
             observed.edges.push(NetworkEdgeStatus {
@@ -301,7 +305,7 @@ impl NetworkTable {
             observed.exposes.push(NetworkExposeStatus {
                 guest_port: ex.guest_port,
                 host_port: host,
-                phase: "Pending".into(),
+                phase: NetworkPhase::Pending.as_str().into(),
                 message: "sandbox not running".into(),
             });
         }
@@ -309,7 +313,7 @@ impl NetworkTable {
             observed.edges.push(NetworkEdgeStatus {
                 to_service: a.to_service.clone(),
                 port: a.port,
-                phase: "Pending".into(),
+                phase: NetworkPhase::Pending.as_str().into(),
                 message: "sandbox not running".into(),
             });
         }

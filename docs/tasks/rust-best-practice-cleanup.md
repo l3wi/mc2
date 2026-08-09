@@ -277,6 +277,10 @@ Verify: workspace tests green; clippy clean.
 - **Phase 7** (`refactor(server)`): scheduler/reschedule/node use `InstancePhase`/`NodeStatus`/
   `SandboxPhase` enums (parse-to-enum + variant matches, `as_str()` for report phases). Network/ssh
   phase strings deferred per ADR-0002 scope.
+- **Phase 7 follow-up (post-review)**: `NetworkPhase` (Pending/Ready/Failed/Mixed) and
+  `SshPhase` (Closed/Opening/Open/Failed) enums added to `mc2-runtime` and used for the observed
+  status constructions + comparisons in `network_serve.rs`, `node/mod.rs`, `ssh_serve.rs`,
+  `ssh.rs`, and `api/ssh.rs`. Both enums get `as_str()`/`parse()` and roundtrip unit tests.
 - **Phase 8**: full `just check` green (fmt, clippy all-targets+all-features `-D warnings`, 194 tests,
   `cargo doc -D warnings`, machete); CHANGELOG updated; ADR-0001 added under `docs/decisions/`.
 

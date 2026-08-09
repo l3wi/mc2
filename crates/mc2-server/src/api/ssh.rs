@@ -189,7 +189,7 @@ pub async fn list_ssh_endpoints(
     let nodes = state.store.list_nodes().await.map_err(ApiError::store)?;
     let mut endpoints = Vec::new();
     for r in rows {
-        if r.phase != "Open" {
+        if mc2_runtime::SshPhase::parse(&r.phase) != mc2_runtime::SshPhase::Open {
             continue;
         }
         let inst = instances.iter().find(|i| i.id == r.instance_id);
