@@ -3005,7 +3005,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mc2"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "clap",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-api"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "serde",
  "serde_json",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-metrics"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -3050,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-runtime"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-server"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-store"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3118,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "mc2-tests"
-version = "0.1.0"
+version = "0.1.0-dev.202608120355"
 dependencies = [
  "anyhow",
  "axum",
