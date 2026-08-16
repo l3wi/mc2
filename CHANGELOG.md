@@ -21,6 +21,10 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ### CLI + fixes
 
+- **`mc2 volume ls`.** Lists the named volumes retained on the node (stack,
+  volume, size MiB, path) via new `GET /v1/volumes`. Volumes are
+  filesystem-only in v1, so this is the way to verify what a destructive
+  `down --volumes` would remove; `-o json` mirrors the API.
 - **Bordered tables.** `mc2 ps` / `node ls` / `network` / `ingress` /
   `secret ls` / `ssh keys` / `ssh endpoints` / `context ls` and the `status`
   resources block now render as bordered tables with headers via a shared
@@ -140,7 +144,7 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   distinct auto port per replica. Stable across re-applies.
 - Cross-service published-host-port conflicts are now rejected at apply (400);
   published host ports are effectively unique server-wide.
-- Docs: new [Environment variables vs secrets](docs/guides/secrets.md) guide
+- Docs: new [Environment variables vs secrets](site/content/documentation/concepts/secrets.mdx) page
   clarifies the direct-`environment` vs host-gated `secrets[].env` mechanisms
   and the server-wide (not per-stack) scoping of the secret store.
 

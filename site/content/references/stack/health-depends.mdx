@@ -1,0 +1,82 @@
+---
+title: Healthchecks & depends_on
+description: The healthcheck key table and runtime behavior, plus depends_on startup ordering in list and map form.
+---
+
+Healthchecks gate readiness (and restart-on-failure); `depends_on` orders
+startup. Both only matter *while the stack is coming up and running*.
+
+## `healthcheck`
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `test` | no | — | Probe command. String (`curl -f http://localhost/`) or list (`["CMD", "curl", "-f", "http://localhost/"]`); `CMD` / `CMD-SHELL` prefix is stripped. |
+| `interval` | no | `30s` | Probe interval (e.g. `30s`, `1m`). |
+| `timeout` | no | `0` | Per-probe timeout (e.g. `5s`). `0` = no timeout. |
+| `retries` | no | `3` | Consecutive failures before the service is marked unhealthy / restarted. |
+| `start_period` | no | `0` | Grace period after start during which probe failures are ignored. |
+| `disable` | no | `false` | `true` disables the healthcheck entirely. |
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 30s
+```
+
+The `test` value may be given as a string or a list; the `CMD` / `CMD-SHELL`
+prefix is stripped, so `test: ["pg_isready"]` and `test: ["CMD", "pg_isready"]`
+are equivalent.
+
+## Healthcheck behavior
+
+When running, the node `exec`s `test` every `interval`. A passing probe sets
+the instance healthy (which gates `depends_on: {condition: service_healthy}`);
+`retries` consecutive failures past `start_period` mark it unhealthy — with
+`restart` set the sandbox is removed and recreated, otherwise it reports
+`Failed`.
+
+<Callout type="note" title="Unhealthy ≠ dead">
+  Marking unhealthy triggers recreate only when `restart` is set. Without it,
+  the instance keeps running and reports `Failed` — check logs before assuming
+  the probe command itself is wrong.
+</Callout>
+
+## `depends_on`
+
+Compose syntax. **Ordering only** — dependencies are started first, dependents
+wait.
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  web:
+    image: alpine
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+- **List form** (`depends_on: [db]`) means `condition: service_started`.
+- **Map form** (`{db: {condition: service_healthy}}`) lets you require health.
+  Conditions: `service_started` (default) \| `service_healthy` (requires the
+  dependency to declare a healthcheck).
+- References must name services in the **same stack**; cycles are rejected at
+  parse time.
+- `service_healthy` requires the dependency to declare a **non-disabled**
+  healthcheck.
+
+<Callout type="warning" title="Startup only">
+  Ordering applies only at startup, not teardown. Dependencies are not stopped
+  in reverse order, and a failed dependency does not cascade a teardown.
+</Callout>

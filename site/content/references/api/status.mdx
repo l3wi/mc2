@@ -1,0 +1,101 @@
+---
+title: Status
+description: Cluster health, version, counts, and node listing via GET /v1/status and GET /v1/nodes.
+---
+
+## Overview
+
+Two endpoints report the health of the cluster: `/v1/status` for the aggregate
+picture and `/v1/nodes` for the registered node(s). Both require a bearer
+token.
+
+## GET /v1/status
+
+Returns cluster status: health, version, counts, and the published public
+hostname.
+
+```
+GET /v1/status
+Authorization: Bearer mc2at_...
+```
+
+Fields include:
+
+| Field | Meaning |
+| ----- | ------- |
+| `version` | Server version |
+| `apiVersion` | API version (e.g. `mc2/v1`) |
+| `nodesReady` / `nodesTotal` | Node readiness counts |
+| `stacks` | Number of stacks |
+| `instances` | Number of instances |
+| `message` | Human status line (e.g. `"control plane up"`) |
+| `publicHostname` | The server's published hostname, set via `--public-hostname` |
+| `resources` | Resource budget: `limits`, `host`, `reserved`, `mc2DiskUsedMib` |
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/status | jq .
+```
+
+```json
+{
+  "version": "0.1.0",
+  "apiVersion": "mc2/v1",
+  "nodesReady": 1,
+  "nodesTotal": 1,
+  "stacks": 2,
+  "instances": 5,
+  "message": "control plane up",
+  "publicHostname": "mc2.example.com",
+  "resources": {
+    "limits": { "cpus": 0, "memoryMib": 0, "diskMib": 0 },
+    "host": { "cpus": 8, "memoryMib": 16384, "diskTotalMib": 1000000, "diskFreeMib": 500000 },
+    "reserved": { "cpus": 5, "memoryMib": 2560 },
+    "mc2DiskUsedMib": 120
+  }
+}
+```
+
+`resources.limits` is the configured `--limit-*` budget (`0` = unlimited);
+`resources.host` is the machine MC2 runs on; `resources.reserved` is the
+CPU/RAM reserved by bound instance specs; `mc2DiskUsedMib` is MC2's measured
+on-disk usage (data dir + named volumes).
+
+## GET /v1/nodes
+
+Lists registered nodes — in v1, the local node.
+
+```
+GET /v1/nodes
+Authorization: Bearer mc2at_...
+```
+
+Each entry reports node identity and capacity. Node tokens are never exposed.
+
+| Field | Meaning |
+| ----- | ------- |
+| `id` | Node id |
+| `name` | Node name |
+| `arch` | Architecture (e.g. `aarch64`) |
+| `cpus` | Host CPUs |
+| `memoryMib` | Host memory MiB |
+| `status` | Node status (e.g. `Ready`) |
+| `lastHeartbeat` | Last heartbeat timestamp |
+| `labels` | Node labels (`key=value`) |
+| `createdAt` | When the node was created |
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/nodes | jq .
+```
+
+```json
+[
+  {
+    "name": "n1",
+    "arch": "aarch64",
+    "cpus": 8,
+    "memoryMib": 16384,
+    "status": "Ready",
+    "labels": {}
+  }
+]
+```

@@ -1,0 +1,57 @@
+---
+title: Observability
+description: OTLP metrics for the orchestrator and node — plus the msb-metrics sidecar for sandboxes.
+---
+
+MC2 exports operational metrics over OpenTelemetry (OTLP) so you can watch
+the control plane and node, not just individual services. Sandbox-level
+CPU/memory/network stays on the microsandbox sidecar — point both at the
+same collector for a unified view.
+
+## What is exported
+
+| Prefix | Covers | Examples |
+| --- | --- | --- |
+| `mc2.server.*` | Orchestrator health | API requests, reconcile cycles, scheduler counts |
+| `mc2.node.*` | Node capacity & activity | capacity, instance counts by phase |
+
+Set the endpoint with the `MC2_OTLP_ENDPOINT` environment variable (or the
+equivalent server flag) and restart the server so it picks it up:
+
+```bash
+export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
+mc2 server --data-dir /tmp/mc2-lab --no-auth
+```
+
+A reference collector configuration ships in
+`examples/90-advanced/observability/collector-config.yaml`.
+
+## The msb-metrics sidecar
+
+Sandbox CPU/mem/net metrics are **not** re-exported by MC2 — they remain on
+microsandbox's own `msb-metrics` sidecar. To get a unified view:
+
+1. Configure `msb-metrics` on the node to the same OTLP collector.
+2. Configure MC2 (`MC2_OTLP_ENDPOINT`) to the same collector.
+3. Query both `mc2.*` and sandbox metrics in the same dashboard.
+
+<Callout type="note" title="Status, the built-in health check">
+  For a quick, dependency-free health read, `mc2 status` prints health,
+  version, and instance counts, and the REST endpoint `GET /v1/status`
+  returns the same as JSON.
+</Callout>
+
+## Key behaviors
+
+- **Server metrics need a restart to pick up the endpoint.** Set
+  `MC2_OTLP_ENDPOINT` before boot.
+- **Two sources, one collector.** Orchestrator metrics and sandbox metrics
+  come from different processes; join them at the collector.
+- **`UNDER DEVELOPMENT`.** The advanced observability example is a working
+  collector config without a full start-and-verify workflow yet.
+
+## Deeper
+
+- [Metrics backends](/recipes/metrics-backends) — collector + Grafana setup.
+- [Run the server](/documentation/operations/run-the-server) — server flags.
+- [REST API: status](/references/api/status) — the `/v1/status` contract.

@@ -1,0 +1,83 @@
+---
+title: Run the server
+description: Server flags, environment variables, auth bootstrap, and day-2 operation.
+---
+
+`mc2 server` is the whole orchestrator. This page is the day-2 reference for
+running it: flags, environment variables, auth bootstrap, and operational
+details. For the mental model, see [Architecture](/documentation/concepts/architecture).
+
+## Start it
+
+```bash
+mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+```
+
+Auth is **on by default**: on first bootstrap the API token prints once —
+save it (the operator REST bearer). Use `--no-auth` only for open lab
+installs.
+
+## Server flags
+
+Every flag also has an environment variable. Defaults in parentheses.
+
+| Flag | Env | Default | Purpose |
+| --- | --- | --- | --- |
+| `--bind` | `MC2_BIND` | `127.0.0.1:7443` | REST listener address |
+| `--data-dir` | `MC2_DATA_DIR` | `~/.mc2` | SQLite state, token, volumes root |
+| `--secrets-key-path` | `MC2_SECRETS_KEY_PATH` | `<data-dir>/secrets.key` | Encryption key for the secret store |
+| `--heartbeat-grace-secs` | `MC2_HEARTBEAT_GRACE_SECS` | `45` | Node heartbeat grace before reschedule |
+| `--reschedule-interval-secs` | `MC2_RESCHEDULE_INTERVAL_SECS` | `5` | Reschedule loop interval |
+| `--reconcile-interval-secs` | `MC2_RECONCILE_INTERVAL_SECS` | `10` | Reconcile loop interval |
+| `--node-name` | `MC2_NODE_NAME` | — | Node identity |
+| `--label KEY=VALUE` | — | — | Node labels (repeatable) |
+| `--ingress-config-dir` | `MC2_INGRESS_CONFIG_DIR` | — | Traefik file-provider catalog output |
+| `--public-hostname` | `MC2_PUBLIC_HOSTNAME` | — | Publish the control plane via ingress |
+| `--public-tls-cert-resolver` | `MC2_PUBLIC_TLS_CERT_RESOLVER` | `le` | Cert resolver for the control-plane route |
+| `--volume-dir` | `MC2_VOLUME_DIR` | `~/.microsandbox/volumes` | Named-volume root |
+| `--no-auth` | `MC2_NO_AUTH` | `false` | Disable API auth (lab only) |
+| `--limit-cpus` | `MC2_LIMIT_CPUS` | `0` (unlimited) | Cluster CPU budget |
+| `--limit-memory-mib` | `MC2_LIMIT_MEMORY_MIB` | `0` (unlimited) | Cluster RAM budget (MiB) |
+| `--limit-disk-mib` | `MC2_LIMIT_DISK_MIB` | `0` (unlimited) | Cluster disk budget (MiB) |
+
+## Auth bootstrap
+
+1. Run `mc2 server --data-dir /srv/mc2` (no `--no-auth`).
+2. Capture the printed `mc2at_…` token.
+3. Use it from the CLI: `export MC2_API_KEY='mc2at_…'`, or save a
+   [context](/documentation/guides/manage-a-remote-server).
+
+The token never prints again — back it up with the data dir.
+
+## Resource budgets
+
+`--limit-cpus` / `--limit-memory-mib` / `--limit-disk-mib` are operator
+budgets (default unlimited). `mc2 up` **refuses** an apply that would exceed
+the reserved CPU/RAM budget or the disk limit, or that exceeds the host's
+detected capacity — so an unplaceable stack is rejected up front instead of
+sitting `Pending`. `mc2 status` and `/v1/status` report host capacity,
+configured limits, reserved CPU/RAM from instance specs, and measured disk
+usage.
+
+## Observability
+
+- **OTLP metrics:** set `MC2_OTLP_ENDPOINT` before boot; the server exports
+  `mc2.server.*` / `mc2.node.*`. Sandbox metrics stay on the msb-metrics
+  sidecar. See [Observability](/documentation/concepts/observability).
+- **Health:** `mc2 status` and `GET /v1/status`.
+
+## Day-2 notes
+
+- **The data dir is the state.** Back it up; don't hand-edit it.
+- **Restart-safe.** Reconcile is idempotent; restarting the server converges
+  again without operator action.
+- **Volumes live under `--volume-dir`** by default inside the data dir; move
+  them explicitly if your durable state must live elsewhere.
+
+## Deeper
+
+- [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) —
+  versioning and state compatibility.
+- [Troubleshooting](/documentation/operations/troubleshooting) —
+  `mc2 doctor` and common failures.
+- [Environment variables](/references/config/environment) — full list.

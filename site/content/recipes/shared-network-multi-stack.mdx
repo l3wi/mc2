@@ -1,0 +1,120 @@
+---
+title: Shared networks across stacks
+description: Join services from different stacks to one server-wide named network and reach each other with <service>.<network>.svc.mc2 DNS.
+---
+
+## What you'll build
+
+Named networks are server-wide, so two stacks can join the same one. A service
+in stack A reaches a service in stack B over the shared network at
+`<service>.<network>.svc.mc2` — default-allow, no allow edges, and no coupling
+between the two stacks' lifecycles.
+
+## The stack
+
+Save two files. First, `stack-a.yaml`:
+
+```yaml
+name: stack-a
+
+networks:
+  shared:
+    mode: mediated
+
+services:
+  api:
+    image: python:3.12-alpine
+    networks: [shared]
+    expose:
+      - port: 8080
+    network:
+      profiles: [public]
+    restart: always
+    command:
+      - /bin/sh
+      - -c
+      - "mkdir -p /tmp/www && printf 'FROM_A\\n' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"
+```
+
+Then `stack-b.yaml`:
+
+```yaml
+name: stack-b
+
+networks:
+  shared:
+    mode: mediated
+
+services:
+  probe:
+    image: alpine:3.20
+    networks: [shared]
+    network:
+      profiles: [public]
+    restart: always
+    command: ["sleep", "infinity"]
+```
+
+Both stacks declare the same named network `shared` (`mode: mediated`) and
+join it via `networks: [shared]`. The network exists once, server-wide — the
+two stacks are members of it together.
+
+## Run it
+
+<Steps>
+<Step title="Apply stack A">
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f stack-a.yaml
+```
+
+</Step>
+<Step title="Apply stack B">
+
+```bash
+mc2 up -f stack-b.yaml
+```
+
+</Step>
+<Step title="Inspect the shared network">
+
+```bash
+mc2 network shared
+```
+
+Lists the network's member instances and ports — including members from both
+stacks.
+
+</Step>
+<Step title="Probe across stacks">
+
+```bash
+mc2 exec stack-b/probe/0 wget -qO- http://api.shared.svc.mc2:8080/
+```
+
+</Step>
+</Steps>
+
+## Verify
+
+The cross-stack probe returns the service from stack A:
+
+```text
+FROM_A
+```
+
+`mc2 network shared` shows `stack-a/api/0` and `stack-b/probe/0` as members of
+the same network. Connectivity is a full mesh within the shared network
+(Docker-style default allow): `api` exposes port 8080, so `probe` reaches it
+by default — no allow edges needed.
+
+## Notes
+
+- DNS depends on the network: the stack's default network is
+  `<service>.<stack>.svc.mc2`; a named network is `<service>.<network>.svc.mc2`.
+- Named networks are mediated-only and same-node in v1.
+- Each stack keeps its own lifecycle: `mc2 down stack-a` tears down only
+  stack A's instances; `mc2 network shared` still lists stack B's members.
+- See [Networking](/documentation/concepts/networking) and
+  [Connect services](/documentation/guides/connect-services).

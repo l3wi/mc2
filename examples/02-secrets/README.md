@@ -15,6 +15,6 @@ be non-empty; injection fails closed otherwise.
 
 Secrets are a **server-wide** store (`mc2 secret set`), shared across stacks —
 unlike `environment:`, which is per-service inline YAML. See
-[docs/guides/secrets.md](../../docs/guides/secrets.md) for the full difference
+[site/content/documentation/concepts/secrets.mdx](../../site/content/documentation/concepts/secrets.mdx) for the full difference
 (direct injection vs encrypted, host-gated msb secrets) and the collision
 precedence rule.

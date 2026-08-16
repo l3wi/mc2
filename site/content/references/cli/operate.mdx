@@ -1,0 +1,87 @@
+---
+title: Operate commands
+description: Run the orchestrator and manage hosts and the CLI with mc2 server, doctor, node, setup, completions, and version.
+---
+
+## Overview
+
+Operate commands run and maintain the MC2 install itself: starting the
+orchestrator, checking host readiness, inspecting nodes, scaffolding setup, and
+generating shell completions.
+
+## server
+
+`mc2 server` runs the orchestrator in a single process: SQLite state, REST API,
+scheduler, and the embedded microsandbox runtime. All server flags are also
+env vars; see the [Environment variables](/references/config/environment) table
+and [Run the server](/documentation/operations/run-the-server).
+
+| Flag | Env | Default | Role |
+| ---- | --- | ------- | ---- |
+| `--bind <addr>` | `MC2_BIND` | `127.0.0.1:7443` | Address to bind the operator REST API |
+| `--data-dir <dir>` | `MC2_DATA_DIR` | `~/.mc2` | Data directory (SQLite, tokens) |
+| `--secrets-key-path <path>` | `MC2_SECRETS_KEY_PATH` | `<data-dir>/secrets.key` | Path to the secrets encryption key (32 bytes) |
+| `--heartbeat-grace-secs <n>` | `MC2_HEARTBEAT_GRACE_SECS` | `45` | Seconds without heartbeat before a Ready node becomes NotReady |
+| `--reschedule-interval-secs <n>` | `MC2_RESCHEDULE_INTERVAL_SECS` | `5` | Interval for reschedule + Pending schedule loops |
+| `--node-name <name>` | `MC2_NODE_NAME` | hostname | Local node name |
+| `--label KEY=VALUE` | — | — | Node labels (repeatable) |
+| `--reconcile-interval-secs <n>` | `MC2_RECONCILE_INTERVAL_SECS` | `10` | Node reconcile interval in seconds |
+| `--ingress-config-dir <dir>` | `MC2_INGRESS_CONFIG_DIR` | — | Directory for Traefik ingress catalog files |
+| `--public-hostname <host>` | `MC2_PUBLIC_HOSTNAME` | — | Public hostname to publish this control plane through the ingress catalog |
+| `--public-tls-cert-resolver <name>` | `MC2_PUBLIC_TLS_CERT_RESOLVER` | `le` | Traefik cert resolver for the control-plane TLS route |
+| `--volume-dir <dir>` | `MC2_VOLUME_DIR` | `~/.microsandbox/volumes` | Named-volume root on durable node storage |
+| `--init-only` | — | — | Bootstrap only: init data dir + tokens + exit (no listen) |
+| `--no-auth` | `MC2_NO_AUTH` | `false` | Initialize without an API token (lab only) |
+| `--limit-cpus <n>` | `MC2_LIMIT_CPUS` | `0` | Max reserved CPUs across the cluster (`0` = unlimited) |
+| `--limit-memory-mib <n>` | `MC2_LIMIT_MEMORY_MIB` | `0` | Max reserved memory MiB (`0` = unlimited) |
+| `--limit-disk-mib <n>` | `MC2_LIMIT_DISK_MIB` | `0` | Max MC2-used disk MiB: data dir + named volumes (`0` = unlimited) |
+
+```bash
+mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+mc2 server --data-dir /srv/mc2 --ingress-config-dir /srv/mc2-ingress --public-hostname mc2.example.com
+```
+
+Auth is on by default — the API token prints once on first bootstrap. `--no-auth`
+is for open lab installs.
+
+## doctor
+
+`mc2 doctor [--msb]` checks host readiness: hypervisor, `msb` (optional), and
+expected paths.
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--msb` | `true` | Also try `msb version` |
+
+```bash
+mc2 doctor
+mc2 doctor --msb
+```
+
+## node
+
+`mc2 node ls` lists registered nodes.
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 node ls` (alias `list`) | List registered nodes |
+
+```bash
+mc2 node ls
+```
+
+## setup, completions, version
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 setup` | Interactive setup wizard; pick a tree |
+| `mc2 setup server` | Jump straight to the server tree |
+| `mc2 setup client` | Jump straight to the client tree |
+| `mc2 completions <shell>` | Generate shell completions (bash/zsh/fish) |
+| `mc2 version` | Show version info |
+
+```bash
+mc2 setup
+mc2 completions bash > ~/.mc2-completions.bash
+mc2 version
+```

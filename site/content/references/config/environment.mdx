@@ -1,0 +1,58 @@
+---
+title: Environment variables
+description: Every MC2 environment variable — client connection, telemetry, and server flags — with role and default.
+---
+
+## Overview
+
+Every `mc2` flag that takes a value is mirrored by an environment variable. The
+client connection env vars resolve the control plane; the server env vars map
+one-to-one onto `mc2 server` flags (flags override env vars).
+
+## Client
+
+| Env var | Role | Default |
+| ------- | ---- | ------- |
+| `MC2_API` | Control plane REST base URL | — (loopback default applies) |
+| `MC2_API_KEY` | Operator API bearer token | — |
+| `MC2_CONTEXT` | Named context to use (overrides the current context) | — |
+| `MC2_ALLOW_INSECURE_HTTP` | Allow plaintext `http://` for a remote (non-loopback) control plane | off |
+| `MC2_SECRET_VALUE` | Value for `mc2 secret set` (prefer over `--value` in scripts) | — |
+
+See [CLI overview](/references/cli/overview) for connection resolution
+precedence.
+
+## Telemetry
+
+| Env var | Role | Default |
+| ------- | ---- | ------- |
+| `MC2_OTLP_ENDPOINT` | OTLP endpoint for orchestrator + node metrics (e.g. `http://127.0.0.1:4317`) | — |
+
+Restart the server after changing the OTLP endpoint so it picks it up.
+
+## Server
+
+These map onto `mc2 server` flags. Defaults match the flag defaults.
+
+| Env var | Flag | Role | Default |
+| ------- | ---- | ---- | ------- |
+| `MC2_BIND` | `--bind` | Address to bind the operator REST API | `127.0.0.1:7443` |
+| `MC2_DATA_DIR` | `--data-dir` | Data directory (SQLite, tokens) | `~/.mc2` |
+| `MC2_SECRETS_KEY_PATH` | `--secrets-key-path` | Path to the secrets encryption key (32 bytes) | `<data-dir>/secrets.key` |
+| `MC2_HEARTBEAT_GRACE_SECS` | `--heartbeat-grace-secs` | Seconds without heartbeat before a Ready node becomes NotReady | `45` |
+| `MC2_RESCHEDULE_INTERVAL_SECS` | `--reschedule-interval-secs` | Interval for reschedule + Pending schedule loops | `5` |
+| `MC2_NODE_NAME` | `--node-name` | Local node name | hostname |
+| `MC2_RECONCILE_INTERVAL_SECS` | `--reconcile-interval-secs` | Node reconcile interval in seconds | `10` |
+| `MC2_INGRESS_CONFIG_DIR` | `--ingress-config-dir` | Directory for Traefik ingress catalog files | — |
+| `MC2_PUBLIC_HOSTNAME` | `--public-hostname` | Public hostname to publish this control plane through the ingress catalog | — |
+| `MC2_PUBLIC_TLS_CERT_RESOLVER` | `--public-tls-cert-resolver` | Traefik cert resolver for the control-plane TLS route | `le` |
+| `MC2_VOLUME_DIR` | `--volume-dir` | Named-volume root on durable node storage | `~/.microsandbox/volumes` |
+| `MC2_NO_AUTH` | `--no-auth` | Initialize without an API token (lab only) | `false` |
+| `MC2_LIMIT_CPUS` | `--limit-cpus` | Max reserved CPUs across the cluster | `0` (unlimited) |
+| `MC2_LIMIT_MEMORY_MIB` | `--limit-memory-mib` | Max reserved memory MiB across the cluster | `0` (unlimited) |
+| `MC2_LIMIT_DISK_MIB` | `--limit-disk-mib` | Max MC2-used disk MiB (data dir + named volumes) | `0` (unlimited) |
+
+<Callout type="note" title="Node labels">
+  `--label KEY=VALUE` is repeatable and has no single env var — pass it on the
+  command line.
+</Callout>

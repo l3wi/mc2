@@ -1,0 +1,68 @@
+---
+title: Contexts file
+description: Named API contexts in ~/.mc2/config.toml — format, the current context, and resolution precedence.
+---
+
+## Overview
+
+Named contexts let the CLI switch between installs — typically one loopback
+context for the local server and one remote context for a production server
+over TLS. Contexts are stored in `~/.mc2/config.toml`, written with mode
+`0600` so tokens stay private. See
+[Identity & contexts](/documentation/concepts/identity-and-contexts) for the
+concept.
+
+## File format
+
+`~/.mc2/config.toml` maps context names to an API URL and an optional token,
+plus a `current` pointer:
+
+```toml
+[contexts.prod]
+api = "https://mc2.example.com"
+token = "mc2at_..."
+
+current = "prod"
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `[contexts.<name>]` | A named context: `api` (control plane REST base URL) and `token` (operator API bearer token) |
+| `current` | The active context name, used when no `--context` / `MC2_CONTEXT` is given |
+
+The token is stored in the 0600 config file. Values are written by
+`mc2 context set`, never hand-edited.
+
+## Resolution precedence
+
+The CLI resolves its connection in this order — the first hit wins:
+
+1. `--api` / `--token` flags
+2. `MC2_API` / `MC2_API_KEY` env vars
+3. `--context` / `MC2_CONTEXT`
+4. the `current` context in `~/.mc2/config.toml`
+5. the loopback default
+
+So a flag or env var overrides the stored context for a single invocation,
+while `mc2 context use` switches the persisted `current`.
+
+## Managing contexts
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 context set <name> --api <URL> [--token <TOKEN>]` | Create or update a context (upsert) |
+| `mc2 context use <name>` | Switch the current context |
+| `mc2 context ls` | List contexts (name, URL, mode) and the current one |
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token mc2at_...
+mc2 context use prod
+mc2 status                      # remote: https://mc2.example.com (context: prod)
+mc2 context ls
+```
+
+<Callout type="warning" title="Remote contexts need TLS">
+  A remote (non-loopback) context requires `https://`; plaintext `http://` is
+  refused unless you opt in with `--allow-insecure-http` /
+  `MC2_ALLOW_INSECURE_HTTP=1`.
+</Callout>

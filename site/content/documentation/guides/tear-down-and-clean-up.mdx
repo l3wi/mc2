@@ -1,0 +1,65 @@
+---
+title: Tear down & clean up
+description: Removal semantics — what down keeps, what --volumes deletes.
+---
+
+**You will learn:** remove stacks and their state safely, and understand the
+retention semantics so you never delete data by accident.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+
+## The command
+
+```bash
+mc2 down <stack>             # instances + definition removed
+mc2 down <stack> --volumes   # also deletes the stack's named volumes
+```
+
+`rm` is an alias for `down`.
+
+## What gets removed
+
+| Artifact | `mc2 down` | `mc2 down --volumes` |
+| --- | --- | --- |
+| Sandbox instances | Yes | Yes |
+| Stack definition (desired state) | Yes | Yes |
+| Named volumes | **No** | Yes |
+| Secrets / keys | No | No |
+| Contexts | No | No |
+
+Secrets and SSH keys are **server-wide** and independent of any stack — a
+stack teardown never touches them. Remove them explicitly:
+
+```bash
+mc2 secret ls && mc2 secret rm <name>
+mc2 ssh keys && mc2 ssh rm-key <name>
+```
+
+## Clean-up hygiene
+
+- **Verify before destroying.** `mc2 ps` shows what's running; `mc2 volume ls`
+  lists the named volumes retained on the node (stack, volume, size, path).
+- **Don't hand-edit the data dir.** Back it up, don't mutate it.
+- **Idempotent tear-down.** `mc2 down` on an already-removed stack is a
+  no-op, not an error.
+
+## What you learned
+
+- `down` stops and forgets; `down --volumes` also destroys data.
+- Server-wide stores (secrets, keys, contexts) are never torn down with a
+  stack.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Run the server"
+    description="Server flags, env vars, and day-2 operation."
+    href="/documentation/operations/run-the-server"
+  />
+  <Card
+    title="Desired state"
+    description="The model that makes teardown predictable."
+    href="/documentation/concepts/desired-state"
+  />
+</Cards>

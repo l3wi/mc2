@@ -1,0 +1,118 @@
+---
+title: Networks & ingress
+description: Server-wide network membership, network profiles, the top-level networks declaration, and the full ingress (rules/tcp) reference.
+---
+
+Two layers compose here: **membership** (which networks a service joins) and
+**exposure** (the `ingress` catalog a BYO Traefik consumes).
+
+## `networks[]` (membership)
+
+List of **server-wide** network names this service joins. Every service is
+implicitly on its stack's default network (named `<stack>`); joining a named
+network also makes it reachable from services in *other* stacks on that
+network (default-allow, `<service>.<network>.svc.mc2` DNS). Networks need no
+top-level declaration — they exist server-wide on first use.
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+    networks: [backend]
+```
+
+Same-stack services on the shared default network reach each other by
+`<service>.<network>.svc.mc2:<port>`; cross-stack reachability requires joining
+a shared named network.
+
+## `network.profiles`
+
+The `network.profiles` key on a service selects its posture from `public`,
+`private`, `host`, and `none` (`none` disables the guest network entirely). It
+is independent of `networks[]` membership — membership says *which* networks,
+the profile says *how*. See [Services](./services#network-profiles) for the
+full table.
+
+## `networks` (top-level)
+
+Top-level declarations exist for group-level options. In v1 only one key is
+valid:
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | no | `mediated` | Only `mediated` is valid in v1. |
+
+Any other value is rejected at parse time. The `backend` example from the
+stack reference declares this explicitly even though `mediated` is the default:
+
+```yaml
+networks:
+  backend:
+    mode: mediated
+```
+
+## `ingress`
+
+Requires at least one of `rules` or `tcp`. Consumed by the server's Traefik
+file export (`mc2 server --ingress-config-dir`).
+
+### `tls`
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Mark routes TLS in the catalog. Certs/ACME live in the proxy. |
+| `certResolver` | — | Traefik certificate resolver name from the proxy static config. |
+
+### `rules[]`
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `host` | yes | — | Hostname to route. |
+| `paths` | yes (≥1) | — | Path → backend entries. |
+
+#### `rules[].paths[]`
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `path` | no | `/` | Route path prefix/exact match. |
+| `pathType` | no | `Prefix` | `Prefix` or `Exact`. |
+| `service` | yes | — | Backend service in this stack. |
+| `port` | yes | — | Must equal a `ports[].target` on that service; backend `ports` entry must be `tcp` with a non-zero `published`. |
+
+```yaml
+ingress:
+  tls:
+    enabled: true
+    certResolver: le
+  rules:
+    - host: shop.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+          port: 8000
+```
+
+### `tcp[]`
+
+| Key | Required | Description |
+| --- | --- | --- |
+| `name` | yes | Stable route name for the Traefik config. |
+| `entryPoint` | yes | Traefik entrypoint accepting TCP connections. |
+| `service` | yes | Backend service; must have `ssh.enabled` with a fixed (non-zero) `ssh.port`. |
+
+```yaml
+ingress:
+  tcp:
+    - name: web-ssh
+      entryPoint: ssh
+      service: web
+```
+
+<Callout type="warning" title="Backend-port validation">
+  HTTP rule backend ports must equal a `ports[].target` on the target service,
+  and that `ports` entry must be `tcp` with a non-zero `published` (`udp`
+  backends and auto-allocated ports are rejected). TCP routes target services
+  through their `ssh` front end, which must have `ssh.enabled` and a fixed
+  (non-zero) `ssh.port`. Violations return `400` at apply.
+</Callout>

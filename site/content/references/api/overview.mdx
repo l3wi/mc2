@@ -1,0 +1,90 @@
+---
+title: REST API overview
+description: The MC2 control-plane contract — base URL, bearer-token auth, error convention, and every endpoint.
+---
+
+## Overview
+
+The MC2 control plane serves a JSON REST API. The CLI is a thin REST client
+over it, so the same routes back every `mc2` command — see the
+[CLI overview](/references/cli/overview).
+
+- **Base URL.** The operator API is served at the server's bind address
+  (default `127.0.0.1:7443`). Operator endpoints live under `/v1/`; `/health`
+  is the bare liveness probe.
+- **JSON in/out.** Requests and responses are JSON.
+- **Auth.** Authenticated endpoints require a bearer token in the
+  `Authorization` header; `/health` is unauthenticated.
+
+## Authentication
+
+Most endpoints require an operator bearer token:
+
+```
+Authorization: Bearer mc2at_...
+```
+
+The server prints the API token once on first bootstrap. Requests without a
+valid token return `401`. `GET /health` is the one exception — it requires no
+auth.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/status
+curl -s http://127.0.0.1:7443/health
+```
+
+## Errors
+
+Errors are returned as JSON with an `error` message. The convention:
+
+| Status | Meaning |
+| ------ | ------- |
+| `400` | Validation / allocation error — malformed body or invalid desired state |
+| `401` | Missing or invalid bearer token |
+| `404` | Resource not found |
+| `500` | Internal server error |
+
+```json
+{ "error": "expose: duplicate port" }
+```
+
+## Endpoints
+
+| Method | Path | Role |
+| ------ | ---- | ---- |
+| `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/v1/status` | Health, version, counts, public hostname, resources |
+| `GET` | `/v1/nodes` | Registered nodes |
+| `POST` | `/v1/stacks:apply` | Apply (up) a stack from YAML |
+| `DELETE` | `/v1/stacks/{name}` | Tear down a stack; `?volumes=true` removes named volumes |
+| `GET` | `/v1/instances` | List instances |
+| `GET` | `/v1/instances/{id}/network` | Observed network status for one instance |
+| `GET` | `/v1/networks` | Server-wide network membership |
+| `GET` | `/v1/volumes` | Named volumes retained on the node |
+| `POST` | `/v1/instances/{id}/exec` | Run a command in an instance's sandbox |
+| `GET` | `/v1/instances/{id}/logs` | Recent sandbox logs; `?follow=true` streams |
+| `GET` | `/v1/ingress` | Desired ingress routes |
+| `GET` | `/v1/secrets` | List secret names (never values) |
+| `PUT` / `DELETE` | `/v1/secrets/{name}` | Create or replace / delete a secret |
+| `GET` | `/v1/ssh/keys` | List authorized SSH keys |
+| `PUT` / `GET` / `DELETE` | `/v1/ssh/keys/{name}` | Manage one authorized SSH key |
+| `GET` | `/v1/ssh/endpoints` | Open SSH endpoints |
+| `GET` / `PUT` / `DELETE` | `/v1/instances/{id}/ssh` | Per-instance SSH state / override |
+
+## Calling from curl
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+export MC2_API_KEY='mc2at_...'
+
+curl -s "$MC2_API/v1/status" | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/instances" | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" \
+  -X POST "$MC2_API/v1/stacks:apply" \
+  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}' | jq .
+```
+
+<Callout type="note" title="Server flags">
+  The control plane is configured by the server's flags and env vars — see
+  [Run the server](/documentation/operations/run-the-server).
+</Callout>

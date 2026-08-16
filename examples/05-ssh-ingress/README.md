@@ -6,7 +6,7 @@ capable machine.
 
 ## Run it
 
-Start the server using the [quickstart](../../docs/guides/quickstart.md),
+Start the server using the [quickstart](../../site/content/documentation/quickstart.mdx),
 with `--ingress-config-dir /tmp/mc2-ssh-ingress/`. Register a public
 key, apply the stack, and start Traefik:
 

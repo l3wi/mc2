@@ -1,0 +1,111 @@
+---
+title: Authentication
+description: The operator bearer token, local versus remote modes, and connection resolution precedence.
+---
+
+Authentication protects the control plane, not the guests. `mc2 server` serves
+a REST API that drives every operation — stack apply, secrets, exec, logs — so
+who can reach that API is who can control your infrastructure. MC2 models this
+as an operator bearer token plus a strict transport rule: loopback is trusted
+by default, everything else needs https and a token.
+
+## The operator API token
+
+Auth is **on by default**. On first bootstrap the server prints a single
+**API token** — an operator REST bearer token, shown as `mc2at_…` — once.
+Every operator request must present it:
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+export MC2_API_KEY='mc2at_…'
+mc2 node ls
+```
+
+The token is the master key to the control plane: anyone holding it can
+manage stacks, read and write secrets, and exec into sandboxes. Treat it like
+a root password.
+
+## Bootstrap: the token prints once
+
+Run the server without `--no-auth` and save the printed token on first
+bootstrap — it is not printed again.
+
+```bash
+mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+# ← save the printed API token (mc2at_…) now
+```
+
+<Callout type="warning" title="Back up the token with the data dir">
+  The token lives under the data dir alongside state and the secret-store key
+  material. Back up the data dir — and lose it and you lose control of the
+  server's identity.
+</Callout>
+
+## `--no-auth` is lab-only
+
+`--no-auth` starts the server with **no API token at all** — any caller who
+can reach the API is the operator. It exists for open lab installs on
+loopback:
+
+```bash
+mc2 server --data-dir /tmp/mc2-dev --bind 127.0.0.1:7443 --no-auth
+```
+
+<Callout type="danger" title="Never --no-auth on anything reachable">
+  Outside a disposable loopback lab, `--no-auth` removes the only credential
+  on the control plane. Any network path to the server becomes full operator
+  access.
+</Callout>
+
+## Local vs remote mode
+
+The CLI resolves its connection and reports the mode in `mc2 status`:
+
+| | local | remote |
+| --- | --- | --- |
+| Host | `127.0.0.1` / `localhost` / `::1` | any other host |
+| Token | optional | required |
+| Transport | http ok (loopback) | https required; plaintext refused |
+
+Remote management pairs a context with the server's `--public-hostname` route:
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context use prod
+mc2 status     # remote: https://mc2.example.com (context: prod)
+```
+
+## Contexts and the contexts file
+
+A **context** bundles an API URL and a token under a name. Contexts live in
+`~/.mc2/config.toml`, written with mode **0600** — readable only by you.
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context ls     # each context shown with its mode
+```
+
+<Callout type="warning" title="Guard the contexts file">
+  `~/.mc2/config.toml` holds bearer tokens in plaintext on disk. It is mode
+  0600 so only your user can read it — do not relax that, and treat the file
+  as sensitive wherever it is copied.
+</Callout>
+
+## Resolution precedence
+
+The CLI picks its connection in this order — flags beat env, env beats the
+context file:
+
+```text
+--api / --token flags
+  > MC2_API / MC2_API_KEY env
+  > --context / MC2_CONTEXT
+  > the `current` context in ~/.mc2/config.toml
+  > the loopback default
+```
+
+`mc2 context use <name>` sets the `current` context; `mc2 status` shows which
+mode and context a given invocation resolved to. See
+[Identity & contexts](/documentation/concepts/identity-and-contexts) for the
+full model, and [Manage a remote server](/documentation/guides/manage-a-remote-server)
+for the end-to-end setup.

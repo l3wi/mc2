@@ -1,0 +1,113 @@
+---
+title: Open SSH
+description: Host-side SSH into a service, with a key registry and optional TCP ingress.
+---
+
+**You will learn:** enable SSH on a service, register authorized keys, and
+connect — locally and through Traefik TCP ingress.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack),
+a local SSH key, and a hypervisor-capable machine. This guide mirrors
+`examples/05-ssh-ingress`.
+
+## The stack
+
+```yaml
+name: ssh-ingress
+services:
+  web:
+    image: alpine:3.20
+    ssh:
+      enabled: true
+      authorizedKeys: [developer]
+```
+
+`ssh:` is a **host-side microsandbox SSH front end** — not a guest `sshd`.
+The short form `ssh: true` works too (all defaults, authenticated by every
+registered key). The stack name here matches the `examples/05-ssh-ingress`
+example the guide applies, so instance refs below use `ssh-ingress`. Replace
+it with your own `name:` and adjust the refs if you use a different file.
+
+## Register a key
+
+```bash
+mc2 ssh add-key developer --file ~/.ssh/id_ed25519.pub
+mc2 ssh keys
+```
+
+## Bring it up and connect
+
+```bash
+mc2 up -f examples/05-ssh-ingress/stack.yaml
+mc2 ssh ls          # shows the direct MC2 listener port
+```
+
+Then, with the fixed port in the example stack (`ssh.port: 2222`):
+
+```bash
+ssh -p 2222 root@127.0.0.1
+```
+
+`mc2 ssh ls` reports the direct listener, which is useful for telling SSH
+problems apart from Traefik problems.
+
+## Override SSH per instance
+
+Keys and endpoints are also first-class commands:
+
+```bash
+mc2 ssh open ssh-ingress/web/0 --key developer --port 2222
+mc2 ssh show ssh-ingress/web/0
+mc2 ssh close ssh-ingress/web/0
+```
+
+## Expose it through Traefik TCP ingress
+
+For remote access over your proxy, add a TCP route. It requires a **fixed**
+`ssh.port`:
+
+```yaml
+services:
+  web:
+    ssh:
+      enabled: true
+      port: 2222
+      authorizedKeys: [developer]
+
+ingress:
+  tcp:
+    - name: web-ssh
+      entryPoint: ssh
+      service: web
+```
+
+Then start Traefik with the catalog and connect through it:
+
+```bash
+traefik --configFile=examples/05-ssh-ingress/traefik.static.yml
+ssh -p 2222 root@127.0.0.1
+```
+
+## Key behaviors
+
+- **Host-side SSH, not guest sshd.** The SDK's SSH server fronts the
+  sandbox.
+- **Key registry is server-wide.** `authorizedKeys` names keys from `mc2 ssh
+  add-key`; an empty list means *all* registered keys authenticate.
+- **TCP ingress needs a fixed port.** `ssh.port: 0` (auto) can't be routed
+  by Traefik.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Use persistent volumes"
+    description="State that outlives a microVM."
+    href="/documentation/guides/use-persistent-volumes"
+  />
+  <Card
+    title="SSH & node placement reference"
+    description="Every ssh key and default."
+    href="/references/stack/ssh-node"
+  />
+</Cards>

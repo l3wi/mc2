@@ -1,0 +1,102 @@
+---
+title: Manage a remote server
+description: Named contexts, the setup wizard, and https-only remote management.
+---
+
+**You will learn:** run MC2 on a VPS and manage it from your laptop with a
+named context over TLS.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+This guide extends the quickstart's remote-management section.
+
+## Why contexts
+
+The CLI is a REST client — a remote server is just a URL swap. A **context**
+bundles that URL with the API key so switching servers is one command.
+`mc2 status` reports whether you're on **local** (loopback, token optional)
+or **remote** (requires https + token) mode.
+
+## 1. On the server host
+
+Bootstrap with auth (omit `--no-auth`; save the printed token), then run with
+a catalog dir and a public hostname so the control plane publishes *itself*
+through Traefik:
+
+```bash
+mc2 server \
+  --data-dir /srv/mc2 \
+  --ingress-config-dir /srv/mc2-ingress \
+  --public-hostname mc2.example.com \
+  --public-tls-cert-resolver le
+```
+
+`--public-hostname` makes the server emit a synthetic control-plane route
+into the catalog (TLS via the cert resolver, backend = the REST listener).
+Point your Traefik file provider at `/srv/mc2-ingress` and it terminates TLS
+for `https://mc2.example.com`.
+
+<Callout type="note" title="Chicken-and-egg">
+  The client needs the route live on first setup. Get the hostname working
+  once (cert resolver + DNS), then everything below is repeatable.
+</Callout>
+
+## 2. On the client machine
+
+Save a named context once, then switch:
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context use prod
+mc2 status              # remote: https://mc2.example.com (context: prod)
+mc2 node ls && mc2 ps
+mc2 up -f stack.yaml
+```
+
+Contexts live in `~/.mc2/config.toml` (mode 0600). Resolution precedence:
+`--api`/`--token` flags > `MC2_API`/`MC2_API_KEY` env > `--context` >
+the `current` context > the loopback default.
+
+## The setup wizard
+
+`mc2 setup` scaffolds both trees interactively (it never starts the server or
+Traefik):
+
+```bash
+mc2 setup                # choose a tree interactively
+mc2 setup server         # on the VPS
+mc2 setup client         # on the laptop
+```
+
+- **Server tree:** bind, data dir, API key on/off, public hostname, cert
+  resolver, ingress dir → writes a ready-to-run default `traefik.static.yml`
+  (once; never overwrites), prints the runnable `mc2 server …` command, and a
+  numbered finish-setup checklist.
+- **Client tree:** context name + control-plane URL + API key → saves and
+  activates the context, optionally verifies with a live status check.
+
+## Insecure HTTP is opt-in
+
+Plaintext `http://` for a remote endpoint is **refused** unless you set
+`--allow-insecure-http` / `MC2_ALLOW_INSECURE_HTTP=1`. Prefer https — the
+operator token travels in the `Authorization` header.
+
+## What you learned
+
+- One token bootstrap, one context save, zero reconfiguration after.
+- The control plane can serve itself through your Traefik for TLS.
+- Remote mode enforces https + token; `mc2 status` tells you which mode.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Tear down & clean up"
+    description="Removal semantics and hygiene."
+    href="/documentation/guides/tear-down-and-clean-up"
+  />
+  <Card
+    title="Identity & contexts"
+    description="The full resolution and trust model."
+    href="/documentation/concepts/identity-and-contexts"
+  />
+</Cards>

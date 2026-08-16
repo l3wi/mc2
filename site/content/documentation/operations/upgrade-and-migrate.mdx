@@ -1,0 +1,67 @@
+---
+title: Upgrade & migrate
+description: Versioning, release channels, and data-dir compatibility.
+---
+
+MC2 is pre-release (0.x). This page explains how versions, releases, and
+state compatibility work so you can upgrade safely.
+
+## Versioning & release channels
+
+- **Production releases** are cut on `main` by release-plz: feature work
+  merged from `dev` bumps the **minor** version, hotfixes merged directly to
+  `main` bump the **patch** version. Each release creates a `vX.Y.Z` git tag
+  and a cargo-dist GitHub Release with checksummed binaries.
+- **Nightly prereleases** (`vX.Y.Z-dev.<date>`) are cut from `dev`. They are
+  ignored by the changelog and are not considered stable.
+- `CHANGELOG.md` is regenerated from conventional commits at release time;
+  PRs into `dev`/`main` update it.
+
+## What changes between versions
+
+The workspace is a single binary crate (`mc2`) plus internal library crates
+that share the workspace version and are never released separately. The
+binary's CLI and the server's REST surface are the compatibility contract.
+
+<Callout type="warning" title="Pre-release caveat">
+  Before 1.0, migrations and storage formats may change between minor
+  versions. Read the release notes in `CHANGELOG.md` for the versions you
+  cross before upgrading a production install.
+</Callout>
+
+## The data dir across upgrades
+
+State lives in SQLite under `--data-dir` (`~/.mc2` by default), including
+the API token and the secrets encryption key. To upgrade:
+
+1. Back up the data dir (`tar` or copy — the server is offline-safe to copy,
+   but stop it first to avoid a torn write).
+2. Install the new binary.
+3. Run `mc2 doctor` to sanity-check the host and paths.
+4. Start `mc2 server` with the same `--data-dir`. Reconcile converges
+   running stacks; nothing is lost or re-declared by hand.
+
+Volumes under `--volume-dir` are plain directories and survive upgrades as
+long as the path is unchanged.
+
+## Migrating an existing install
+
+- **From an older data dir:** run the new binary against the old data dir —
+  store migrations run on open (open → write → reopen → read is a tested
+  contract). If a migration is missing or the format is unrecognized, the
+  server fails fast rather than corrupting state.
+- **From Docker Compose:** see [Migrate from Docker Compose](/recipes/compose-to-mc2).
+
+## Rolling back
+
+Because the binary is a single static-ish release artifact, rollback is:
+restore the previous binary, point at the backed-up data dir, and start.
+Forward migrations are not automatically reversible — restore from backup
+rather than "downgrading in place".
+
+## Deeper
+
+- [Run the server](/documentation/operations/run-the-server) — flags and
+  bootstrap.
+- [Troubleshooting](/documentation/operations/troubleshooting) — recovery.
+- [Changelog](/changelog/unreleased) — what is currently shipping.

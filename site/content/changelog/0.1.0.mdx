@@ -1,0 +1,25 @@
+---
+title: 0.1.0
+description: The first MC2 release — ssh, network, compose parity, exec/logs.
+---
+
+First release of MC2: a Compose-shaped orchestrator for microsandbox microVMs.
+
+## Highlights
+
+- **Simpler SSH (`ssh: true`).** `ssh: true` enables the host-side SSH front
+  end with all defaults, authenticated by every registered key; `mc2 up`
+  prints declared SSH endpoints.
+- **`mc2 network` replaces `mc2 fabric`.** Network summaries, per-network
+  detail, and per-instance connectivity.
+- **Compose parity.** `environment:` (replacing `env:`), string `command`,
+  full `healthcheck` (`timeout`/`retries`/`start_period`/`disable`),
+  `depends_on` startup ordering with `service_healthy`, and per-replica
+  published ports.
+- **`mc2 exec` + `mc2 logs`.** Run commands inside a sandbox and stream logs
+  (`--follow`).
+
+## Changelog
+
+Full details in the
+[repository CHANGELOG](https://github.com/l3wi/mc2/blob/main/CHANGELOG.md#010).

@@ -1,0 +1,77 @@
+---
+title: Desired state & reconciliation
+description: You write what you want; MC2 makes it true and keeps it true.
+---
+
+You write what you want; MC2 makes it true and keeps it true. `mc2 up`
+publishes a stack as the *desired state*, and the server's reconcile loop
+converges real microVMs toward it on an interval. Nothing is run-once and
+nothing drifts.
+
+## The analogy
+
+Docker Compose runs a project once and walks away. MC2 behaves more like a
+Kubernetes controller collapsed into one process: the desired document is
+durable, and a loop continuously compares it against reality, creating,
+restarting, and tearing down instances until they match. Unlike Kubernetes,
+there is no multi-node scheduler — just one node and one loop.
+
+## How it works
+
+1. **Publish.** `mc2 up -f stack.yaml` validates the file (unknown keys are
+   rejected), fills defaults, and persists the normalized document in SQLite.
+   Applying is *idempotent* — the same file re-applied converges to the same
+   state.
+2. **Schedule.** The scheduler turns each service into concrete instances on
+   the local node, resolving per-replica ports, placement (`nodeName` /
+   `nodeSelector`), and `depends_on` ordering.
+3. **Converge.** The reconcile loop runs on an interval (default 10s). For
+   every instance it builds the *desired set* and drives the sandbox through
+   its phase model: `Pending` → `Running`, or `Failed`. Restart policies
+   (`restart: on-failure | always | unless-stopped`) re-create failed or
+   stopped replicas.
+4. **Report.** `mc2 ps` reads live phase state; `mc2 status` summarizes
+   health and counts.
+
+## In practice
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    restart: on-failure
+  web:
+    image: python:3.12-alpine
+    scale: 3
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+```bash
+mc2 up -f stack.yaml   # publish + converge
+mc2 ps                 # watch phases
+mc2 down web-stack     # instances + definition removed
+```
+
+## Key behaviors
+
+- **Idempotent.** Re-applying the same file is a no-op if already converged.
+- **No drift.** The loop owns instance lifecycle; a crashed replica is
+  recreated according to `restart` — not left dead.
+- **Ordering at startup only.** `depends_on` gates *when* a dependent
+  starts; it does not tear down a dependent when its dependency later dies
+  (Compose semantics).
+- **Teardown.** `mc2 down` removes instances *and* the definition; volumes
+  are retained unless you add `--volumes`.
+- **Failed ≠ vanished.** An instance that cannot start reports `Failed`
+  with a reason, so misconfiguration is visible in `mc2 ps`.
+
+## Deeper
+
+- [Services & instances](/documentation/concepts/services-and-instances) —
+  the phase model and restart policies.
+- [Run your first stack](/documentation/guides/run-your-first-stack) —
+  publish, inspect, tear down.
+- [Scale & restart](/documentation/guides/scale-and-restart) —
+  per-replica ports and resilience.

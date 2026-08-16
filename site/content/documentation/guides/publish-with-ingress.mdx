@@ -1,0 +1,112 @@
+---
+title: Publish with ingress
+description: North–south HTTP via ports, ingress rules, and a BYO Traefik.
+---
+
+**You will learn:** route a hostname to a service through your own Traefik
+instance, using the file catalog MC2 writes.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack),
+and Traefik installed. This guide mirrors `examples/04-http-ingress`.
+
+<Callout type="note" title="Lab setup, not production TLS">
+  This is a local HTTP lab, not a production ACME/TLS setup. Traefik is the
+  only supported proxy for MC2 ingress.
+</Callout>
+
+## Start the server with a catalog directory
+
+```bash
+mkdir -p /tmp/mc2-ingress
+mc2 server \
+  --bind 127.0.0.1:7443 \
+  --no-auth \
+  --ingress-config-dir /tmp/mc2-ingress
+```
+
+The `--ingress-config-dir` tells the server where to write the Traefik
+file-provider catalog (`catalog.json`) as instances become Ready.
+
+## Map the hostname
+
+```bash
+echo "127.0.0.1 smoke-ingress.local" | sudo tee -a /etc/hosts
+```
+
+## The stack
+
+```yaml
+name: smoke-ingress
+services:
+  web:
+    image: alpine:3.20
+    ports:
+      - "8088:8000"
+    command: 'exec sh -c "while true; do echo -e \"HTTP/1.1 200 OK\n\nINGRESS_OK\" | nc -l -p 8000; done"'
+ingress:
+  rules:
+    - host: smoke-ingress.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+          port: 8000
+```
+
+The ingress rule's `port` must equal a `ports[].target` on the service.
+
+## Apply and start Traefik
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f examples/04-http-ingress/stack.yaml
+mc2 ps
+
+# Point Traefik's file provider at the catalog directory:
+traefik --configFile=examples/04-http-ingress/traefik.static.yml
+```
+
+## Verify
+
+```bash
+curl -s -H 'Host: smoke-ingress.local' http://127.0.0.1:8088/
+# INGRESS_OK
+```
+
+The server only writes catalog entries for instances that are **Ready**
+(Running + TCP accept), so a dead backend never sits in the proxy. Inspect
+what it wrote:
+
+```bash
+curl -s "$MC2_API/v1/ingress" | jq .
+cat /tmp/mc2-ingress/catalog.json | jq .
+```
+
+## Expose the control plane too
+
+On a remote install, `--public-hostname mc2.example.com` plus a cert
+resolver publishes the REST API itself through the same catalog, so
+`https://mc2.example.com` terminates TLS at your Traefik and reaches the
+server.
+
+## Key behaviors
+
+- **BYO Traefik.** MC2 writes the catalog; you run the proxy and TLS.
+- **Ready-gated files.** No routes until instances are actually reachable.
+- **TLS is delegated.** `ingress.tls.enabled` + `certResolver` just mark
+  routes in the catalog; certs/ACME live in the proxy.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Add secrets"
+    description="Encrypted, host-gated secret injection."
+    href="/documentation/guides/add-secrets"
+  />
+  <Card
+    title="Networks & ingress reference"
+    description="Every ingress key and validation rule."
+    href="/references/stack/networks-ingress"
+  />
+</Cards>

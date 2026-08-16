@@ -1,0 +1,94 @@
+---
+title: Observe commands
+description: Inspect running state with mc2 ps, logs, status, network, ingress, and volume.
+---
+
+## Overview
+
+Observe commands read the cluster's converged state: instances, logs, health,
+network membership, desired ingress routes, and retained named volumes. Every
+listing command accepts `-o json` for machine-readable output.
+
+## ps
+
+`mc2 ps [--stack s] [--service s] [-o json]` lists instances (desired
+sandboxes) and their phases.
+
+| Flag | Meaning |
+| ---- | ------- |
+| `--stack <name>` | Only instances of this stack |
+| `--service <name>` | Only instances of this service |
+| `-o, --output <format>` | `table` (default) or `json` |
+
+```bash
+mc2 ps
+mc2 ps --stack demo --service web
+```
+
+## logs
+
+`mc2 logs <instance> [--tail N] [--follow]` prints recent sandbox logs for an
+instance.
+
+| Arg | Meaning |
+| --- | ------- |
+| `<instance>` | Instance id, or `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) |
+| `--tail N` | Show only the last N entries |
+| `--follow` | Keep streaming new entries as they arrive |
+
+```bash
+mc2 logs demo/web/0
+mc2 logs --tail 50 --follow demo/web/0
+```
+
+## status
+
+`mc2 status [-o json]` prints cluster status: health, version, and counts. It
+is mode/context-aware — it reports the resolved connection mode (local/remote)
+and the active context.
+
+```bash
+mc2 status
+mc2 status -o json
+```
+
+## network & ingress
+
+`mc2 network [name | inst-ref] [-o json]` shows server-wide network
+membership.
+
+| Arg | Meaning |
+| --- | ------- |
+| *(none)* | Every network and its member instances |
+| `<name>` | Drill into one named network |
+| `<stack>/<service>/<ordinal>` | One instance's observed exposes/edges |
+
+```bash
+mc2 network
+mc2 network smoke-networks
+mc2 network demo/web/0
+```
+
+`mc2 ingress [-o json]` lists the desired ingress routes derived from stack
+`ingress:` + `ports:`.
+
+```bash
+mc2 ingress
+mc2 ingress -o json
+```
+
+## volume
+
+`mc2 volume ls [-o json]` lists the named volumes retained on the node —
+directories under `mc2 server --volume-dir` (default
+`~/.microsandbox/volumes`), each resolved as `mc2-<stack>--<volume>`.
+
+```bash
+mc2 volume ls
+mc2 volume ls -o json
+```
+
+The table shows each volume's stack, volume name, on-disk size (MiB), and
+path. Volumes are retained by `mc2 down` and only removed with
+`mc2 down --volumes` — `volume ls` is the way to verify what a destructive
+teardown would remove. See [Storage](/documentation/concepts/storage).

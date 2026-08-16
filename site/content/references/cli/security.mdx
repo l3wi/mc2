@@ -1,0 +1,61 @@
+---
+title: Security commands
+description: Manage encrypted secrets and named API contexts with mc2 secret and mc2 context.
+---
+
+## Overview
+
+Security commands cover the two credential surfaces: `secret` (server-wide,
+encrypted-at-rest values) and `context` (named API connections stored locally).
+
+## Secrets
+
+Secrets are a server-wide store, encrypted at rest. Values are never listed
+back.
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 secret set <name> [--value <value>]` | Create or replace a secret value |
+| `mc2 secret ls` (alias `list`) | List secret names (values never shown) |
+| `mc2 secret rm <name>` (alias `delete`) | Delete a secret |
+
+For scripts, prefer passing the value via the `MC2_SECRET_VALUE` env var (or
+stdin) over `--value` on the command line.
+
+```bash
+mc2 secret set SMOKE_TOKEN --value 'lab-only'
+MC2_SECRET_VALUE='lab-only' mc2 secret set SMOKE_TOKEN
+mc2 secret ls
+mc2 secret rm SMOKE_TOKEN
+```
+
+<Callout type="note" title="Values stay hidden">
+  `secret ls` lists names only; `set` never echoes the value back. Guests see a
+  placeholder and the real value only on connections to `allowHosts`.
+</Callout>
+
+## Contexts
+
+Named contexts save an API URL + token in `~/.mc2/config.toml` (mode 0600) so
+you can switch between local and remote installs.
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 context set <name> --api <URL> [--token <TOKEN>]` | Create or update a context (upsert) |
+| `mc2 context use <name>` | Switch the current context |
+| `mc2 context ls` | List contexts (name, URL, mode) and the current one |
+
+The token is stored in the 0600 config file.
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token mc2at_...
+mc2 context use prod
+mc2 context ls
+```
+
+<Callout type="warning" title="Remote contexts need TLS">
+  A remote (non-loopback) context requires `https://`; plaintext `http://` is
+  refused unless you opt in with `--allow-insecure-http`. See
+  [Identity & contexts](/documentation/concepts/identity-and-contexts) and the
+  [Contexts file](/references/config/contexts-file).
+</Callout>

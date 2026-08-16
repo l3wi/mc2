@@ -1,0 +1,37 @@
+---
+title: Changelog
+description: What is shipping in the current development cycle.
+---
+
+MC2 is pre-release (0.x). Full `vX.Y.Z` entries appear here as releases are
+cut from `main`; the canonical, complete changelog lives in
+[`CHANGELOG.md`](https://github.com/l3wi/mc2/blob/main/CHANGELOG.md) in the
+repo.
+
+## Unreleased
+
+### Resource limits (opt-in; unlimited by default)
+
+- Configurable cluster budgets: `--limit-cpus`, `--limit-memory-mib`,
+  `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
+  refuses an apply that would exceed the reserved budget.
+- Node capacity is host-derived; `--cpus`/`--memory-mib` flags removed.
+  Unplaceable stacks are rejected up front instead of sitting `Pending`.
+- Resource visibility in `mc2 status` / `/v1/status`.
+
+### CLI + fixes
+
+- Bordered tables for `ps` / `node ls` / `network` / `ingress` / `secret ls`
+  / `ssh …` / `context ls` (comfy-table).
+- Fix: `mem_limit` JSON round-trip (bytes, matching compose semantics).
+
+### Rust best-practice cleanup (internal)
+
+- `cargo doc` warning-clean and enforced; `unsafe_code = deny`; clippy
+  `--all-features`; CI gains `cargo machete`, blocking `cargo-deny` /
+  `cargo-audit`.
+- CLI split into modules; REST split into `api/` with typed errors; stack
+  schema split into `schema.rs` + `decode.rs` + `validate.rs`.
+- Typed phase enums at boundaries; automated releases (ADR-0003).
+
+See [0.1.0](/changelog/0.1.0) for the previous release.

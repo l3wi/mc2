@@ -1,0 +1,94 @@
+---
+title: Use persistent volumes
+description: Mount a named volume that survives sandbox recreation.
+---
+
+**You will learn:** declare a volume, mount it into a service, and prove the
+data survives a recreate and a stack teardown.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+This guide mirrors `examples/06-persistent-volumes`.
+
+## The stack
+
+```yaml
+name: smoke-volumes
+volumes:
+  data:
+    kind: dir
+
+services:
+  keep:
+    image: alpine:3.20
+    command: 'exec sh -c "while true; do sleep 3600; done"'
+    volumes:
+      - name: data
+        target: /data
+```
+
+Every service mount must reference a declared top-level volume. `kind: dir`
+is the only kind in v1.
+
+## Write a marker, then force a recreate
+
+```bash
+mc2 up -f stack.yaml
+mc2 exec smoke-volumes/keep/0 'echo durable > /data/marker.txt'
+```
+
+Now make the sandbox be recreated — change the command (a spec change forces
+recreate) or trigger a `restart`:
+
+```bash
+mc2 exec smoke-volumes/keep/0 'kill 1'   # restart: no → will not recreate; use spec change instead
+```
+
+For the reliable path, edit the stack (e.g. add a label) and re-apply:
+
+```bash
+mc2 up -f stack.yaml     # idempotent, but a spec change recreates the sandbox
+mc2 exec smoke-volumes/keep/0 'cat /data/marker.txt'
+# durable
+```
+
+The marker survived because the volume lives on the node
+(`mc2-smoke-volumes--data` under the volume root), not in the sandbox.
+
+## Survives teardown too
+
+```bash
+mc2 down smoke-volumes          # volume retained
+ls ~/.microsandbox/volumes      # mc2-smoke-volumes--data still there
+
+mc2 down smoke-volumes --volumes   # now the volume is deleted
+```
+
+## Key behaviors
+
+- **Node-local named directory volumes.** Stored under
+  `mc2 server --volume-dir` (default `~/.microsandbox/volumes`).
+- **Retained on remove, deleted on `--volumes`.** Think of `down` as
+  stopping, `down --volumes` as destroying.
+- **Name-namespaced.** `mc2-<stack>--<volume>` means two stacks can each
+  have a `data` volume.
+- **Single-consumer in v1.** Give a volume to one service at a time.
+
+## What you learned
+
+- Volumes are the explicit way to persist across sandbox recreation.
+- Teardown semantics: retained by default, destructive with `--volumes`.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Order startup"
+    description="Health-gated depends_on ordering."
+    href="/documentation/guides/order-startup"
+  />
+  <Card
+    title="Storage concept"
+    description="How volume names and lifecycle work."
+    href="/documentation/concepts/storage"
+  />
+</Cards>

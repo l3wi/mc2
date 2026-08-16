@@ -1,0 +1,80 @@
+---
+title: Identity & contexts
+description: API tokens, local vs remote, and how the CLI picks a server.
+---
+
+The `mc2` CLI is a REST client. A **context** names a server (API URL +
+token) so the same commands work on your laptop or a remote VPS. MC2
+distinguishes two trust modes — **local** and **remote** — and refuses
+insecure combinations by default.
+
+## The analogy
+
+Like `kubectl` contexts or `docker context` — a named bundle of connection
+settings, plus a `current` pointer. The difference: MC2 enforces that remote
+connections use TLS and a token.
+
+## How the CLI resolves its connection
+
+Precedence, highest first:
+
+1. `--api` / `--token` flags
+2. `MC2_API` / `MC2_API_KEY` environment variables
+3. `--context` / `MC2_CONTEXT` flags
+4. the `current` context in `~/.mc2/config.toml`
+5. the loopback default (`127.0.0.1:7443`)
+
+```bash
+# Ad-hoc flags
+mc2 --api https://mc2.example.com --token 'mc2at_…' status
+
+# Named context (saved, then switched)
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context use prod
+mc2 status                     # remote: https://mc2.example.com (context: prod)
+```
+
+Contexts live in `~/.mc2/config.toml` (mode 0600). `mc2 context ls` shows
+each context with its mode; `mc2 status` reports which mode is active.
+
+## Local vs remote
+
+- **Local** — loopback API (`127.0.0.1` / `localhost` / `::1`); a token is
+  optional (`--no-auth` lab installs).
+- **Remote** — any other host; requires **https + an API key**. Plaintext
+  `http://` is refused unless you opt in with `--allow-insecure-http` /
+  `MC2_ALLOW_INSECURE_HTTP=1`.
+
+The mode is reported by `mc2 status`, so there is no ambiguity about which
+trust rules applied.
+
+## Remote management loop
+
+1. **On the server:** bootstrap with auth (save the printed token), run with
+   `--public-hostname mc2.example.com` and a cert resolver so the control
+   plane itself appears in the Traefik catalog (`https://mc2.example.com`).
+2. **On the client:** `mc2 context set prod --api https://mc2.example.com
+   --token 'mc2at_…'` once, then `mc2 context use prod` — every command now
+   manages the remote server.
+
+`mc2 setup` scaffolds both trees interactively: the **server** tree writes a
+default `traefik.static.yml`, prints the runnable `mc2 server …` command, and
+a finish-setup checklist; the **client** tree saves and activates a context
+with an optional live verify.
+
+## Key behaviors
+
+- **The CLI is stateless.** Everything it knows about a server is in flags,
+  env, or the contexts file.
+- **Remote means https + token.** There is no "trust me, it's fine" remote
+  over plaintext.
+- **One-time bootstrap token.** The API token prints once; keep it in your
+  secrets manager, not the stack file.
+
+## Deeper
+
+- [Manage a remote server](/documentation/guides/manage-a-remote-server) —
+  end-to-end walkthrough.
+- [Authentication](/security/authentication) — the threat model.
+- [Contexts file](/references/config/contexts-file) — the on-disk format.
+- [Environment variables](/references/config/environment) — every var.

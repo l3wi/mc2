@@ -1,0 +1,95 @@
+---
+title: Stacks
+description: The Compose-shaped desired-state document you hand to MC2.
+---
+
+A **stack** is the desired-state document `mc2 up -f <file>` sends to the
+server. It is Docker-Compose-shaped: a top-level `name` plus a `services`
+map, with `volumes`, `networks`, and `ingress` as top-level declarations.
+Everything is declared in one git-committable YAML file.
+
+## The analogy
+
+Like `docker-compose.yml`: services, ports, environment, healthchecks,
+`depends_on`, volumes, networks. The differences are what make MC2 MC2 —
+the parser is *canonical* (unknown keys are rejected, not ignored), and the
+file describes a desired state that is reconciled, not a run-once recipe.
+
+## The shape
+
+```yaml
+name: shop                        # required (else derived from the file name)
+volumes:
+  data:
+    kind: dir
+networks:
+  backend:
+    mode: mediated
+
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    volumes:
+      - name: data
+        target: /var/lib/postgresql/data
+  web:
+    image: alpine:3.20
+    ports:
+      - "8080:8000"
+
+ingress:
+  rules:
+    - host: shop.local
+      paths:
+        - path: /
+          service: web
+          port: 8000
+```
+
+A minimal, complete stack can be just:
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+```
+
+`mc2 up` fills the missing `name` from the sanitized file name, and defaults
+`scale`, `cpus`, `mem_limit`, `restart`, `command`, and the network profile.
+
+## Canonical parsing
+
+MC2 does not silently ignore what it does not understand. Unknown keys —
+including the old k8s-style `apiVersion`, `kind`, `metadata`, and fields like
+`replicas`, `resources`, `restartPolicy`, `health`, or `env` — are rejected
+with `unknown field …`. Apply returns `400` for any validation failure, and
+`mc2 config -f <file>` validates and prints the normalized document without
+applying anything.
+
+## Validation
+
+Apply returns `400` for: empty services; a missing `name` or one containing
+`--`; undeclared volume mounts or invalid volume names; non-`dir` volume
+kinds; relative or duplicate mount targets; `scale: 0`; unknown `restart`
+values; non-mediated networks; zero or duplicate `expose` ports; ingress
+without routes or with non-tcp backends; TCP ingress without a fixed SSH
+port; and `depends_on` references to unknown services, unknown conditions,
+or cycles.
+
+## Key behaviors
+
+- **Defaults are applied, not required.** The parser fills sensible defaults
+  so partial files work, then normalizes.
+- **`name` is the stack's identity.** `mc2 down <name>` targets it; the name
+  also namespaces the stack's default network and volumes.
+- **The file is the source of desire, not truth.** Reality lives in SQLite;
+  re-applying converges.
+
+## Deeper
+
+- [Stack YAML reference](/references/stack/overview) — every key and default.
+- [Run your first stack](/documentation/guides/run-your-first-stack) — apply,
+  inspect, tear down.
+- [Migrate from Docker Compose](/recipes/compose-to-mc2) — port an existing
+  compose file.

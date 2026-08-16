@@ -1,0 +1,141 @@
+---
+title: Introduction
+description: Compose-shaped orchestration for microsandbox microVMs.
+---
+
+MicroCommandControl (**MC2**) is a Compose-shaped orchestrator for
+[microsandbox](https://microsandbox.dev) microVMs. Declare services in a
+Docker-Compose-style stack file; MC2 schedules, runs, and continuously
+reconciles them as detached, hardware-virtualized microVMs on your machine —
+replicas, restart policies, health-gated startup ordering, encrypted secrets,
+a default-allow service network, and Traefik ingress — without reimplementing
+the VMM and without becoming Kubernetes.
+
+One process, no daemon, no agent: `mc2 server` is the orchestrator — SQLite
+state, REST API, scheduler, and a reconcile loop that drives detached microVMs
+through the embedded microsandbox SDK.
+
+## Where it fits
+
+| | MC2 | Docker Compose | Kubernetes | Firecracker-style |
+| --- | --- | --- | --- | --- |
+| Isolation | microVM (kernel) per replica | container (shared kernel) | container | microVM |
+| Model | desired-state reconcile | run-once | controllers | imperative VMM |
+| Scope | single node, single process | single host | multi-node | no orchestrator |
+| Ergonomics | Compose vocabulary | Compose-native | kubectl | n/a |
+
+Container ergonomics on real microVM isolation, without Kubernetes.
+
+## v1 scope
+
+MC2 is pre-release (0.x) and deliberately small. What you can rely on today:
+
+- **Single node, single process.** One `mc2 server` owns everything; there is
+  no second node type and no distributed store.
+- **Same-node networking.** Service-to-service DNS and L4 splices are
+  node-local; cross-node traffic is not part of v1.
+- **Mediated networks only.** `networks.mode: mediated` is the only network
+  mode; `network.profiles` (public/private/host/none) controls guest posture.
+- **Directory volumes only.** `volumes.kind: dir`; disk images, quotas, and
+  snapshots are future work.
+- **One supported proxy.** MC2 writes Traefik file catalogs — Traefik is the
+  only supported ingress proxy.
+
+See [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) for
+versioning, and the [glossary](/documentation/concepts/glossary) for the
+terms used throughout.
+
+## Why MC2
+
+microsandbox boots a fast microVM. MC2 is the orchestration layer on top of
+it — Compose-shaped stacks, lifecycle, networking, secrets, and operator
+tooling, the parts microsandbox leaves to you.
+
+- **Compose-shaped stacks.** `services`, `scale`, `ports`, `expose`,
+  `environment`, `healthcheck`, `restart`, `depends_on`, `volumes`,
+  `networks`, `ingress` in a git-committable file. Unknown keys are rejected,
+  not ignored.
+- **Desired state, converged.** `mc2 up` reconciles replicas, restart
+  policies, and health-gated startup ordering
+  (`depends_on: {db: {condition: service_healthy}}`); `mc2 down` (alias `rm`,
+  add `--volumes`) tears down. No run-once, no drift.
+- **A local, private sandbox and app host.** The embedded SDK keeps every
+  microVM on your box (or a server you control) — no account, no egress of
+  your code or data. `mc2 exec` and `mc2 logs --follow` are built in.
+- **Secrets that stay secret.** A server-wide, encrypted-at-rest store
+  (`mc2 secret set`) that never echoes values back; the guest sees a
+  placeholder and the real value only on connections to `allowHosts`.
+- **A service network, not a pod network.** `expose` → default-allow
+  east–west with `<service>.<network>.svc.mc2` DNS across server-wide named
+  networks; `ports` + `ingress:` produce a Traefik catalog. `mc2 network`
+  shows it all.
+- **Per-replica ports, no bookkeeping.** `scale: 3` turns `8080` into
+  `8080, 8081, 8082`; target-only ports get stable auto host ports.
+
+## What's possible
+
+- **Launch a swarm of agents.** `scale: 20` on an agent image puts each agent
+  in its own hardware-isolated microVM; `restart` keeps them alive through
+  crashes, and `mc2 exec` / `mc2 logs --follow` drop you into any of them.
+  Give the swarm its own network so agents can coordinate — or keep them fully
+  isolated.
+- **Power your existing Docker Compose with microVMs.** If you can write a
+  `docker-compose.yml`, you already know MC2 — the same `services`, `ports`,
+  `depends_on`, and `environment` shape now boots each service as a
+  hardware-isolated microVM.
+- **Remote coding agents over SSH.** `ssh: true` on a dev VM, `mc2 ssh
+  add-key`, and you SSH into it from anywhere over TLS — your keys and code
+  never leave your box.
+- **A throwaway test grid.** Bring up N identical VMs, run your suite across
+  all of them, then `mc2 down --volumes` and they're gone — or keep a cache
+  volume for reuse.
+- **A fleet of headless browsers.** Thirty scraper VMs, each network-locked
+  to only the hosts it talks to, each disposable inside its own microVM.
+
+## Minimal example
+
+A stack file can be this small:
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+```
+
+`mc2 up` fills the missing `name` from the file name, defaults `scale` to 1,
+and boots one detached microVM. Without an explicit `command`, the default is
+`sleep infinity` — a shell-less image stays alive so you can inspect and exec
+into it:
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f stack.yaml
+mc2 ps
+```
+
+<Callout type="tip" title="Where to start">
+  Follow the [Quickstart](/documentation/quickstart) to install MC2, boot the
+  server, and run your first real service. Then read
+  [Desired state & reconciliation](/documentation/concepts/desired-state) to
+  understand the model that makes everything else make sense.
+</Callout>
+
+## Next steps
+
+<Cards cols={3}>
+  <Card
+    title="Quickstart"
+    description="Install MC2 and run your first service in minutes."
+    href="/documentation/quickstart"
+  />
+  <Card
+    title="Concepts"
+    description="Clean explanations of every MC2 surface."
+    href="/documentation/concepts/architecture"
+  />
+  <Card
+    title="Guides"
+    description="Ordered how-to path from first stack to remote server."
+    href="/documentation/guides/run-your-first-stack"
+  />
+</Cards>

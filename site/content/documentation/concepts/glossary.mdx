@@ -1,0 +1,74 @@
+---
+title: Glossary
+description: The terms MC2 uses — stack, service, instance, phase, desired state, reconcile loop, and the network planes.
+---
+
+MC2 reuses Docker Compose vocabulary where it can, but a few words carry
+specific meaning. This page defines the terms used across the documentation.
+
+## Core objects
+
+- **Stack** — the desired-state document `mc2 up -f <file>` publishes. A
+  Compose-shaped YAML file with a top-level `name` and `services` map, plus
+  optional `volumes`, `networks`, and `ingress`. See
+  [Stacks](/documentation/concepts/stacks).
+- **Service** — one named workload inside a stack: an image, resource limits,
+  and runtime behavior. A stack describes services; services produce
+  instances. See [Services & instances](/documentation/concepts/services-and-instances).
+- **Instance** — one replica of a service: one detached microVM with its own
+  kernel. Addressable as `<stack>/<service>/<ordinal>` (e.g. `shop/web/0`).
+- **Desired state** — what you declared in the stack file. It is durable and
+  idempotent; reality is converged toward it. See
+  [Desired state & reconciliation](/documentation/concepts/desired-state).
+- **Reconcile loop** — the server's periodic pass that compares desired state
+  to reality and creates, restarts, or tears down instances until they match.
+- **Phase** — an instance's lifecycle state: `Pending` (scheduled, not yet
+  running), `Running`, or `Failed`. Restart policies re-create failed
+  instances instead of leaving them dead.
+- **Node** — the host machine `mc2 server` runs on. In v1 there is one node,
+  and it is the same machine that runs the server.
+
+## Networking
+
+- **North–south** — traffic in and out of the box: `ports` host forwards and
+  the Traefik `ingress` catalog. Host ports always bind loopback.
+- **East–west** — service-to-service traffic over shared networks: `expose`
+  listeners + default-allow `svc.<network>.svc.mc2` DNS.
+- **Service network** — a server-wide named network services join via
+  `networks:`. Sharing a network grants default-allow reachability; the DNS
+  suffix is `.svc.mc2`.
+- **Mediated network** — the only network `mode` in v1. Networking is set up
+  by MC2 on the host (an L4 splice), rather than giving the guest direct
+  access to a bridge.
+- **Network profile** — a service's egress posture via `network.profiles`:
+  `public` (default), `private` (no internet egress), `host`, or `none`
+  (no guest networking at all).
+- **Ingress** — hostname + TCP routes MC2 renders into a Traefik file catalog
+  (`--ingress-config-dir`) that you run. See
+  [Networking](/documentation/concepts/networking).
+
+## Storage & secrets
+
+- **Volume** — a named directory on the node that survives sandbox recreation
+  and stack removal, mounted into a service at an absolute guest path. Only
+  `kind: dir` in v1. See [Storage](/documentation/concepts/storage).
+- **Secret** — a server-wide, encrypted-at-rest value referenced by name from
+  a stack. The guest never holds the raw value; it is attached per-connection
+  to `allowHosts`. Distinct from plaintext `environment:`. See
+  [Secrets](/documentation/concepts/secrets).
+
+## Identity
+
+- **Context** — a named bundle of API URL + token so the CLI can switch
+  between servers. Lives in `~/.mc2/config.toml` (mode 0600).
+- **Local vs remote mode** — loopback API (token optional) vs any other host
+  (https + token required, plaintext refused unless opted in). See
+  [Identity & contexts](/documentation/concepts/identity-and-contexts).
+- **API token** — the operator REST bearer token (`mc2at_…`), printed once on
+  first bootstrap. Treat it like a root password.
+
+## Versioning
+
+- **Pre-release (0.x)** — minor versions from `dev` feature work; patch
+  versions from `main` hotfixes; nightly `-dev` prereleases from `dev`. See
+  [Upgrade & migrate](/documentation/operations/upgrade-and-migrate).

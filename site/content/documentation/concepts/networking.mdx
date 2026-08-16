@@ -1,0 +1,123 @@
+---
+title: Networking
+description: Three planes — host ports, service networks, and ingress — that compose independently.
+---
+
+MC2 has three network planes. They solve different problems and compose
+together:
+
+1. **Host ports** (`ports`) — *outside-in* access to a single instance.
+2. **Service networks** (`expose` + `networks`) — *inside-in* communication
+   between services.
+3. **Ingress** (`ingress:` + `ports`) — *hostname* routing through a BYO
+   Traefik proxy.
+
+## The analogy
+
+Compose has `ports` and `expose`; Kubernetes has NodePort/Ingress and the pod
+network. MC2 keeps the Compose vocabulary but the model is deliberate: host
+ports are loopback-only by default, services on a shared network reach each
+other by default (Docker-style), and anything you want reachable by name or
+from outside goes through ingress.
+
+## 1. Host ports (north–south)
+
+`ports` maps a host port to a guest port. Host ports **always bind loopback**
+— the public path is ingress, not an open host bind.
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+    ports:
+      - "8080:8000"       # fixed published:target
+      - "8001"            # target-only → auto host port (stable)
+      - "mcp.example.com:3000"  # hostname sugar → ingress route (TLS)
+```
+
+With `scale > 1`, each replica gets a distinct host port (`8080, 8081,
+8082`); target-only ports get a distinct auto port per replica.
+
+## 2. Service networks (east–west)
+
+A service declares `expose` (internal listeners). Every other service that
+shares a **network** reaches it by default via the node loop's L4 splice,
+with `<service>.<network>.svc.mc2` DNS.
+
+```yaml
+services:
+  echo:
+    image: alpine:3.20
+    expose: [8080]
+  client:
+    image: alpine:3.20
+```
+
+```bash
+mc2 exec smoke/client/0 wget -qO- http://echo.smoke.svc.mc2:8080/
+```
+
+- **Default-allow.** No allow edges to declare — sharing a network is enough.
+- **Networks are server-wide.** Named networks need no top-level declaration;
+  stacks can join the same one, so services in *different* stacks can talk.
+- **`mc2 network`** lists every network and its members; `mc2 network <name>`
+  drills in; `mc2 network <stack>/<service>/<ordinal>` shows one instance's
+  observed exposes/edges.
+- **Unique server-wide ports.** Exposed guest ports are effectively unique
+  server-wide (the L4 splices share host loopback), so a second claim of an
+  already-bound port reports a `Failed` edge — unlike Docker, same-port
+  isolation across networks isn't possible in v1.
+
+## 3. Ingress (north–south HTTP/TCP)
+
+`ingress:` plus `ports:` produces a Traefik file-provider catalog that MC2
+writes to `--ingress-config-dir`. You run your own Traefik pointing its file
+provider there.
+
+```yaml
+ingress:
+  tls:
+    enabled: true
+    certResolver: le
+  rules:
+    - host: shop.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+          port: 8000
+  tcp:
+    - name: web-ssh
+      entryPoint: ssh
+      service: web       # requires ssh.enabled with a fixed port
+```
+
+The control plane can publish *itself* through the same catalog with
+`--public-hostname`, so `https://mc2.example.com` terminates TLS at your
+Traefik and reaches the REST API.
+
+## Network profiles
+
+Each service also picks an egress profile via `network.profiles`:
+`public` (default), `private`, `host`, or `none`. `none` disables the guest
+network entirely. Network-reachable ports are always allowed via narrow
+rules regardless of profile.
+
+## Key behaviors
+
+- **Three planes, three jobs.** Ports for one instance, networks for
+  service-to-service, ingress for hostnames and TLS.
+- **Loopback-only host binds.** Nothing public is bound by accident.
+- **Server-wide names.** Networks and their DNS live at the server level, not
+  per stack.
+- **Same-node in v1.** L4 splices and DNS are node-local.
+
+## Deeper
+
+- [Ports & expose](/references/stack/ports-expose) — exact syntax.
+- [Networks & ingress](/references/stack/networks-ingress) — exact syntax.
+- [Connect services](/documentation/guides/connect-services) — east–west in
+  practice.
+- [Publish with ingress](/documentation/guides/publish-with-ingress) —
+  north–south in practice.
+- [Security: networking](/security/networking) — the security model.

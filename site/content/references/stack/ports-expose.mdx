@@ -1,0 +1,84 @@
+---
+title: Ports & expose
+description: "Host↔guest ports (north-south) and network listeners (east-west): short and long forms, auto host ports, and scaling blocks."
+---
+
+Two independent mechanisms expose a service: `ports[]` forwards host↔guest
+traffic (north-south), while `expose[]` publishes listeners on the shared
+networks (east-west).
+
+## `ports[]` (north-south)
+
+Compose syntax. Host ports always bind loopback; expose publicly through
+`ingress` or the hostname sugar below (BYO Traefik).
+
+```yaml
+ports:
+  - "5000:3001"            # published:target
+  - "3001"                 # target-only → auto-allocated host port (server picks)
+  - "mcp.example.com:3000" # hostname sugar → ingress route for that hostname (TLS, `le`)
+  - "127.0.0.1:5000:3001"  # ip:published:target (ip advisory; always loopback)
+  - "5000:3001/tcp"        # explicit protocol
+```
+
+Long form: `{ target: 3001, published: 5000, protocol: tcp, hostname: "mcp.example.com" }`.
+`published: 0` / omitted → auto host port, resolved once at apply and persisted
+(the port is stable across restarts and re-applies).
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `published` | no | auto | Host port. `0`/absent → server allocates. |
+| `target` | yes | — | Port inside the guest. |
+| `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
+| `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). |
+
+A published port is the north-south gateway; to reach it over the network you
+route it through `ingress` (see [Networks & ingress](./networks-ingress)).
+
+## Auto host ports & scaling
+
+When `scale > 1` and a service declares published ports, each replica gets a
+distinct host port:
+
+- a fixed `published: P` becomes the block `P, P+1, …, P+N-1` (ordinal 0 keeps
+  `P`);
+- a target-only (`"3001"` / hostname-sugar) port gets a distinct auto-allocated
+  port per replica.
+
+Allocations are stable across re-applies. Ingress routes for a scaled service
+target replica 0's port.
+
+<Callout type="note" title="Auto ports persist">
+  An auto host port is resolved once at apply and persisted — the same port
+  survives restarts and re-applies rather than churning each reconcile.
+</Callout>
+
+## `expose[]` (east-west listeners)
+
+Compose list form or map form:
+
+```yaml
+expose: [5432, "6379"]        # bare ports
+# or map form for protocol/name:
+expose:
+  - port: 5432
+    name: main
+```
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `port` | yes | — | Listener port; non-zero, unique per service. |
+| `protocol` | no | `tcp` | Only `tcp` in v1. |
+| `name` | no | — | Optional listener name. |
+
+Reachable by every other service that shares a network (same or different
+stack) as `<service>.<network>.svc.mc2:<port>` (default-allow, round-robin
+across Ready replicas). Same-node only in v1. See
+[Networking](/documentation/concepts/networking).
+
+<Callout type="warning" title="Exposed ports are effectively unique server-wide">
+  Each stack validates uniqueness at parse time, but the L4 splices all live on
+  the shared host loopback, so a port already bound by another stack or network
+  makes the later splice report `Failed` (unlike Docker, same-port isolation
+  across networks isn't possible).
+</Callout>

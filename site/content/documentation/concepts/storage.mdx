@@ -1,0 +1,74 @@
+---
+title: Storage
+description: Named volumes that outlive a microVM.
+---
+
+A **volume** is a named directory on the node that survives sandbox
+recreation, restarts, and stack removal. It is the way state outlives a
+microVM — everything inside the sandbox's own filesystem is ephemeral.
+
+## The analogy
+
+Like a Compose named volume, but backed by a directory on the MC2 node
+rather than by the Docker daemon. Mount it where the service writes state;
+that state persists across `restart`-driven recreates and across `mc2 down`
+until you explicitly delete it.
+
+## Declaring and mounting
+
+Volumes are declared at the top level and referenced by services:
+
+```yaml
+volumes:
+  data:
+    kind: dir
+
+services:
+  keep:
+    image: alpine:3.20
+    volumes:
+      - name: data
+        target: /data
+```
+
+- The top-level declaration is required — services cannot invent volumes.
+- `kind: dir` is the only kind in v1. Disk images, quotas, and snapshots are
+  not yet supported.
+- Volume names must match `[a-z0-9][a-z0-9._-]*` and must not contain `--`.
+- Mount targets must be absolute and unique per service.
+
+## How names resolve
+
+At sandbox create time, each mount resolves to the node-local name
+`mc2-<stack>--<volume>`, stored under the server's volume root
+(`mc2 server --volume-dir`, default `~/.microsandbox/volumes`). Because the
+stack name namespaces the volume, two stacks can each mount a `data` volume
+without colliding.
+
+## Lifecycle
+
+| Event | Volume survives? |
+| --- | --- |
+| Sandbox crash + `restart` recreate | Yes |
+| `mc2 down <stack>` | Yes (retained) |
+| `mc2 down <stack> --volumes` | No (deleted) |
+
+`mc2 volume ls` lists the volumes currently retained on the node (stack,
+volume name, size, path) — useful for verifying what a destructive
+`down --volumes` would remove.
+
+## Key behaviors
+
+- **Ephemeral by default.** Writes to the sandbox rootfs vanish with the
+  microVM; a volume is the explicit choice to persist.
+- **Single-consumer in v1.** Treat a volume as belonging to one service at a
+  time; design caches/grids accordingly (e.g. one scale-1 cache service).
+- **`--volumes` is destructive.** It deletes the stack's named volumes.
+
+## Deeper
+
+- [Use persistent volumes](/documentation/guides/use-persistent-volumes) —
+  marker-file persistence end to end.
+- [Secrets & volumes](/references/stack/secrets-volumes) — exact syntax.
+- [Throwaway test grid](/recipes/throwaway-test-grid) — a cache-volume
+  pattern.

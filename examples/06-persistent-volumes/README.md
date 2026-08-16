@@ -63,7 +63,7 @@ coordination is the application's responsibility.
 ## Run it (lab)
 
 Start the server using the
-[quickstart](../../docs/guides/quickstart.md), optionally pointing it at
+[quickstart](../../site/content/documentation/quickstart.mdx), optionally pointing it at
 a throwaway volume root:
 
 ```bash

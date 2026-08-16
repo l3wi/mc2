@@ -1,0 +1,167 @@
+---
+title: Migrate from Docker Compose
+description: Port a docker-compose.yml to MC2 — rename it, drop unsupported keys, validate with mc2 config, and bring the same services up as microVMs.
+---
+
+## What you'll build
+
+If you can write a `docker-compose.yml`, you already know MC2. Take an existing
+compose file, translate it into an MC2 stack, validate it client-side with
+`mc2 config`, and bring the same services up as hardware-isolated microVMs —
+with no image builds.
+
+## The stack
+
+Given a compose file like this:
+
+```yaml
+# docker-compose.yml (before)
+version: "3.9"
+services:
+  web:
+    image: nginx:1.27
+    ports: ["8080:80"]
+    depends_on: { db: { condition: service_healthy } }
+    restart: on-failure
+  db:
+    image: postgres:16
+    environment: { POSTGRES_PASSWORD: lab }
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+volumes:
+  pgdata: {}
+```
+
+The MC2 stack after migration:
+
+```yaml
+# stack.yaml (after)
+name: myapp
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - "8080:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: lab
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - name: pgdata
+        target: /var/lib/postgresql/data
+volumes:
+  pgdata:
+    kind: dir
+```
+
+### Key mapping
+
+| Docker Compose | MC2 | Notes |
+| --- | --- | --- |
+| `version` | — | drop it; the canonical parser rejects it |
+| `services` | `services` | same shape; each service boots as a microVM |
+| `services.<name>.image` | `image` | unchanged |
+| `services.<name>.command` | `command` | list or string form; defaults to `sleep infinity` |
+| `services.<name>.ports` | `ports` | `"8080:80"` short form; `scale > 1` gives per-replica port blocks |
+| `services.<name>.expose` | `expose` | map form (`port` + `protocol`); default-allow east–west |
+| `services.<name>.environment` | `environment` | map or `KEY=VALUE` list; the old `env:` key is rejected |
+| `services.<name>.healthcheck` | `healthcheck` | `test` / `interval` / `timeout` / `retries` / `start_period` |
+| `services.<name>.restart` | `restart` | `no` / `on-failure` / `always` / `unless-stopped` |
+| `services.<name>.depends_on` | `depends_on` | `condition: service_healthy`; startup ordering only |
+| `services.<name>.networks` | `networks` | join named networks (`[shared]`); network locking via `network.profiles` |
+| `services.<name>.volumes` | `volumes` | long form: `name` + absolute `target`, referencing a top-level declaration |
+| `volumes.<name>` | `volumes.<name>` | requires `kind: dir` (directory-backed only in v1) |
+| `networks.<name>` | `networks.<name>` | requires `mode: mediated` (mediated-only in v1) |
+| `services.<name>.secrets` | `secrets` | server-wide store; `name` + `env` + `allowHosts` |
+| Traefik labels / compose ingress | `ingress` | top-level `ingress:` block plus published `ports` |
+
+### Intentional differences
+
+- **Desired-state reconcile, not run-once.** `docker compose up` runs once and
+  exits; `mc2 up` publishes desired state and the server keeps converging —
+  restart policies, health-gated ordering, and replica counts are continuously
+  reconciled. See [Desired state & reconciliation](/documentation/concepts/desired-state).
+- **A microVM per service, not a container.** The Compose vocabulary is the
+  same, but every replica is hardware-isolated with its own kernel.
+- **Unknown keys are rejected, not ignored.** The canonical parser errors on
+  anything outside the reference — `apiVersion`/`kind`/`metadata`, `replicas`,
+  `resources`, `restartPolicy`, `health`, `mount`, and `env` all fail loudly.
+- **`env:` → `environment:`.** Use `environment:` (map or `KEY=VALUE` list).
+- **Secrets are host-gated.** MC2 secrets live in a server-wide encrypted
+  store and are never echoed; the guest sees a placeholder and the real value
+  attaches only to connections to `allowHosts`. Compose secret files don't
+  translate 1:1.
+- **Volumes are declared and typed.** `volumes` needs `kind: dir`, mounts use
+  absolute targets, and data is node-local — retained on `down`, deleted with
+  `down --volumes`.
+
+## Run it
+
+<Steps>
+<Step title="Rename the file">
+
+```bash
+mv docker-compose.yml stack.yaml
+```
+
+</Step>
+<Step title="Drop unsupported keys">
+
+Edit the file: remove `version:`, rewrite the old `env:` key as
+`environment:`, and convert volume mounts to the long form (`name` + `target`)
+with a `kind: dir` top-level declaration.
+
+</Step>
+<Step title="Validate client-side">
+
+```bash
+mc2 config -f stack.yaml
+```
+
+This parses and prints the normalized document exactly as `mc2 up` would send
+it. Unknown keys are rejected here — fix them before applying.
+
+</Step>
+<Step title="Bring it up">
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f stack.yaml
+mc2 ps
+```
+
+</Step>
+</Steps>
+
+## Verify
+
+```bash
+curl -s http://127.0.0.1:8080/
+```
+
+returns the service's response on the published port, and `mc2 ps` shows the
+services converged to `Running` — `web` only after `db` is healthy, per the
+`service_healthy` condition.
+
+## Notes
+
+- `mc2 config` needs no server — it is a pure client-side validation pass.
+- v1 is single-node; `volumes` and `networks` are node-local and
+  mediated/`dir`-only.
+- East–west traffic works the same way it does in compose: `expose` services
+  reach each other over a default-allow network with `<service>.<network>.svc.mc2`
+  DNS (see [Networking](/documentation/concepts/networking) and
+  [Connect services](/documentation/guides/connect-services)).
+- Publish HTTP hostnames with the `ingress:` block and a BYO Traefik — see
+  [Publish with ingress](/documentation/guides/publish-with-ingress).

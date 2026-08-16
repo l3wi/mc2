@@ -1,0 +1,128 @@
+---
+title: Remote coding agents over SSH
+description: "Turn a dev microVM into an SSH endpoint with ssh: true, register a key with mc2 ssh add-key, and SSH in from anywhere."
+---
+
+## What you'll build
+
+A microVM you can SSH into. `ssh: true` (or an explicit `ssh:` block) turns on
+a host-side SSH front end, `mc2 ssh add-key` registers a public key, and you
+then `ssh -p <port> root@<host>`. Pair it with a context to manage the same
+server remotely over TLS — your keys and code never leave your box.
+
+## The stack
+
+Save this as `dev-agents.yaml`:
+
+```yaml
+name: dev-agents
+services:
+  agent:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    ssh:
+      enabled: true
+      bind: 127.0.0.1
+      port: 2222
+      user: root
+      sftp: true
+      authorizedKeys: [developer]
+ingress:
+  tcp:
+    - name: agent-ssh
+      entryPoint: ssh
+      service: agent
+```
+
+`authorizedKeys` names refer to MC2's SSH-key registry (register each name
+first with `mc2 ssh add-key`), not raw public keys. For a dev-only VM you can
+use the short form — `ssh: true` enables SSH with all defaults and authenticates
+with every registered key, on an auto host port:
+
+```yaml
+services:
+  agent:
+    image: alpine:3.20
+    ssh: true
+```
+
+## Run it
+
+<Steps>
+<Step title="Register a public key">
+
+```bash
+mc2 ssh add-key developer --file ~/.ssh/id_ed25519.pub
+```
+
+</Step>
+<Step title="Apply the stack">
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f dev-agents.yaml
+```
+
+`mc2 up` prints the declared SSH port and the `ingress.tcp` entrypoint. Auto
+ports resolve on the first reconcile — check `mc2 ssh ls`.
+
+</Step>
+<Step title="Check the listeners">
+
+```bash
+mc2 ssh ls
+```
+
+`mc2 ssh ls` reports the direct MC2 SSH listener, which is useful for
+distinguishing SSH or node issues from Traefik issues.
+
+</Step>
+<Step title="SSH in">
+
+```bash
+ssh -p 2200 root@127.0.0.1
+```
+
+For the short form, substitute the port from `mc2 ssh ls`:
+`ssh -p <port> root@127.0.0.1`.
+
+</Step>
+<Step title="Go remote over TLS">
+
+Point the same CLI at a remote server with a context, then apply and SSH to
+its public address:
+
+```bash
+mc2 context set prod --api https://mc2.example.com --token mc2at_…
+mc2 context use prod
+mc2 up -f dev-agents.yaml
+mc2 ssh ls
+ssh -p <port> root@mc2.example.com
+```
+
+</Step>
+</Steps>
+
+## Verify
+
+The two ports are intentionally different:
+
+```text
+Traefik :2200  →  MC2 SSH listener 127.0.0.1:2222  →  microsandbox
+```
+
+`ssh -p 2200 root@127.0.0.1` reaches the microVM through Traefik; `mc2 ssh ls`
+still reports the direct listener on `127.0.0.1:2222`. On a remote server, the
+same `ssh -p <port> root@<host>` works against the server's public hostname.
+
+## Notes
+
+- `bind: 127.0.0.1` keeps the host-side listener loopback-only. Publish it
+  externally with `ingress.tcp` (as above); `0` auto-allocation is not
+  supported for an ingress TCP route's backend port.
+- `port` must be a fixed nonzero port when used by TCP ingress.
+- `sftp: true` enables SFTP for the session.
+- Only the public key is registered server-side; your private key stays on
+  your box.
+- For remote installs, the control plane itself is TLS — see
+  [Manage a remote server](/documentation/guides/manage-a-remote-server).

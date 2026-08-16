@@ -41,7 +41,7 @@ tooling, the parts msb leaves to you.
   (`mc2 secret set`) that never echoes values back; the guest sees a
   placeholder and the real value only on connections to `allowHosts`.
 - **A service network, not a pod network.** `expose` → default-allow east–west
-  with `svc.<network>.svc.mc2` DNS across server-wide named networks;
+  with `<service>.<network>.svc.mc2` DNS across server-wide named networks;
   `ports` + `ingress:` produce a Traefik catalog. `mc2 network` shows it all.
 - **Per-replica ports, no bookkeeping.** `scale: 3` turns `8080` into
   `8080, 8081, 8082`; target-only ports get stable auto host ports.
@@ -85,7 +85,7 @@ Or grab the checksummed `.tar.xz` for your platform from
 
 Requirements: `mc2` on your PATH (see [Install](#install)) and a hypervisor
 (Linux KVM / Apple Silicon HVF) for running sandboxes. Full walkthrough:
-[docs/guides/quickstart.md](docs/guides/quickstart.md).
+[site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx).
 
 ```bash
 DATA=/tmp/mc2-dev
@@ -113,7 +113,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 # advanced collector example: examples/90-advanced/observability/collector-config.yaml
 ```
 
-**Guides:** [Quickstart](docs/guides/quickstart.md) · [Stack YAML](docs/guides/stack-yaml.md) · [Secrets](docs/guides/secrets.md) · [Testing](docs/guides/testing.md)
+**Guides:** [Quickstart](site/content/documentation/quickstart.mdx) · [Stack YAML](site/content/references/stack/overview.mdx) · [Secrets](site/content/documentation/concepts/secrets.mdx) · [Testing](site/content/documentation/operations/troubleshooting.mdx)
 
 ## Binary modes
 
@@ -130,6 +130,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | `mc2 status` | Health + version + counts (mode/context-aware) |
 | `mc2 network [name \| inst-ref]` | Network membership summary; `<name>` detail; `<stack>/<service>/<ordinal>` per-instance connectivity |
 | `mc2 ingress` | Desired ingress routes |
+| `mc2 volume ls` | Named volumes retained on the node (stack, size, path) |
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
 | `mc2 ssh add-key\|keys\|show-key\|rm-key\|ls\|open\|close` | SSH keys + open/close endpoints |
 | `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |
@@ -149,14 +150,14 @@ host outside loopback is `remote` mode (`mc2 status` reports it); plaintext
 `--public-hostname`, which publishes the control plane itself through the
 Traefik ingress catalog so `mc2 context set prod --api https://mc2.example.com
 --token mc2at_… && mc2 context use prod` manages a remote install over TLS. See
-[docs/guides/quickstart.md](docs/guides/quickstart.md#remote-management).
+[site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx#remote-management).
 
 **Interactive setup:** `mc2 setup` walks two trees — **Server** (on the VPS:
 server flags, a one-time default `traefik.static.yml`, and a finish-setup
 checklist) and **Client** (locally: URL + API key → saved context, optional
 live verify).
 
-**Service networks:** `expose` → default-allow east–west with `svc.<network>.svc.mc2` DNS (server-wide — stacks can share a network); `mc2 network` lists networks, members, and ports. See [examples/03-networks/](examples/03-networks/).
+**Service networks:** `expose` → default-allow east–west with `<service>.<network>.svc.mc2` DNS (server-wide — stacks can share a network); `mc2 network` lists networks, members, and ports. See [examples/03-networks/](examples/03-networks/).
 
 **Ingress:** stack `ingress:` + `ports:` → the server writes a Traefik file-provider catalog (`--ingress-config-dir`). See [examples/04-http-ingress/](examples/04-http-ingress/).
 
@@ -169,12 +170,14 @@ live verify).
 ```text
 mc2/
   crates/           # Rust workspace (mc2 bin, server, api, store, runtime, metrics)
-  docs/guides/      # Operator guides (quickstart, stack-yaml, secrets, testing)
+  site/             # Docs site (Next.js + MDX; `cd site && bun run dev`)
   examples/         # Compose-shaped stack YAML, ingress, OTLP samples
   justfile          # build, test, check, run-server
 ```
 
-**Docs site / Next.js app:** lives in a **separate repository** (not this one).
+**Docs site:** a Next.js + MDX app lives in [`site/`](site/) — the public
+documentation (concepts, guides, references, recipes, security). Run
+`cd site && bun install && bun run dev` and open http://localhost:3000.
 
 ## License
 

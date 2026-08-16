@@ -1,0 +1,79 @@
+---
+title: SSH & node placement
+description: The host-side microsandbox SSH front end (boolean and map forms, key auth) and nodeName/nodeSelector placement.
+---
+
+`ssh` gives you a host-side door into a sandbox; `nodeName` and `nodeSelector`
+decide which node runs it.
+
+## `ssh`
+
+Host-side microsandbox SSH front end (not guest sshd). Accepts a short boolean
+form — `ssh: true` (all defaults, authenticated by **every registered key**) —
+or the long map form:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Turns on the host-side microsandbox SSH server. |
+| `bind` | `127.0.0.1` | Agent listener address. |
+| `port` | `0` | Agent backend port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
+| `user` | `root` | SSH username presented to the SDK. |
+| `sftp` | `true` | Enable SFTP on the session. |
+| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh add-key`). Empty → **all registered keys** authenticate. |
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+    ssh:
+      enabled: true
+      bind: 127.0.0.1
+      port: 2222          # 0 = auto-allocate (not usable with ingress.tcp)
+      user: root
+      sftp: true
+      authorizedKeys: [developer]
+```
+
+The boolean form expands to defaults, which means `ssh: true` also enables
+**all registered keys** (empty `authorizedKeys`). `mc2 up` prints the declared
+SSH ports and any `ingress.tcp` entrypoint per service (auto ports resolve on
+first reconcile — see `mc2 ssh ls`).
+
+## Authorized keys
+
+`authorizedKeys` lists names from the key registry (`mc2 ssh add-key`). Empty
+means **every registered key** authenticates — convenient for a single-operator
+lab, risky if you add keys later. The user `mc2` presents to the SDK defaults
+to `root` and the session can include SFTP (`sftp: true` by default).
+
+<Callout type="warning" title="Auto-allocated ports can't back ingress.tcp">
+  `port: 0` (auto-allocate) is resolved only at reconcile time, so a TCP
+  ingress route cannot be pinned to it. `ingress.tcp` requires `ssh.enabled`
+  with a **fixed (non-zero)** `ssh.port`, else apply returns `400`.
+</Callout>
+
+## `nodeName` & `nodeSelector`
+
+Two placement keys with different guarantees:
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `nodeName` | no | — | Hard pin to a node name. |
+| `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+    nodeName: worker-1     # hard pin (optional)
+    nodeSelector:          # soft placement by labels (optional)
+      zone: a
+```
+
+- **`nodeName`** is a hard pin: the instance goes on that node, no fallback.
+- **`nodeSelector`** is soft placement: the instance lands on any node whose
+  labels match the given set.
+
+Both are optional and may be combined — the pin wins where they conflict. See
+[Services & instances](/documentation/concepts/services-and-instances) for how
+placement interacts with the scheduler.

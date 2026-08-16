@@ -1,0 +1,71 @@
+---
+title: Stack YAML overview
+description: The desired-state document mc2 up -f sends to the server — shape, canonical parsing, defaults, and apply-time validation.
+---
+
+The desired-state document `mc2 up -f <file>` sends to the MC2 server. It is
+**Docker Compose-shaped**: a top-level `name` plus a `services` map, with
+`volumes`, `networks`, and `ingress` as top-level declarations.
+
+## Document shape
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `name` | no\* | file stem | Stack name. Must not contain `--` (volume namespace separator). |
+| `services` | yes | — | Map of service name → service spec. Must be non-empty. |
+| `volumes` | no | `{}` | Declared volumes; service mounts must reference them. |
+| `networks` | no | `{}` | Logical network groups (membership only in v1). |
+| `ingress` | no | — | HTTP(S) rules + TCP routes for a BYO Traefik. |
+
+\* filled by `mc2 up` when missing.
+
+A service is roughly "a microVM that runs one process." The full service key
+table lives in [Services](./services). For the deeper model, see
+[Stacks](/documentation/concepts/stacks).
+
+## Canonical parsing
+
+The parser is canonical: **any unrecognized key is rejected** (`unknown field
+…`). There is no legacy compatibility layer, so the old k8s-style
+`apiVersion`/`kind`/`metadata` wrapper and fields like `replicas` /
+`restartPolicy` / `resources` / `health` / `mount` are **errors, not silent
+no-ops**. If a key isn't in this reference, it doesn't apply.
+
+<Callout type="warning" title="Do not port Kubernetes manifests">
+  `apiVersion`, `kind`, `metadata`, `replicas`, `resources`, `restartPolicy`,
+  `health`, `allow`, `mount`, `env`, and `host`/`guest` port keys are all
+  rejected at parse time. Rewrite the document into the keys below.
+</Callout>
+
+## Minimal file
+
+`mc2 up` fills a missing top-level `name:` from the sanitized file stem, so
+this is a complete stack:
+
+```yaml
+services:
+  web:
+    image: alpine:3.20
+```
+
+`mc2 up` also supplies service-level defaults (`scale: 1`, `cpus: 1`,
+`mem_limit: 512m`, `restart: no`, and so on), so the file above runs as-is.
+
+## Apply-time validation
+
+Apply returns `400` for:
+
+- unknown keys (canonical parser — see above)
+- empty services; a missing `name`; `--` in the stack name
+- undeclared volume mounts or invalid volume names; non-`dir` volume kinds
+- relative or duplicate target paths
+- `scale: 0`; unknown `restart` values; non-mediated networks
+- zero/duplicate `expose` ports; non-unique expose ports across the stack
+- ingress without routes; ingress paths whose backend ports are missing or
+  non-tcp; TCP ingress targeting services without fixed SSH ports
+- `depends_on` references to services outside the stack, unknown conditions, or
+  cycles; `service_healthy` dependencies without a declared healthcheck
+
+See [networks & ingress](./networks-ingress) and
+[secrets & volumes](./secrets-volumes) for the individual constraints that back
+these rejections.

@@ -1,0 +1,198 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    monospace;
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+}
+
+:root {
+  --accent: #6d4aff;
+  --accent-strong: #5a39e0;
+  --accent-soft: #efeaff;
+  --muted: #6b7280;
+  --subtle: #f4f4f5;
+}
+
+.dark {
+  --accent: #8b6dff;
+  --accent-strong: #a08cff;
+  --accent-soft: #221a44;
+  --muted: #9ca3af;
+  --subtle: #18181b;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-white text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+}
+
+::selection {
+  @apply bg-accent-soft text-accent-strong;
+}
+
+/* ---------- layout ---------- */
+.docs-grid {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  gap: 0;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+@media (min-width: 1152px) {
+  .docs-grid {
+    grid-template-columns: 264px minmax(0, 1fr) 224px;
+  }
+}
+
+/* ---------- prose content ---------- */
+.prose {
+  --tw-prose-body: var(--tw-prose-body);
+  --tw-prose-bold: inherit;
+  --tw-prose-quotes: inherit;
+  --tw-prose-headings: inherit;
+  max-width: none;
+}
+
+.prose :where(pre):not(:where([class~="not-prose"] *)) {
+  @apply my-5 rounded-xl border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-900;
+}
+
+.prose :where(code):not(:where([class~="not-prose"] *, pre *)) {
+  @apply rounded-md border border-zinc-200 bg-zinc-100 px-1.5 py-0.5 text-[0.85em] font-medium text-zinc-800 dark:border-zinc-800 dark:bg-zinc-800/60 dark:text-zinc-200;
+}
+
+.prose :where(pre code):not(:where([class~="not-prose"] *)) {
+  @apply border-0 bg-transparent p-0 text-[0.85em] leading-relaxed;
+}
+
+.prose :where(h2):not(:where([class~="not-prose"] *)) {
+  @apply mt-12 scroll-mt-24 border-b border-zinc-200 pb-2 text-xl font-semibold tracking-tight dark:border-zinc-800;
+}
+
+.prose :where(h3):not(:where([class~="not-prose"] *)) {
+  @apply mt-8 scroll-mt-24 text-base font-semibold tracking-tight;
+}
+
+.prose :where(h4):not(:where([class~="not-prose"] *)) {
+  @apply mt-6 text-sm font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400;
+}
+
+.prose :where(p):not(:where([class~="not-prose"] *)) {
+  @apply leading-relaxed;
+}
+
+.prose :where(a):not(:where([class~="not-prose"] *)) {
+  @apply font-medium text-accent-strong underline decoration-accent/40 underline-offset-2 hover:decoration-accent;
+}
+
+.prose :where(table):not(:where([class~="not-prose"] *)) {
+  @apply my-6 block w-full overflow-x-auto text-sm;
+}
+
+.prose :where(thead):not(:where([class~="not-prose"] *)) {
+  @apply text-left;
+}
+
+.prose :where(th):not(:where([class~="not-prose"] *)) {
+  @apply border-b border-zinc-300 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:border-zinc-700 dark:text-zinc-400;
+}
+
+.prose :where(td):not(:where([class~="not-prose"] *)) {
+  @apply border-b border-zinc-200 px-3 py-2 align-top dark:border-zinc-800;
+}
+
+.prose :where(blockquote):not(:where([class~="not-prose"] *)) {
+  @apply border-l-4 border-accent/40 pl-4 italic text-zinc-600 dark:text-zinc-400;
+}
+
+.prose :where(ul):not(:where([class~="not-prose"] *)) {
+  @apply list-disc space-y-1 pl-5;
+}
+
+.prose :where(ol):not(:where([class~="not-prose"] *)) {
+  @apply list-decimal space-y-1 pl-5;
+}
+
+.prose :where(li):not(:where([class~="not-prose"] *)) > p {
+  margin: 0;
+}
+
+.prose :where(li):not(:where([class~="not-prose"] *))::marker {
+  @apply text-zinc-400 dark:text-zinc-500;
+}
+
+.prose :where(hr):not(:where([class~="not-prose"] *)) {
+  @apply my-10 border-zinc-200 dark:border-zinc-800;
+}
+
+/* ---------- steps ---------- */
+.mc2-steps {
+  counter-reset: mc2step;
+  list-style: none;
+  padding-left: 0;
+}
+
+.mc2-step {
+  counter-increment: mc2step;
+}
+
+.mc2-step > span::before {
+  content: counter(mc2step);
+}
+
+/* ---------- pretty code (rehype-pretty-code) ---------- */
+[data-rehype-pretty-code-figure] {
+  position: relative;
+}
+
+[data-rehype-pretty-code-figure] pre {
+  overflow-x: auto;
+  padding: 0.9rem 1rem;
+  font-size: 0.85em;
+  line-height: 1.65;
+}
+
+[data-rehype-pretty-code-figure] pre[data-theme="dark"] {
+  display: none;
+}
+
+[data-rehype-pretty-code-figure] code {
+  counter-reset: line;
+  display: grid;
+}
+
+[data-rehype-pretty-code-figure] code > [data-line] {
+  padding: 0 1rem;
+  border-left: 2px solid transparent;
+}
+
+[data-rehype-pretty-code-figure] code > [data-line].highlighted {
+  background: rgba(109, 74, 255, 0.08);
+  border-left-color: var(--accent);
+}
+
+[data-rehype-pretty-code-figure] figcaption {
+  @apply mb-2 rounded-t-xl border border-b-0 border-zinc-200 bg-zinc-100 px-4 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400;
+}
+
+.dark [data-rehype-pretty-code-figure] pre[data-theme="light"] {
+  display: none;
+}
+
+.dark [data-rehype-pretty-code-figure] pre[data-theme="dark"] {
+  display: block;
+}

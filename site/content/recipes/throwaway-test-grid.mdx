@@ -1,0 +1,144 @@
+---
+title: Throwaway test grid
+description: Bring up N identical microVMs, run your suite across all of them, then mc2 down --volumes — with an optional cache volume reused across runs.
+---
+
+## What you'll build
+
+Bring up N identical test microVMs from one service definition, exec your
+suite into each, and tear the whole grid down with `mc2 down --volumes`. A
+single-instance cache service owns a named volume, so the cache survives
+between grid runs.
+
+## The stack
+
+Save this as `test-grid.yaml`:
+
+```yaml
+name: test-grid
+
+volumes:
+  cache:
+    kind: dir
+
+services:
+  cache:
+    image: python:3.12-alpine
+    scale: 1
+    cpus: 1
+    mem_limit: 256m
+    network:
+      profiles: [public]
+    expose:
+      - port: 8080
+    volumes:
+      - name: cache
+        target: /cache
+    restart: always
+    command:
+      - /bin/sh
+      - -c
+      - "mkdir -p /cache/www && printf 'CACHE_OK\\n' > /cache/www/index.html && cd /cache/www && exec python -m http.server 8080"
+
+  runner:
+    image: alpine:3.20
+    scale: 4
+    cpus: 1
+    mem_limit: 256m
+    network:
+      profiles: [public]
+    restart: no
+    command: ["sleep", "infinity"]
+```
+
+- `runner` is the fleet: `scale: 4` identical microVMs, `restart: no` (a
+  throwaway grid should not resurrect itself).
+- `cache` is a single instance that owns the `cache` volume and serves it over
+  the stack's default network at `cache.test-grid.svc.mc2:8080`. v1 volumes
+  are single-consumer, so the fleet reads/writes it over the network instead
+  of mounting it.
+- `mc2 down` keeps named volumes; `mc2 down --volumes` deletes them.
+
+## Run it
+
+<Steps>
+<Step title="Apply the grid">
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f test-grid.yaml
+```
+
+</Step>
+<Step title="Confirm all replicas">
+
+```bash
+mc2 ps --stack test-grid
+```
+
+All four `runner` replicas converge to `Running` alongside `cache`.
+
+</Step>
+<Step title="Run your suite across the fleet">
+
+```bash
+mc2 exec test-grid/runner/0 <your-suite-command>
+for i in 0 1 2 3; do mc2 exec test-grid/runner/$i <your-suite-command>; done
+```
+
+Instance refs take the form `<stack>/<service>/<ordinal>`. A quick smoke check
+against any replica:
+
+```bash
+mc2 exec test-grid/runner/0 /bin/sh -c 'echo ok; uname -a'
+```
+
+</Step>
+<Step title="Check results">
+
+```bash
+mc2 logs test-grid/runner/1 --tail 50
+mc2 logs test-grid/runner/3 --tail 50
+```
+
+</Step>
+<Step title="Tear down">
+
+```bash
+mc2 down test-grid            # instances gone, cache volume kept
+mc2 down --volumes test-grid  # wipe the cache volume too
+```
+
+</Step>
+</Steps>
+
+## Verify
+
+The cache marker is served from the volume, not from memory:
+
+```bash
+mc2 exec test-grid/runner/0 wget -qO- http://cache.test-grid.svc.mc2:8080/
+```
+
+Expected response: `CACHE_OK`.
+
+Reuse across runs: tear down without `--volumes`, re-apply, and the marker is
+still there because the named volume survived:
+
+```bash
+mc2 down test-grid
+mc2 up -f test-grid.yaml
+mc2 exec test-grid/runner/0 wget -qO- http://cache.test-grid.svc.mc2:8080/
+# CACHE_OK
+```
+
+## Notes
+
+- v1 volumes are single-consumer (one volume, one service instance), so the
+  shared cache lives on a `scale: 1` service and the fleet reaches it over the
+  network. Multi-consumer mounts are future work.
+- Volumes are node-local and not replicated; data is lost if the node's
+  storage is lost. Back up the volume root like any durable directory.
+- `restart: no` means a crashed runner is not re-created — good for a grid
+  where you want the failure to show up in `mc2 ps`.
+- Same-node only in v1.

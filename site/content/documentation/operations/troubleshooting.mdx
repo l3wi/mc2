@@ -1,0 +1,67 @@
+---
+title: Troubleshooting
+description: mc2 doctor, common failures, and platform notes.
+---
+
+Start with `mc2 doctor` — it checks the hypervisor, the `msb` CLI (optional),
+and expected paths, and names exactly what is missing.
+
+```bash
+mc2 doctor
+```
+
+## Common failures
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Instance reports `Failed` with an image error | Image name/tag not found, or the image lacks a shell for `command` | Check `mc2 logs <instance>` for the pull/boot error; fix the `image:` reference or provide an explicit `command`. |
+| Instance reports `Failed` immediately | No hypervisor, or the sandbox could not boot | `mc2 doctor`; ensure KVM/HVF is available and your user can open `/dev/kvm`. |
+| `mc2 up` returns `400` with `unknown field …` | Non-canonical key (e.g. k8s-style `apiVersion`, `replicas`, `env:`) | Remove the key; see [Stack YAML](/references/stack/overview). |
+| Host port already in use | Cross-service conflict | Published host ports are effectively unique server-wide; change the port or remove the conflicting service. |
+| `Failed` network edge | Another stack/network already bound the same exposed port | Exposed guest ports are unique server-wide; rename or drop one claim. |
+| Remote `http://` refused | Remote mode requires https + token | Use `https://`, or explicitly opt in with `--allow-insecure-http`. |
+| `mc2 status` shows the wrong mode | Context or env points elsewhere | Check `mc2 context ls`; resolution is flags > env > context > current > loopback. |
+
+## Platform notes
+
+### Linux (KVM)
+
+- Ensure your user can open `/dev/kvm` — this often means being in the `kvm`
+  group: `sudo usermod -aG kvm $USER` and re-login.
+- Nested virtualization is required if MC2 runs inside a VM without
+  passthrough; `mc2 doctor` reports it.
+
+### macOS (Apple Silicon / HVF)
+
+- arm64 is first-class. Intel Macs are out of scope for the MVP.
+- If the hypervisor check fails, confirm the machine is Apple Silicon and the
+  app is running natively (not under Rosetta for the virtualization layer).
+
+### Hypervisor present but nothing boots
+
+The REST/scheduler side serves without a hypervisor — instances just fail
+with a runtime error. Check `mc2 ps` for the `Failed` reason and `mc2 logs
+<instance>` for the runtime/kernel logs.
+
+## Where to look next
+
+- **Instance detail:** `mc2 ps` phases + `mc2 logs <instance>` (add
+  `--follow`).
+- **Network:** `mc2 network` / `mc2 network <name>` / `mc2 network
+  <stack>/<service>/<ordinal>`.
+- **Ingress:** `mc2 ingress`, the catalog JSON in `--ingress-config-dir`, and
+  your Traefik logs.
+- **Tests:** the repo's test strategy separates CI (no hypervisor) from lab
+  (real microVMs) — see the repo `tests/` README.
+
+<Callout type="tip" title="Report a bug">
+  Include `mc2 doctor` output, `mc2 status`, `mc2 ps`, and the failing
+  instance's logs when opening an issue at
+  https://github.com/l3wi/mc2.
+</Callout>
+
+## Deeper
+
+- [Run the server](/documentation/operations/run-the-server) — flags and
+  health reporting.
+- [Stack validation](/references/stack/overview) — the 400-error cases.

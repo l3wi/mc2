@@ -1,0 +1,110 @@
+---
+title: Headless browser fleet
+description: Run N scraper microVMs, each network-locked with network.profiles to only the hosts it talks to, and each disposable with mc2 down.
+---
+
+## What you'll build
+
+A fleet of N scraper microVMs. Every scraper runs in its own kernel-level
+microVM and is network-locked: `network.profiles: [private]` blocks public
+egress (or `[none]` for fully offline VMs). Verify the isolation with
+`mc2 network`, and dispose of the whole fleet with `mc2 down --volumes`.
+
+## The stack
+
+Save this as `scraper-fleet.yaml`:
+
+```yaml
+name: scraper-fleet
+
+services:
+  scraper:
+    image: <scraper-image>    # e.g. a Playwright or Puppeteer image
+    scale: 30
+    cpus: 1
+    mem_limit: 512m
+    network:
+      profiles: [private]     # no public egress; only allowed network edges
+    restart: always
+    command: ["/usr/local/bin/scrape", "--job", "prices"]
+```
+
+- `scale: 30` — thirty microVMs from one definition; each scraper is isolated
+  in its own VM.
+- `network.profiles: [private]` — the sandbox gets no public internet; it can
+  only use the network edges MC2 grants it. For a scraper that only parses
+  already-fetched input, use `[none]` to disable networking entirely.
+- `restart: always` — a crashed scraper is re-created by the reconcile loop;
+  with `restart: no` a failed scrape stays `Failed` in `mc2 ps`.
+
+## Run it
+
+<Steps>
+<Step title="Apply the fleet">
+
+```bash
+export MC2_API=http://127.0.0.1:7443
+mc2 up -f scraper-fleet.yaml
+```
+
+</Step>
+<Step title="Confirm the fleet is running">
+
+```bash
+mc2 ps --stack scraper-fleet
+```
+
+</Step>
+<Step title="Tail a scraper's logs">
+
+```bash
+mc2 logs scraper-fleet/scraper/0 --tail 50
+mc2 logs scraper-fleet/scraper/7 --follow
+```
+
+</Step>
+<Step title="Exec into a scraper">
+
+```bash
+mc2 exec scraper-fleet/scraper/4 /bin/sh -c 'echo scrape-ok'
+```
+
+</Step>
+</Steps>
+
+## Verify
+
+Confirm the fleet's network membership:
+
+```bash
+mc2 network scraper-fleet
+```
+
+lists the fleet's network with its member instances and ports. Isolation is
+enforced by the network profile: a request from a `[private]` VM to a public
+host fails — there is no route out:
+
+```bash
+mc2 exec scraper-fleet/scraper/0 wget -qO- http://example.com
+```
+
+Under `[private]` this cannot connect; under `[none]` the sandbox has no
+networking at all.
+
+Dispose of the fleet when done:
+
+```bash
+mc2 down scraper-fleet --volumes
+```
+
+## Notes
+
+- Network profiles are `public` (default), `private`, `host`, and `none`.
+  `[private]` keeps the microVM off the public internet; `[none]` turns off
+  networking entirely.
+- Each scraper is a full microVM, so 30 scrapers = 30 VMs — budget CPU and
+  memory on the host.
+- A scraper that legitimately needs the internet should use
+  `network.profiles: [public]`; lock down the others.
+- Same-node only in v1. See [Networking](/documentation/concepts/networking)
+  for the three network planes.

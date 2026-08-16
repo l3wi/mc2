@@ -1,0 +1,94 @@
+---
+title: Order startup
+description: Health-gated startup with healthcheck and depends_on.
+---
+
+**You will learn:** make one service wait until another is *healthy* (not
+just started) using `healthcheck` and `depends_on`, and tune per-replica
+ports at `scale > 1`.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+This guide mirrors `examples/07-startup-ordering`.
+
+## The stack
+
+```yaml
+name: startup-ordering
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    environment:
+      POSTGRES_PASSWORD: lab
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  web:
+    image: python:3.12-alpine
+    scale: 3
+    ports:
+      - "8080:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: 'exec python -m http.server 8000'
+```
+
+## Watch the gating
+
+```bash
+mc2 up -f examples/07-startup-ordering/stack.yaml
+mc2 ps
+```
+
+Until the DB's `pg_isready` probe passes, `web` stays `Pending` with a
+message like `depends_on: waiting for db (service_healthy)`. Once the DB
+reports healthy, `web` converges to `Running`.
+
+## Ordering semantics
+
+- **List form** (`depends_on: [db]`) means `condition: service_started`.
+- **`service_healthy`** requires the dependency to declare a non-disabled
+  healthcheck.
+- **Ordering only at startup.** If the DB dies later, `web` is *not* torn
+  down (Compose semantics).
+- **Cycles are rejected** at parse time; references must stay in-stack.
+
+## Healthcheck keys
+
+`interval`, `timeout`, `retries`, `start_period`, and `disable`. `retries`
+consecutive failures past `start_period` mark the instance unhealthy — with
+`restart` set it is recreated, otherwise it reports `Failed`.
+
+## Per-replica ports
+
+With `scale: 3` and `8080:8000`, replicas get **`8080, 8081, 8082`** —
+distinct host ports per replica, ingress targeting replica 0. Check:
+
+```bash
+curl -s http://127.0.0.1:8080/
+curl -s http://127.0.0.1:8082/
+```
+
+## What you learned
+
+- `depends_on` gates *when* a dependent starts, keyed on health.
+- Healthchecks are exec probes with full Compose tuning.
+- Scaling a published-port service allocates ports per replica for you.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Manage a remote server"
+    description="Contexts, setup wizard, and remote TLS."
+    href="/documentation/guides/manage-a-remote-server"
+  />
+  <Card
+    title="Healthchecks reference"
+    description="Every healthcheck and depends_on key."
+    href="/references/stack/health-depends"
+  />
+</Cards>

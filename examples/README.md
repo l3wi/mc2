@@ -35,12 +35,12 @@ paths. The parser is canonical — unknown keys (including the old k8s-style
 `health`, `mount`, and `env`) are rejected loudly rather than silently ignored.
 Note that filling re-serializes the document, so YAML comments in partial files
 are dropped; complete files pass through verbatim. Full key reference:
-[stack.yaml guide](../docs/guides/stack-yaml.md).
+[stack.yaml guide](../site/content/references/stack/overview.mdx).
 
 ## Ready-to-use
 
 - [Hello service](./01-hello-service/) — run one HTTP service and verify it with `curl`.
-- [Secrets](./02-secrets/) — inject an encrypted secret with an `allowHosts` policy (server-wide store; `environment` overrides collisions). See the [secrets guide](../docs/guides/secrets.md).
+- [Secrets](./02-secrets/) — inject an encrypted secret with an `allowHosts` policy (server-wide store; `environment` overrides collisions). See the [secrets guide](../site/content/documentation/concepts/secrets.mdx).
 - [Service networks](./03-networks/) — connect two services with `expose` over a shared network (default-allow mesh); `mc2 network` shows members and ports.
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.

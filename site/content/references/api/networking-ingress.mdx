@@ -1,0 +1,67 @@
+---
+title: Networking & ingress
+description: Read network membership, per-instance connectivity, and desired ingress routes via the /v1 API.
+---
+
+## Overview
+
+Networking endpoints expose the service-network model: server-wide network
+membership, one instance's observed connectivity, and the desired ingress
+routes derived from stack `ingress:` + `ports:`. All require a bearer token.
+
+## GET /v1/networks
+
+`GET /v1/networks` returns the server-wide network membership summary (default
++ named networks) with member instances and ports.
+
+```
+GET /v1/networks
+Authorization: Bearer mc2at_...
+```
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/networks | jq .
+```
+
+## GET /v1/instances/{id}/network
+
+`GET /v1/instances/{id}/network` returns the observed network status for one
+instance (agent-reported).
+
+```
+GET /v1/instances/{id}/network
+Authorization: Bearer mc2at_...
+```
+
+Response fields: `instanceId`, `phase`, `message`, `updatedAt`, and `observed`
+(the agent's report). Returns `404` when there is no network status for the
+instance.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." \
+  http://127.0.0.1:7443/v1/instances/<id>/network | jq .
+```
+
+## GET /v1/ingress
+
+`GET /v1/ingress` lists the desired ingress routes derived from stack YAML and
+instance placement. Ready/file status is agent-local (the `catalog.json` under
+`--ingress-config-dir`).
+
+```
+GET /v1/ingress
+Authorization: Bearer mc2at_...
+```
+
+The response is `{ routes, note }`. Each route carries `id`, `stack`, `host`,
+`path`, `service`, guest/host ports, `tlsEnabled`, `certResolver`, and the
+backend instance/ordinal.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/ingress | jq .
+```
+
+<Callout type="note" title="Ingress file readiness">
+  `GET /v1/ingress` is desired state only — the Traefik file catalog lives on
+  the agent under `--ingress-config-dir` and is written by the reconcile loop.
+</Callout>

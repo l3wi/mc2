@@ -1,0 +1,134 @@
+---
+title: Stacks & instances
+description: Apply and delete stacks, and list, exec, and read logs for instances via the /v1 API.
+---
+
+## Overview
+
+The `/v1/stacks*` and `/v1/instances*` endpoints publish desired state and
+observe the converged result. All require a bearer token.
+
+## Apply a stack
+
+`POST /v1/stacks:apply` publishes stack YAML as desired state and converges
+instances toward it. The request body is a JSON object with a `yaml` field
+holding the stack YAML. A missing top-level `name:` is filled in from the
+file path; the old k8s-style `apiVersion`/`kind`/`metadata` wrapper is
+**rejected** by the canonical parser (see
+[Stack overview](/references/stack/overview)).
+
+```
+POST /v1/stacks:apply
+Authorization: Bearer mc2at_...
+Content-Type: application/json
+
+{ "yaml": "name: demo\nservices:\n  web:\n    image: alpine:3.20\n" }
+```
+
+Apply is idempotent. Validation errors — malformed YAML, duplicate `expose`
+ports, allocation or capacity failures — return `400` with an `error` message.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." \
+  -X POST http://127.0.0.1:7443/v1/stacks:apply \
+  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}' | jq .
+```
+
+## Delete a stack
+
+`DELETE /v1/stacks/{name}` tears down a stack: instances and the stack
+definition. Named volumes are retained unless you add `?volumes=true`, which
+removes them best-effort.
+
+```
+DELETE /v1/stacks/demo?volumes=true
+```
+
+Returns `204` on success, `404` if the stack does not exist.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." -X DELETE \
+  "http://127.0.0.1:7443/v1/stacks/demo?volumes=true"
+```
+
+## List instances
+
+`GET /v1/instances` lists all instances (desired sandboxes) with their phase.
+
+```
+GET /v1/instances
+Authorization: Bearer mc2at_...
+```
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/instances | jq .
+```
+
+## Exec & logs
+
+`POST /v1/instances/{id}/exec` runs a command inside the instance's sandbox and
+returns the captured output.
+
+| Body field | Meaning |
+| ---------- | ------- |
+| `cmd` | Command array (required; empty `cmd` → `400`) |
+| `stdin` | Optional stdin to forward |
+
+Response fields: `instanceId`, `exitCode`, `stdout`, `stderr`. An instance with
+no sandbox runtime yet returns `400`.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." \
+  -X POST http://127.0.0.1:7443/v1/instances/<id>/exec \
+  -d '{"cmd":["echo","hi"]}' | jq .
+```
+
+`GET /v1/instances/{id}/logs` returns recent sandbox logs.
+
+| Query param | Meaning |
+| ----------- | ------- |
+| `tail` | Show only the last N entries |
+| `follow=true` | Stream new entries as they arrive (SSE) |
+
+Without `follow`, the response is `{ instanceId, entries }`, each entry with
+`timestamp`, `source`, and `data`.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." \
+  "http://127.0.0.1:7443/v1/instances/<id>/logs?tail=50" | jq .
+```
+
+## List volumes
+
+`GET /v1/volumes` lists the named volumes retained on the node — directories
+under the server's volume root (`mc2 server --volume-dir`, default
+`~/.microsandbox/volumes`), each resolved as `mc2-<stack>--<volume>`.
+
+```
+GET /v1/volumes
+Authorization: Bearer mc2at_...
+```
+
+Each entry reports `name` (the resolved `mc2-<stack>--<volume>` identity),
+`stack`, `volume` (the name declared in the stack), `path`, and `sizeMib`
+(measured best-effort). Non-MC2 entries in the volume root are ignored.
+
+```bash
+curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/volumes | jq .
+```
+
+```json
+[
+  {
+    "name": "mc2-shop--data",
+    "stack": "shop",
+    "volume": "data",
+    "path": "/srv/mc2-volumes/mc2-shop--data",
+    "sizeMib": 4
+  }
+]
+```
+
+Volumes are retained by `DELETE /v1/stacks/{name}` and only removed with
+`?volumes=true` — this endpoint is how you verify what a destructive teardown
+would remove. See [Storage](/documentation/concepts/storage).

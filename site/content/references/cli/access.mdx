@@ -1,0 +1,69 @@
+---
+title: Access commands
+description: Run commands in sandboxes and manage SSH keys and endpoints with mc2 exec and mc2 ssh.
+---
+
+## Overview
+
+Access commands get you inside an instance's sandbox: `exec` runs one-off
+commands, and `ssh` manages authorized keys and open/close SSH endpoints.
+
+## exec
+
+`mc2 exec <instance> <cmd...>` runs a command inside an instance's sandbox.
+Piped stdin is forwarded.
+
+| Arg | Meaning |
+| --- | ------- |
+| `<instance>` | Instance id, or `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) |
+| `<cmd...>` | Command to run in the sandbox |
+
+```bash
+mc2 exec demo/web/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
+echo "input" | mc2 exec demo/web/0 tee /dev/stdin
+```
+
+## ssh keys
+
+Authorized public keys live in a cluster-wide registry.
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 ssh add-key <name> --key <line>` | Add or replace an authorized public key from a key line |
+| `mc2 ssh add-key <name> --file <path>` | Add or replace an authorized public key from a `.pub` file |
+| `mc2 ssh show-key <name>` | Show one authorized public key |
+| `mc2 ssh keys` (alias `key-ls`) | List authorized public keys |
+| `mc2 ssh rm-key <name>` | Remove an authorized public key |
+
+`add-key` takes either `--key <public key line>` or `--file <path to .pub>`.
+
+```bash
+mc2 ssh add-key laptop --file ~/.ssh/id_ed25519.pub
+mc2 ssh keys
+mc2 ssh show-key laptop
+mc2 ssh rm-key laptop
+```
+
+## ssh endpoints
+
+| Command | Meaning |
+| ------- | ------- |
+| `mc2 ssh ls` (alias `list`) | List open SSH endpoints |
+| `mc2 ssh show <id>` | Show SSH state for an instance |
+| `mc2 ssh open <id> --key <name>... [--bind] [--port]` | Open SSH on an instance (API override) |
+| `mc2 ssh close <id>` | Close SSH on an instance |
+
+`open` requires at least one `--key <name>` (repeatable, authorized key names)
+and accepts:
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--bind <addr>` | `127.0.0.1` | Local bind address |
+| `--port <n>` | `0` | Local port (`0` = auto-assigned) |
+
+```bash
+mc2 ssh open demo/web/0 --key laptop
+mc2 ssh ls
+ssh -p <port> root@127.0.0.1
+mc2 ssh close demo/web/0
+```

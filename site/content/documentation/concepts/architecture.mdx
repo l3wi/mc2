@@ -1,0 +1,81 @@
+---
+title: Architecture
+description: One process — REST, SQLite, scheduler, and a reconcile loop driving detached microVMs.
+---
+
+MC2 is one process. `mc2 server` is the whole orchestrator: it stores state,
+serves the REST API, schedules work, and reconciles real microVMs toward what
+you declared. There is no daemon to install, no agent to run on the host, and
+no gRPC seam between layers.
+
+## The analogy
+
+Think of Docker Compose's `compose up` — but the process that wrote the
+desired state stays alive and keeps converging, and each "container" is a
+microVM with its own kernel. Or think of a Kubernetes control plane with all
+controllers collapsed into a single binary that only ever manages one node.
+
+## How it works
+
+`mc2 server` combines four components in one process:
+
+1. **SQLite store** — the source of truth: stacks (normalized `spec_json`),
+   instances and their phases, secrets, keys, contexts, and node state.
+   Nothing is re-derived from YAML on every request.
+2. **REST API** — the operator surface the CLI talks to (`/v1/...`). The CLI
+   is a thin REST client, so the same commands manage a local or remote
+   server.
+3. **Scheduler** — turns a published stack into concrete instances on nodes
+   (one node in v1), resolving per-replica ports and placement.
+4. **Reconcile loop** — on an interval, builds the *desired set* from state
+   and drives real sandboxes through the embedded microsandbox SDK toward it:
+   create, health-probe, restart, network splice, ingress file write, and
+   teardown.
+
+```text
+            ┌────────────────────── mc2 server (one process) ──────────────────────┐
+            │                                                                      │
+  mc2 CLI ──┤──► REST API ──► Scheduler ──► desired set                            │
+            │       ▲              │                                                │
+            │       │         reconcile loop ──► embedded microsandbox SDK ──► microVMs
+            │       │              │                                                │
+            │       └──────────────┴──────────────► SQLite (source of truth)       │
+            └──────────────────────────────────────────────────────────────────────┘
+```
+
+`mc2 doctor` is the pre-flight check: hypervisor present (KVM `/dev/kvm` or
+Apple Silicon HVF), `msb` CLI on PATH (optional), and expected paths. The REST
+and scheduler side serves even without a hypervisor; instances fail with a
+runtime error instead.
+
+## In practice
+
+```bash
+mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+```
+
+Server-level knobs (all also env vars) include `--node-name`, `--label
+KEY=VALUE`, `--volume-dir` (durable volume root), `--ingress-config-dir`
+(Traefik file catalog), and `--reconcile-interval-secs`. Auth is on by
+default — the API token prints once on first bootstrap; `--no-auth` is for
+open lab installs.
+
+## Key behaviors
+
+- **Single node, single process** in v1. There is no distributed store and no
+  second node type.
+- **SQLite is the truth.** Re-apply is idempotent; the file on disk is
+  desired state, the database is the converged reality.
+- **Data-dir artifacts.** State, volumes, and the token live under the data
+  dir; back it up, don't hand-edit it.
+- **`--public-hostname`** publishes the control plane itself through the
+  Traefik ingress catalog, so a remote install is manageable over TLS.
+
+## Deeper
+
+- [Desired state & reconciliation](/documentation/concepts/desired-state) — the
+  loop that makes one process enough.
+- [Run the server](/documentation/operations/run-the-server) — every flag and
+  env var.
+- [Stacks](/documentation/concepts/stacks) — the document that drives it.
+- [REST API](/references/api/overview) — the control-plane contract.

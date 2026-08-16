@@ -1,0 +1,74 @@
+---
+title: Services
+description: The services.<name> key table, network profiles, and command string-vs-list behavior.
+---
+
+A service is the unit of work in a stack: a container image, resource limits,
+and the runtime behavior that turns it into one or more sandbox instances.
+
+## `services.<name>` keys
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `image` | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). |
+| `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
+| `cpus` | no | `1` | vCPUs (float, e.g. `0.5`); rounded up. |
+| `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
+| `command` | no | `sleep infinity` | Guest argv. List (`["echo", "hi"]`) or string (`echo "hi there"`, split shell-like). Omit to keep a shell-less image alive. |
+| `restart` | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`. Drives node restart/recreate on failure. |
+| `environment` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
+| `depends_on` | no | `{}` | Startup ordering: list (`[db]`) or map (`{db: {condition: service_healthy}}`). Conditions: `service_started` (default) \| `service_healthy` (requires the dependency to declare a healthcheck). |
+| `labels` | no | `{}` | Free-form labels copied onto the sandbox. |
+| `network` | no | public | See `network` below. |
+| `ports` | no | `[]` | Host↔guest port forwards (north-south; auto host port when `published` omitted). |
+| `secrets` | no | `[]` | Cluster secret injections. |
+| `volumes` | no | `[]` | Mounts of declared stack volumes. |
+| `healthcheck` | no | none | Exec health probe. |
+| `ssh` | no | disabled | Host-side msb SSH front end. |
+| `expose` | no | `[]` | Network listeners (east-west; default-allow on shared networks). |
+| `networks` | no | `[]` | Server-wide network membership (default = stack). |
+| `nodeName` | no | — | Hard pin to a node name. |
+| `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
+
+The last four — `ssh`, `expose`/`networks`, `healthcheck`/`depends_on`, and
+`nodeName`/`nodeSelector` — have dedicated pages in this section.
+
+## `network` profiles
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Network reachable ports are always allowed via narrow rules regardless of profile. |
+
+Profiles select the guest's network posture:
+
+- **`public`** (default) — the guest participates in the shared networks and
+  its reachable ports are exposed north-south.
+- **`private`** — guest traffic stays on its own networks; no north-south
+  exposure.
+- **`host`** — host networking semantics for the guest.
+- **`none`** — the guest network is disabled entirely.
+
+Regardless of profile, reachable ports are always allowed via narrow rules, so
+the profile only controls the default posture. See
+[Networks & ingress](./networks-ingress) for how membership works.
+
+## `command`
+
+`command` sets the guest argv and defaults to `sleep infinity`, which keeps a
+shell-less image alive so you can inspect it. Two spellings are accepted:
+
+```yaml
+command: ["echo", "hi"]        # list form: argv verbatim
+
+command: echo "hi there"       # string form: split shell-like
+```
+
+A string is split shell-like, so quoting behaves as you'd expect — useful for
+`sh -c "…"`-style invocation or one-line commands. Omit the key entirely to get
+the `sleep infinity` default.
+
+<Callout type="tip" title="Related service keys">
+  Startup ordering and probes: [Healthchecks & depends_on](./health-depends).
+  Ports: [Ports & expose](./ports-expose). Secrets and mounts:
+  [Secrets & volumes](./secrets-volumes).
+</Callout>

@@ -1,0 +1,84 @@
+---
+title: CLI overview
+description: The mc2 command tree, global flags, connection resolution, and local vs remote client modes.
+---
+
+## Overview
+
+`mc2` is one binary: the orchestrator (`mc2 server`) and the operator CLI. The
+CLI is a thin REST client — the same commands manage a local server on
+loopback or a remote install over TLS. For the API it talks to, see the
+[REST API overview](/references/api/overview).
+
+## Command tree
+
+| Command | Role |
+| ------- | ---- |
+| `mc2 server` | The orchestrator — SQLite, REST, scheduler, embedded microsandbox runtime |
+| `mc2 node ls` | Show the local node (capacity, status) |
+| `mc2 up -f <file>` | Bring up a stack (publish desired state, converge) |
+| `mc2 down <stack> [--volumes]` | Tear down a stack (`rm` is an alias) |
+| `mc2 config -f <file>` | Validate and print a normalized stack config |
+| `mc2 ps [--stack s] [--service s]` | List instances / phases |
+| `mc2 logs <instance> [--tail N] [--follow]` | Sandbox logs; `--follow` streams |
+| `mc2 status` | Health + version + counts (mode/context-aware) |
+| `mc2 network [name \| inst-ref]` | Network membership summary |
+| `mc2 ingress` | Desired ingress routes |
+| `mc2 volume ls` | Named volumes retained on the node |
+| `mc2 exec <instance> <cmd...>` | Run a command inside a sandbox (piped stdin forwarded) |
+| `mc2 ssh` | SSH authorized keys + open/close endpoints |
+| `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
+| `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |
+| `mc2 doctor` | Host / msb readiness checks |
+| `mc2 setup` | Interactive setup wizard (server / client trees) |
+| `mc2 completions <shell>` | Shell completions (bash/zsh/fish) |
+| `mc2 version` | Show version info |
+
+## Global flags
+
+These flags are global — they apply to every subcommand.
+
+| Flag | Env | Role |
+| ---- | --- | ---- |
+| `--api <URL>` | `MC2_API` | Control plane REST base URL (overrides the current context) |
+| `--token <TOKEN>` | `MC2_API_KEY` | Operator API bearer token |
+| `--context <NAME>` | `MC2_CONTEXT` | Named context from `~/.mc2/config.toml` (overrides the current context) |
+| `--allow-insecure-http` | `MC2_ALLOW_INSECURE_HTTP` | Allow plaintext `http://` for a remote (non-loopback) control plane |
+
+All flags may be combined on a single command line.
+
+## Connection resolution
+
+The CLI resolves its connection in this order — the first hit wins:
+
+1. `--api` / `--token` flags
+2. `MC2_API` / `MC2_API_KEY` env vars
+3. `--context` / `MC2_CONTEXT`
+4. the `current` context in `~/.mc2/config.toml`
+5. the loopback default
+
+The same rules apply when reading contexts. See
+[Contexts file](/references/config/contexts-file) and
+[Identity & contexts](/documentation/concepts/identity-and-contexts).
+
+## Local vs remote mode
+
+The connection host class decides the client mode, reported by `mc2 status`:
+
+- **local** — loopback API (`127.0.0.1` / `localhost` / `::1`); a token is
+  optional.
+- **remote** — any other host; requires `https://` and an API key. Plaintext
+  `http://` is refused unless you opt in with `--allow-insecure-http` (or
+  `MC2_ALLOW_INSECURE_HTTP=1`).
+
+<Callout type="warning" title="Plaintext remote">
+  The operator token travels unencrypted over plaintext `http://`. Prefer
+  `https://` + TLS, and pair with the server's `--public-hostname` for a remote
+  install published through the ingress catalog.
+</Callout>
+
+**Instances and output.** `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) is
+accepted anywhere an instance id is, for instance-taking commands such as
+`exec` and `logs`. Listing commands accept `-o json` (`-o`/`--output`, `table`
+by default) for machine-readable output that mirrors the
+[REST API](/references/api/overview) JSON.

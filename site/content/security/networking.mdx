@@ -1,0 +1,89 @@
+---
+title: Networking
+description: Default-allow service networks, unique port claims, loopback host ports, and remote transport rules.
+---
+
+MC2 splits networking into two planes with different security postures.
+East–west traffic between services is **default-allow** within a shared
+network, Docker-style. North–south traffic in and out of the box is a single,
+controlled ingress path — host ports bind loopback and are only exposed
+publicly through the ingress catalog. This page covers both, plus the rules
+that govern how you reach a remote control plane.
+
+## East–west: default-allow service networks
+
+A service declares `expose` for its internal listeners. Every other service
+that shares a **network** reaches it by default over the node loop's L4 splice,
+resolved as `<service>.<network>.svc.mc2` DNS.
+
+- Named networks are **server-wide**, so stacks can share one.
+- Default-allow within a shared network: if you put a service on the network,
+  it can reach every other member.
+- A guest's own reach is further bounded by its network profile — see
+  [Isolation](/security/isolation).
+
+<Callout type="note">
+  Default-allow means membership is the access control. Keep unrelated
+  workloads on separate networks, and use `network.profiles: none` when a
+  sandbox must not have any network reach at all.
+</Callout>
+
+## Port claims are unique server-wide
+
+Exposed guest ports are effectively unique server-wide. When `scale > 1`, each
+replica gets a distinct host port (fixed `8080` becomes `8080, 8081, 8082`;
+target-only ports get a stable auto host port). A second claim on an
+already-bound port fails:
+
+<Callout type="warning" title="Failed network edge">
+  The second service to claim an already-bound exposed port reports a
+  `Failed` network edge rather than silently sharing or stealing the port.
+  `mc2 network <stack>/<service>/<ordinal>` shows each instance's observed
+  exposes and edges.
+</Callout>
+
+## Host ports: loopback only
+
+Published host ports always bind the host's loopback interface. Guests cannot
+reach them from inside, and nothing on the box exposes them to the world by
+default. The public path in is only what you publish.
+
+## North–south: ingress with TLS
+
+Public HTTP is a deliberate step: declare `ports:` + stack `ingress:` and the
+server writes a Traefik file-provider catalog (`--ingress-config-dir`). TLS
+termination and certificates are yours to operate — point your Traefik file
+provider at the catalog and it terminates TLS for the hostnames you own. MC2
+publishes the control plane itself the same way when you set
+`--public-hostname`, so a remote install is manageable over TLS.
+
+## Remote control plane transport
+
+The CLI is a REST client; a remote server is just a URL swap. Two modes,
+reported by `mc2 status`:
+
+- **local** — loopback API (`127.0.0.1` / `localhost` / `::1`), token
+  optional.
+- **remote** — any other host; requires **https + an API key**.
+
+Plaintext `http://` for a remote endpoint is **refused** unless you explicitly
+opt in:
+
+```bash
+# Refused:
+export MC2_API=http://mc2.example.com:7443
+
+# Explicitly allowed (do not use in production):
+export MC2_ALLOW_INSECURE_HTTP=1
+```
+
+<Callout type="warning" title="Plaintext remote is refused">
+  Outside loopback, MC2 refuses `http://` by default. Only
+  `--allow-insecure-http` or `MC2_ALLOW_INSECURE_HTTP=1` re-enables it — and
+  that defeats the https requirement. Use it for nothing but throwaway labs.
+</Callout>
+
+See [Networking & ingress reference](/references/stack/networks-ingress) for
+the stack schema, and
+[Manage a remote server](/documentation/guides/manage-a-remote-server) for the
+end-to-end remote setup.

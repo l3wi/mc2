@@ -1,0 +1,69 @@
+---
+title: Stack commands
+description: Bring up, tear down, and validate stack YAML with mc2 up, down, and config.
+---
+
+## Overview
+
+Stack commands publish desired state and tear it down. Stacks are declared in
+Compose-shaped YAML; see [Stack overview](/references/stack/overview) for the
+schema. All commands below are idempotent or fail loudly on conflict.
+
+## up
+
+`mc2 up -f <file>` brings up a stack: it publishes the file as desired state
+and converges instances toward it.
+
+| Arg | Meaning |
+| --- | ------- |
+| `-f, --file <path>` | Path to stack YAML |
+
+- **Idempotent.** Re-applying the same (or a newer) file converges replicas
+  toward the declared state; it does not create duplicates.
+- **`name` is optional.** If the stack file omits `name:`, it is filled in
+  from the file path (sanitized); a file literally named `stack.yaml` takes
+  its parent directory's name.
+- **The parser is canonical.** The old k8s-style `apiVersion`/`kind`/
+  `metadata` wrapper and keys like `replicas`/`resources` are **rejected**, not
+  filled in. See [Stack overview](/references/stack/overview).
+
+```bash
+mc2 up -f stack.yaml
+```
+
+## down
+
+`mc2 down <stack> [--volumes]` tears a stack down: it deletes instances and the
+stack definition. `rm` is an alias for `down`.
+
+| Arg | Meaning |
+| --- | ------- |
+| `<stack>` | Stack name |
+| `--volumes` | Also delete the stack's named volumes (default: retained) |
+
+Named volumes are retained by default so cached data survives a teardown. Add
+`--volumes` to remove them.
+
+```bash
+mc2 down demo
+mc2 rm demo --volumes
+```
+
+<Callout type="note" title="Volume retention">
+  `down` without `--volumes` leaves the stack's named volumes on disk for
+  reuse; `--volumes` deletes them best-effort.
+</Callout>
+
+## config
+
+`mc2 config -f <file>` validates a stack file and prints the normalized config.
+
+| Arg | Meaning |
+| --- | ------- |
+| `-f, --file <path>` | Path to stack YAML |
+
+```bash
+mc2 config -f stack.yaml
+```
+
+Validation is strict — unknown keys are rejected, not ignored.

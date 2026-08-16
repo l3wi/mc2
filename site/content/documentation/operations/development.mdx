@@ -1,0 +1,96 @@
+---
+title: Development & contributing
+description: Building MC2, the workspace layout, and the test strategy for contributing.
+---
+
+MC2 is a Rust workspace. This page covers how to build, test, and contribute —
+the prerequisites, the crate layout, and the CI-vs-lab test split that keeps
+development fast without a hypervisor.
+
+## Prerequisites
+
+- Rust stable (see `rust-toolchain.toml`).
+- `just` for the recipe runner (`just --list`).
+- `cargo-machete` and `cargo-deny` for two of the checks (`cargo install
+  cargo-machete --locked`, `cargo install cargo-deny`).
+- A hypervisor only if you run lab tests that boot microVMs (Linux KVM / Apple
+  Silicon HVF). Everything else works without one.
+
+## Workspace layout
+
+```text
+mc2/
+  crates/
+    mc2/          # the binary: CLI (cli.rs), REST client, handlers (cmd/)
+    mc2-api/      # REST DTOs + stack YAML types (schema/decode/validate)
+    mc2-server/   # orchestrator: REST API (api/), scheduler, reconcile loop, store
+    mc2-store/    # SQLite + memory store
+    mc2-runtime/  # embedded microsandbox SDK boundary (msb_sdk.rs, naming, spec)
+    mc2-metrics/  # OTLP metrics exports
+  tests/          # mc2-tests: cross-crate integration harness + tests
+  examples/       # Compose-shaped stack YAML, ingress, OTLP samples
+  justfile        # build / test / check recipes
+```
+
+The binary and server share a workspace version; library crates are never
+released separately.
+
+## Build & run
+
+```bash
+just build          # debug build of the mc2 binary
+just run-server     # run `mc2 server` (REST on :7443, data dir ~/.mc2)
+just test           # full workspace tests
+```
+
+## Test strategy
+
+Two tiers, mirroring the CI split:
+
+- **Unit tests** — live next to the code in `crates/*/src`. Fast, no
+  hypervisor, deterministic. Cover parsers, validators, the store, the
+  scheduler, and the REST handlers (via an in-memory store and a mock
+  runtime).
+- **Integration tests** — in `tests/` (the `mc2-tests` package) and
+  `crates/mc2/tests` (black-box CLI). They boot a real `mc2 server` on an
+  ephemeral port with a temp data dir and drive the control plane over REST —
+  no microVMs needed. Sandboxes can't start without a hypervisor, but every
+  control-plane command works, so the whole apply → schedule → reconcile
+  surface is covered in CI.
+
+```bash
+just test-unit          # crates/*/src unit tests
+just test-integration   # mc2-tests + cli_smoke
+```
+
+Lab tests that boot real microVMs are documented under
+[examples/](/examples) and are not part of CI.
+
+## The regression gate
+
+`just check` runs everything CI gates on:
+
+```bash
+just check   # fmt + clippy (-D warnings) + tests + rustdoc + machete
+```
+
+- `cargo doc` must be warning-clean (`RUSTDOCFLAGS=-D warnings`).
+- `cargo clippy` runs with `--all-features`, `-D warnings`.
+- `unsafe_code = "deny"` is a workspace lint — MC2 is zero-`unsafe`.
+- `cargo deny check` and `cargo audit` are blocking in CI.
+
+## Contributing
+
+- Branch from `dev` (`feat/...`), open a PR against `dev`; `main` is
+  release-only.
+- Update `CHANGELOG.md` for any PR into `dev`/`main` (a CI gate enforces it).
+- Keep the docs in sync: the [docs site](/) content lives in `site/content/`;
+  README, examples, and tests should reference it consistently.
+- Run `just check` before opening a PR.
+
+## Deeper
+
+- [Troubleshooting](/documentation/operations/troubleshooting) — common
+  failures and recovery.
+- [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) — how
+  releases and versioning work.

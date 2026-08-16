@@ -1,0 +1,88 @@
+---
+title: Run your first stack
+description: Bring up a real HTTP service, inspect it, and tear it down.
+---
+
+**You will learn:** publish a stack, watch it converge, verify the service,
+and tear it down cleanly.
+
+**Prerequisites:** [Quickstart](/documentation/quickstart) — the server is
+running at `MC2_API=http://127.0.0.1:7443` and `mc2` is on your PATH. This
+guide uses the `examples/01-hello-service` stack from the repo.
+
+## Bring it up
+
+```bash
+mc2 up -f examples/01-hello-service/stack.yaml
+```
+
+The stack is deliberately minimal — `name` is omitted and filled in from the
+file path (the parent directory, because the file is named `stack.yaml`). MC2
+validates, schedules one instance, and converges it to `Running`.
+
+## Inspect it
+
+```bash
+mc2 ps
+mc2 status
+```
+
+`mc2 ps` shows each instance and its phase; `mc2 status` summarizes health,
+version, and counts. Validate without applying at any time with:
+
+```bash
+mc2 config -f examples/01-hello-service/stack.yaml
+```
+
+## Verify the service
+
+The example publishes host port `18091`:
+
+```bash
+curl -s http://127.0.0.1:18091/
+# hello world
+```
+
+## Interact with the instance
+
+Everywhere an instance ID is accepted, you can use
+`<stack>/<service>/<ordinal>`. Because the example file is
+`examples/01-hello-service/stack.yaml`, the stack's `name` resolves to
+`01-hello-service` (the parent directory, since the file stem is the generic
+`stack`):
+
+```bash
+mc2 exec 01-hello-service/web/0 'echo inside the vm'
+mc2 logs 01-hello-service/web/0 --tail 20
+```
+
+## Tear it down
+
+```bash
+mc2 down 01-hello-service        # removes instances + definition
+mc2 down 01-hello-service --volumes   # also deletes named volumes
+```
+
+`rm` is an alias for `down`. Volumes are retained unless `--volumes` — this
+stack has none, but the habit matters later.
+
+## What you learned
+
+- A minimal stack is valid and complete.
+- `mc2 up` is idempotent — running it again converges to the same state.
+- Phases, exec, logs, and teardown are all one command away.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Scale & restart"
+    description="Replicas, per-replica ports, and resilience."
+    href="/documentation/guides/scale-and-restart"
+  />
+  <Card
+    title="Desired state"
+    description="Understand the model behind what you just did."
+    href="/documentation/concepts/desired-state"
+  />
+</Cards>

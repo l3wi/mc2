@@ -1,0 +1,84 @@
+---
+title: Isolation
+description: Hardware-virtualized isolation per replica, host-side network stack, and private-by-default storage.
+---
+
+Isolation is MC2's core security property. Every replica is a microVM with its
+own kernel, filesystem, and network boundary — a hardware-virtualized boundary
+rather than a shared-kernel one. This page explains what that boundary is, how
+networking and storage fit inside it, and where your data can and cannot go.
+
+## MicroVM per replica, not a shared kernel
+
+Docker-style containers run in the host kernel's namespaces and cgroups; a
+kernel exploit in one container is one step away from the host. MC2 replicas
+are microVMs driven through the embedded microsandbox SDK — each boots its own
+kernel inside the hypervisor.
+
+| | MC2 (microVM) | Container |
+| --- | --- | --- |
+| Kernel | own kernel per replica | shared host kernel |
+| Filesystem | own rootfs per replica | shared kernel + namespaces |
+| Network boundary | own device, per-network profile | host network namespace |
+| Escape blast radius | VMM / hypervisor boundary | kernel syscall surface |
+
+<Callout type="note">
+  The hypervisor is required to run sandboxes. `mc2 doctor` checks for KVM on
+  Linux and Apple Silicon HVF on macOS before you rely on the isolation model.
+</Callout>
+
+## Network boundaries: profiles
+
+Each sandbox attaches to networks through a network profile that fixes its
+network boundary:
+
+- **`public`** — internet egress through the host-side network stack, plus
+  service-to-service traffic on shared networks.
+- **`private`** — service-to-service connectivity only; no internet egress.
+- **`host`** — shares the host network stack.
+- **`none`** — guest networking is disabled entirely. The microVM has no
+  network device and no route off the box.
+
+<Callout type="warning" title="network.profiles: none">
+  `none` disables guest networking completely — no ingress and no egress. Use
+  it for workloads that must not touch a network at all; do not expect a
+  `none` sandbox to reach other services or be reachable from them.
+</Callout>
+
+Service-to-service traffic that is allowed flows through the node loop's L4
+splice with `<service>.<network>.svc.mc2` DNS — default-allow within a shared
+network, never crossing to the public side.
+
+## Host ports: loopback until ingress
+
+Published guest ports are always bound to the host's loopback interface. A
+guest cannot reach them and a neighbor service cannot claim them on your
+behalf; the only public path in is the ingress catalog you configure. See
+[Networking](/security/networking) for how east–west and north–south traffic
+meet this rule.
+
+## Storage: private by default
+
+The sandbox rootfs is private to the microVM. Writes inside the guest change
+that sandbox's own filesystem only — they never touch the image and never
+reach the host filesystem. Data leaves a sandbox only through a path you
+declare:
+
+- **Volumes** — a named volume mounted into a sandbox is the one place data
+  crosses from the sandbox into host-managed durable storage.
+- **Network** — data reaches other sandboxes only over an allowed network
+  edge.
+
+<Callout type="warning" title="Rootfs writes are disposable">
+  Anything written to the sandbox rootfs is lost when the microVM is torn
+  down. If a value must survive, mount a declared volume — see
+  [Secrets & volumes](/references/stack/secrets-volumes).
+</Callout>
+
+## What this means in practice
+
+A guest that is compromised is contained by the microVM boundary: it cannot
+read other guests' filesystems, cannot open host ports, and its network reach
+is exactly what the profile and the declared edges allow. The remaining trust
+is in the host underneath — which is why host OS and hypervisor hygiene are on
+the [hardening checklist](/security/hardening).

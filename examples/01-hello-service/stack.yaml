@@ -3,7 +3,7 @@
 #   mc2 up -f examples/01-hello-service/stack.yaml
 #
 # The stack `name:` is optional: `mc2 up` fills it in
-# (defaults to the file stem). See docs/guides/stack-yaml.md.
+# (defaults to the file stem). See site/content/references/stack/overview.mdx.
 services:
   web:
     image: python:3.12-alpine

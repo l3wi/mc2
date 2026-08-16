@@ -1,0 +1,101 @@
+---
+title: Services & instances
+description: Replicas, restart policies, health, and startup ordering.
+---
+
+A **service** is a named description of a workload in a stack. An
+**instance** is one replica of that service — one detached microVM. MC2
+schedules instances, runs them through a phase model, and keeps them alive
+according to the service's restart policy.
+
+## The analogy
+
+Like a Compose service, but each replica is a separate hardware-isolated
+microVM with its own kernel, and the service is a *desired state* that MC2
+keeps converged rather than a one-shot run.
+
+## Phases
+
+Instances move through a simple phase model, visible in `mc2 ps`:
+
+| Phase | Meaning |
+| --- | --- |
+| `Pending` | Scheduled but not yet running (e.g. waiting on `depends_on`). |
+| `Running` | Sandbox booted; service command running. |
+| `Failed` | Could not start or stay healthy; a reason is shown. |
+
+With a `restart` policy, a failed or stopped instance is removed and
+recreated instead of being left `Failed`.
+
+## Service keys
+
+- **`scale`** — replica count. `scale: 3` creates three instances. With
+  published ports, each replica gets a distinct host port: a fixed
+  `published: P` becomes the block `P, P+1, …, P+N-1` (ordinal 0 keeps `P`);
+  target-only ports get distinct auto-allocated ports. Allocations are stable
+  across re-applies.
+- **`restart`** — `no` | `on-failure` | `always` | `unless-stopped`. Drives
+  node restart/recreate on failure.
+- **`command`** — guest argv as a list or a shell-split string. Omitted
+  defaults to `sleep infinity` so a shell-less image stays alive.
+- **`cpus` / `mem_limit`** — vCPU count (float) and guest memory
+  (`512m`, `1g`, `1.5g`, or bytes).
+- **`depends_on`** — startup ordering; see below.
+- **`healthcheck`** — exec health probe that gates health.
+
+## Addressing instances
+
+Everywhere a command wants an instance, you can pass a UUID **or** the
+human-readable `<stack>/<service>/<ordinal>` form:
+
+```bash
+mc2 exec shop/web/0 'echo hi'
+mc2 logs shop/web/2 --tail 20
+```
+
+## Health-gated startup
+
+`depends_on` lets a service wait until a dependency is *healthy*, not just
+started:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    expose: [5432]
+    healthcheck:
+      test: ["pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+  web:
+    image: alpine
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+- List form (`depends_on: [db]`) means `condition: service_started`.
+- `service_healthy` requires the dependency to declare a non-disabled
+  healthcheck.
+- References must be to services in the same stack; cycles are rejected at
+  parse time.
+- While waiting, the dependent reports `Pending` with a message like
+  `depends_on: waiting for db (service_healthy)`.
+
+## Key behaviors
+
+- **Ordering at startup only.** If a dependency later dies, the dependent is
+  not torn down (Compose semantics).
+- **`restart` is the resilience knob.** Without it, failures surface as
+  `Failed`; with it, MC2 re-creates the sandbox.
+- **Health drives convergence.** A passing probe sets an instance healthy,
+  which unlocks `service_healthy` dependents.
+
+## Deeper
+
+- [Desired state & reconciliation](/documentation/concepts/desired-state) —
+  the loop behind the phases.
+- [Scale & restart](/documentation/guides/scale-and-restart) —
+  replicas and resilience in practice.
+- [Order startup](/documentation/guides/order-startup) —
+  healthchecks and `depends_on` end to end.
+- [Services reference](/references/stack/services) — every service key.

@@ -1,0 +1,95 @@
+---
+title: Connect services
+description: East–west networking with expose, networks, and svc DNS.
+---
+
+**You will learn:** make two services talk to each other over a shared
+network using `expose`, `networks`, and `<service>.<network>.svc.mc2` DNS — and
+inspect it with `mc2 network`.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+This guide mirrors `examples/03-networks`.
+
+## The stack
+
+```yaml
+name: smoke-networks
+
+services:
+  echo:
+    image: python:3.12-alpine
+    expose: [8080]
+    command: 'exec sh -c "mkdir -p /tmp/www && printf ''NETWORK_OK\n'' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"'
+  client:
+    image: alpine:3.20
+```
+
+`echo` declares `expose: [8080]`. Every other service sharing the same
+network — here, both services are on the stack's default network
+(`smoke-networks`) — reaches it by **default-allow**; no allow edges needed.
+The command matches `examples/03-networks` (Python's `http.server`, which the
+alpine image includes).
+
+## Bring it up
+
+```bash
+mc2 up -f examples/03-networks/stack.yaml
+mc2 ps
+```
+
+## Talk to the other service
+
+From inside the client sandbox, reach the echo service by name:
+
+```bash
+mc2 exec smoke-networks/client/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
+# NETWORK_OK
+```
+
+The DNS name is `<service>.<network>.svc.mc2`, the port is the exposed one.
+
+## Inspect the network
+
+```bash
+mc2 network                 # every network + member instances and ports
+mc2 network smoke-networks  # drill into one network
+mc2 network smoke-networks/client/0   # one instance's exposes/edges
+```
+
+## Share a network across stacks
+
+Networks are **server-wide**, so services in different stacks can join one by
+name:
+
+```yaml
+services:
+  worker:
+    image: alpine:3.20
+    networks: [shared]
+```
+
+Another stack's service with `networks: [shared]` can then reach
+`worker.shared.svc.mc2` by default. See
+[Shared networks across stacks](/recipes/shared-network-multi-stack).
+
+## Key behaviors
+
+- **Default-allow within a shared network** — Docker-style.
+- **Same-node in v1.** DNS and L4 splices are node-local.
+- **Unique server-wide ports.** If another stack already bound the same
+  exposed port, the new splice reports a `Failed` edge.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Publish with ingress"
+    description="North–south HTTP through a BYO Traefik."
+    href="/documentation/guides/publish-with-ingress"
+  />
+  <Card
+    title="Networking concepts"
+    description="The three network planes in detail."
+    href="/documentation/concepts/networking"
+  />
+</Cards>

@@ -1,0 +1,87 @@
+---
+title: Scale & restart
+description: Replicas, per-replica published ports, and crash resilience.
+---
+
+**You will learn:** scale a service to multiple replicas, understand
+per-replica port allocation, and make it survive crashes with `restart`.
+
+**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+
+## The stack
+
+```yaml
+name: shop
+
+services:
+  web:
+    image: python:3.12-alpine
+    scale: 3
+    restart: on-failure
+    ports:
+      - "8080:8000"
+    command: 'exec python -m http.server 8000'
+```
+
+## Scale it up
+
+```bash
+mc2 up -f stack.yaml
+mc2 ps
+```
+
+Three instances, each its own microVM. With `scale > 1` and a published
+port, each replica gets a distinct host port: fixed `8080` becomes the block
+**`8080, 8081, 8082`** (ordinal 0 keeps `8080`).
+
+```bash
+curl -s http://127.0.0.1:8080/   # replica 0
+curl -s http://127.0.0.1:8082/   # replica 2
+```
+
+A target-only port (`"3001"`) gets a distinct auto-allocated host port per
+replica instead. Allocations are stable across re-applies.
+
+## Make it resilient
+
+`restart: on-failure` tells MC2 to re-create a replica that exits
+non-zero. Kill one from inside and watch it come back:
+
+```bash
+mc2 exec shop/web/1 'kill 1'   # simulate a crash
+mc2 ps                          # replica recreated, not left dead
+```
+
+`restart` accepts `no | on-failure | always | unless-stopped`.
+
+## Address replicas
+
+Each replica is addressable as `<stack>/<service>/<ordinal>`:
+
+```bash
+mc2 exec shop/web/2 'echo third replica'
+mc2 logs shop/web/0 --follow
+```
+
+## Key behaviors
+
+- **Distinct host ports per replica** — no port bookkeeping.
+- **Ingress targets replica 0.** Routes for a scaled service point at
+  ordinal 0's port.
+- **`restart` + reconcile = self-healing.** Without it, a crash surfaces as
+  `Failed`.
+
+## Next
+
+<Cards cols={2}>
+  <Card
+    title="Connect services"
+    description="East–west networking between services."
+    href="/documentation/guides/connect-services"
+  />
+  <Card
+    title="Services & instances"
+    description="The phase model and service keys."
+    href="/documentation/concepts/services-and-instances"
+  />
+</Cards>

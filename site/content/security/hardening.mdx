@@ -1,0 +1,98 @@
+---
+title: Hardening checklist
+description: A production checklist for running MC2 securely — server, auth, secrets, networking, and monitoring.
+---
+
+This is the production hardening checklist. It assumes you are running `mc2
+server` on a machine you control and applying the security model described in
+[Security overview](/security/overview). Each item maps to a real MC2 surface;
+nothing here requires tools MC2 does not ship or document.
+
+## Baseline posture
+
+- [ ] **Auth is on.** Start the server without `--no-auth` and save the printed
+      API token on first bootstrap.
+- [ ] **The data dir is private.** A dedicated user owns it and nothing else
+      reads it.
+- [ ] **`--allow-insecure-http` is off.** Remote endpoints are https-only by
+      default; do not re-enable plaintext.
+- [ ] **Secrets are not in stack files.** Credentials live in the encrypted
+      server-wide store and are referenced by name.
+
+## Run the server safely
+
+- [ ] Run `mc2 server` as a **dedicated user** with a **private data dir**
+      (`--data-dir`), not as your login user in a shared directory.
+- [ ] Pin the durable volume root with `--volume-dir` so guest volumes land in
+      one place you control and can back up.
+- [ ] Give the process only what it needs: hypervisor access (`/dev/kvm` or
+      HVF) and its data dirs. Prefer a host OS and hypervisor that are patched
+      and minimal.
+- [ ] Vet the images you run. MC2 does not sign or verify image provenance —
+      a malicious image is code running in your microVMs.
+
+<Callout type="warning" title="Host trust is your outer ring">
+  The isolation model in [Isolation](/security/isolation) contains a guest,
+  but the host under it is trusted. Keep the host, kernel, and hypervisor
+  patched; run the server with least-privilege accounts.
+</Callout>
+
+## Authenticate the control plane
+
+- [ ] **Never `--no-auth`.** It is for disposable loopback labs only; it
+      removes the only credential on the API.
+- [ ] **Always https + a token remotely.** Bind appropriately and, for remote
+      management, publish the control plane via `--public-hostname` with a
+      cert resolver — then reach it as `https://…` from a saved context.
+- [ ] Use contexts rather than scattering tokens: `mc2 context set prod --api
+      https://… --token 'mc2at_…'`.
+- [ ] Restrict who can read `~/.mc2/config.toml` (mode 0600). It holds bearer
+      tokens in plaintext.
+
+## Protect secrets and state
+
+- [ ] Store credentials with `mc2 secret set NAME --value …`, never in
+      `environment:`. The store is encrypted at rest and values are never
+      listed back.
+- [ ] Keep `allowHosts` non-empty on every secret so injection **fails
+      closed** instead of attaching the value broadly.
+- [ ] Rotate by re-setting the value and re-applying the stack — the old value
+      is not pushed to running sandboxes in place.
+- [ ] **Back up the data dir.** It holds state, volumes, the operator token,
+      and the secret-store key material. Lose it and you lose the ability to
+      decrypt secrets and authenticate as operator.
+- [ ] Do not hand-edit the data dir; treat it as opaque state.
+
+<Callout type="warning" title="The data dir is the crown jewels">
+  Because the secret-store key material and the operator token live under the
+  data dir, anyone who can read it can impersonate the operator and decrypt
+  secrets. Restrict access to it as strictly as the token itself.
+</Callout>
+
+## Networking and ingress
+
+- [ ] Keep unrelated workloads on separate networks — east–west is
+      **default-allow** within a shared network, so membership is access
+      control.
+- [ ] Use `network.profiles: none` for sandboxes that must have no network
+      reach at all.
+- [ ] Publish HTTP only through the ingress catalog (`--ingress-config-dir` +
+      `ingress:`); host ports bind loopback and stay private otherwise.
+- [ ] Operate Traefik TLS/ACME and DNS yourself — the public path in is the
+      part MC2 delegates to you.
+
+## Verify and monitor
+
+- [ ] Run `mc2 doctor` and act on its output — it checks host / msb readiness
+      (hypervisor present, expected paths).
+- [ ] Check `/v1/status` for health and version:
+
+      ```bash
+      curl -s "$MC2_API/v1/status" | jq .
+      ```
+
+- [ ] Export OTLP metrics (`MC2_OTLP_ENDPOINT`) and watch `mc2.server.*` /
+      `mc2.node.*`; configure the msb-metrics sidecar to the same collector
+      for sandbox CPU/mem/net.
+- [ ] After applying a stack, watch for warnings — including the collision
+      warning when a plaintext `environment:` entry overrides a secret.
