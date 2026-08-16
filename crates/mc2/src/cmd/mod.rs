@@ -5,3 +5,4 @@ pub mod access;
 pub mod observe;
 pub mod security;
 pub mod stacks;
+pub mod volumes;

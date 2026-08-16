@@ -3,7 +3,7 @@
 //! Unit tests live next to production code (`crates/*/src/**`).
 //! Integration tests live in this package's `tests/` directory.
 //!
-//! See [docs/guides/testing.md](../docs/guides/testing.md).
+//! See [site/content/documentation/operations/troubleshooting.mdx](../site/content/documentation/operations/troubleshooting.mdx).
 
 use anyhow::{Context, Result};
 use mc2_server::{router, AppState, Bootstrap};
@@ -40,6 +40,16 @@ impl TestCluster {
 
     /// `with_node=false`: no local node row (scheduler-pending tests).
     pub async fn start_with_node(with_node: bool) -> Result<Self> {
+        Self::start_with_opts(with_node, None).await
+    }
+
+    /// Start with an explicit named-volume root (for `GET /v1/volumes` tests).
+    pub async fn start_with_volume_dir(with_node: bool, volume_dir: PathBuf) -> Result<Self> {
+        Self::start_with_opts(with_node, Some(volume_dir)).await
+    }
+
+    /// Shared start: bootstrap + REST server + (optional) auto local node.
+    pub async fn start_with_opts(with_node: bool, volume_dir: Option<PathBuf>) -> Result<Self> {
         let dir = tempfile::tempdir().context("tempdir")?;
         let data_dir = dir.path().to_path_buf();
         let secrets_key_path = data_dir.join("secrets.key");
@@ -69,7 +79,7 @@ impl TestCluster {
             data_dir: data_dir.clone(),
             version: env!("CARGO_PKG_VERSION"),
             secrets_key,
-            volume_dir: None,
+            volume_dir,
             runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
             limits: Default::default(),
         };

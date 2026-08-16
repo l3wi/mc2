@@ -126,3 +126,44 @@ services:
     assert!(err.contains("other"), "{err}");
     assert!(err.contains("not defined"), "{err}");
 }
+
+/// `GET /v1/volumes` lists retained MC2 volumes from the volume root and
+/// ignores non-MC2 entries.
+#[tokio::test]
+async fn list_volumes_reports_retained_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let volumes_root = dir.path().join("volumes");
+    std::fs::create_dir_all(volumes_root.join("mc2-shop--data")).unwrap();
+    std::fs::create_dir_all(volumes_root.join("mc2-shop--cache")).unwrap();
+    std::fs::write(volumes_root.join("mc2-shop--data").join("payload"), "x").unwrap();
+    // Not an MC2 volume identity — must be ignored.
+    std::fs::create_dir_all(volumes_root.join("scratch")).unwrap();
+
+    let cluster = TestCluster::start_with_volume_dir(true, volumes_root.clone())
+        .await
+        .expect("start");
+
+    let (status, body) = cluster
+        .get_json("/v1/volumes", Some(&cluster.api_token))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "{body}");
+
+    // Deterministic order: stack, then volume name (alphabetically cache < data).
+    let first = &arr[0];
+    assert_eq!(first["stack"], "shop");
+    assert_eq!(first["volume"], "cache");
+    assert_eq!(first["name"], "mc2-shop--cache");
+    assert!(first["path"].as_str().unwrap().contains("mc2-shop--cache"));
+
+    let second = &arr[1];
+    assert_eq!(second["stack"], "shop");
+    assert_eq!(second["volume"], "data");
+    assert!(second["size_mib"].is_u64());
+
+    for v in arr.iter() {
+        assert_ne!(v["name"].as_str().unwrap(), "scratch");
+    }
+}

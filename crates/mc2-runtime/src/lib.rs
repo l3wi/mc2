@@ -10,7 +10,7 @@ mod spec;
 mod spec_hash;
 
 pub use msb_sdk::MicrosandboxRuntime;
-pub use naming::{sandbox_name, volume_mount_plan, volume_name};
+pub use naming::{parse_volume_name, sandbox_name, volume_mount_plan, volume_name};
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod networks;
 pub use networks::{

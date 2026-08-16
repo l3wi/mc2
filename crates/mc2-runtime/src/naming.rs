@@ -32,6 +32,20 @@ pub fn volume_name(stack: &str, volume: &str) -> String {
     }
 }
 
+/// Parse a resolved volume identity back into `(stack, volume)`.
+///
+/// Inverts [`volume_name`]. The separator is `--` (never present inside stack
+/// or volume names — stack validation rejects them), so the split is
+/// unambiguous. Returns `None` for a name that is not an MC2 volume identity.
+pub fn parse_volume_name(name: &str) -> Option<(String, String)> {
+    let stripped = name.strip_prefix("mc2-")?;
+    let (stack, volume) = stripped.split_once("--")?;
+    if stack.is_empty() || volume.is_empty() {
+        return None;
+    }
+    Some((stack.to_string(), volume.to_string()))
+}
+
 /// Guest mount path → resolved msb volume name, in spec order.
 pub fn volume_mount_plan(desired: &DesiredSandbox) -> Vec<(String, String)> {
     desired
@@ -92,5 +106,25 @@ mod tests {
         assert_eq!(volume_name("My Stack", "Data/X"), "mc2-My-Stack--Data-X");
         let long = "a".repeat(200);
         assert_eq!(volume_name(&long, "v").len(), 128);
+    }
+
+    #[test]
+    fn parse_volume_name_roundtrips() {
+        assert_eq!(
+            parse_volume_name("mc2-demo--data"),
+            Some(("demo".into(), "data".into()))
+        );
+        assert_eq!(
+            parse_volume_name("mc2-my-stack--cache"),
+            Some(("my-stack".into(), "cache".into()))
+        );
+    }
+
+    #[test]
+    fn parse_volume_name_rejects_non_mc2_names() {
+        assert_eq!(parse_volume_name("demo--data"), None);
+        assert_eq!(parse_volume_name("mc2-demo-data"), None);
+        assert_eq!(parse_volume_name("mc2--"), None);
+        assert_eq!(parse_volume_name(""), None);
     }
 }

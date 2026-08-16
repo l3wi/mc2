@@ -466,11 +466,14 @@ struct LiveServer {
     child: Child,
     base: String,
     _dir: tempfile::TempDir,
+    volumes_dir: std::path::PathBuf,
 }
 
 impl LiveServer {
     fn start() -> LiveServer {
         let dir = tempdir().unwrap();
+        let volumes_dir = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes_dir).unwrap();
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -486,6 +489,8 @@ impl LiveServer {
                 "--no-auth",
                 "--reconcile-interval-secs",
                 "1",
+                "--volume-dir",
+                volumes_dir.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -495,6 +500,7 @@ impl LiveServer {
             child,
             base,
             _dir: dir,
+            volumes_dir,
         };
         srv.wait_ready();
         srv
@@ -672,4 +678,45 @@ fn live_server_end_to_end() {
         "{}",
         String::from_utf8_lossy(&rm.stderr)
     );
+}
+
+#[test]
+fn volume_ls_lists_retained_volumes() {
+    let srv = LiveServer::start();
+
+    // Seed the volume root with MC2-named volume dirs (as a retained `down`
+    // leaves behind) plus a non-MC2 entry that must be ignored.
+    std::fs::create_dir_all(srv.volumes_dir.join("mc2-shop--data")).unwrap();
+    std::fs::create_dir_all(srv.volumes_dir.join("mc2-shop--cache")).unwrap();
+    std::fs::write(srv.volumes_dir.join("mc2-shop--data").join("payload"), "x").unwrap();
+    std::fs::create_dir_all(srv.volumes_dir.join("scratch")).unwrap();
+
+    let ls = srv.run(&["volume", "ls"]);
+    assert!(
+        ls.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    let out = String::from_utf8_lossy(&ls.stdout);
+    assert!(out.contains("STACK"), "headers: {out}");
+    assert!(out.contains("shop"), "{out}");
+    assert!(out.contains("data"), "{out}");
+    assert!(out.contains("cache"), "{out}");
+    assert!(
+        !out.contains("scratch"),
+        "non-MC2 dir must be ignored: {out}"
+    );
+
+    // JSON output mirrors the API.
+    let lsj = srv.run(&["volume", "ls", "-o", "json"]);
+    assert!(lsj.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&lsj.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    assert_eq!(v[0]["stack"], "shop");
+    assert!(v[0]["name"].as_str().unwrap().starts_with("mc2-shop--"));
+
+    // Help surface.
+    let help = srv.run_raw(&["volume", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("ls"));
 }

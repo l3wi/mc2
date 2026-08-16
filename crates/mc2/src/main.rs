@@ -22,7 +22,7 @@ mod table;
 
 use cli::{
     Cli, Commands, CompletionsArgs, ContextCmd, ContextCommands, DoctorArgs, NodeCmd, NodeCommands,
-    SecretCmd, SecretCommands, SetupCmd, SshCmd, SshCommands,
+    SecretCmd, SecretCommands, SetupCmd, SshCmd, SshCommands, VolumeCmd, VolumeCommands,
 };
 
 fn init_tracing() {
@@ -99,6 +99,12 @@ async fn main() -> Result<()> {
             let conn = resolve()?;
             cmd::observe::ingress_cmd(args, &conn).await?
         }
+        Commands::Volume(VolumeCmd { command }) => match command {
+            VolumeCommands::Ls(a) => {
+                let conn = resolve()?;
+                cmd::volumes::volume_ls(a, &conn).await?
+            }
+        },
         Commands::Secret(SecretCmd { command }) => match command {
             SecretCommands::Set(a) => {
                 let conn = resolve()?;

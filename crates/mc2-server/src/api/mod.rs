@@ -6,6 +6,7 @@ mod meta;
 mod secrets;
 mod ssh;
 mod stacks;
+mod volumes;
 
 use crate::AppState;
 use axum::{
@@ -39,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/instances/{id}/logs", get(instances::get_instance_logs))
         .route("/v1/ingress", get(ingress::list_ingress))
+        .route("/v1/volumes", get(volumes::list_volumes))
         .route("/v1/secrets", get(secrets::list_secrets))
         .route(
             "/v1/secrets/{name}",

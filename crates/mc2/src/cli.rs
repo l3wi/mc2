@@ -59,6 +59,8 @@ pub enum Commands {
     Network(NetworkArgs),
     /// Desired ingress routes
     Ingress(IngressArgs),
+    /// Named volumes (retained across stack removal)
+    Volume(VolumeCmd),
 
     /// Run a command inside an instance's sandbox
     Exec(ExecArgs),
@@ -287,6 +289,19 @@ pub struct NetworkArgs {
     /// Output format
     #[arg(short = 'o', long, value_enum, default_value_t = OutputFormat::Table)]
     pub output: OutputFormat,
+}
+
+#[derive(Debug, Parser)]
+pub struct VolumeCmd {
+    #[command(subcommand)]
+    pub command: VolumeCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VolumeCommands {
+    /// List named volumes retained on the node
+    #[command(name = "ls", alias = "list")]
+    Ls(ListArgs),
 }
 
 #[derive(Debug, Parser)]

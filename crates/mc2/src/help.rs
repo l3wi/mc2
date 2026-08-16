@@ -20,7 +20,7 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
     },
     CommandGroup {
         heading: "Observe",
-        commands: &["logs", "status", "network", "ingress"],
+        commands: &["logs", "status", "network", "ingress", "volume"],
     },
     CommandGroup {
         heading: "Access",

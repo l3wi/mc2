@@ -104,6 +104,21 @@ impl ClusterStatus {
     }
 }
 
+/// Operator-visible named volume (resolved from the node's volume root).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeView {
+    /// Resolved volume identity on the node, `mc2-<stack>--<volume>`.
+    pub name: String,
+    /// Stack that owns the volume.
+    pub stack: String,
+    /// Volume name declared in the stack.
+    pub volume: String,
+    /// Absolute path under the node's volume root.
+    pub path: String,
+    /// On-disk size of the volume directory, in MiB (measured best-effort).
+    pub size_mib: u64,
+}
+
 /// Operator-visible node (no credentials).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {

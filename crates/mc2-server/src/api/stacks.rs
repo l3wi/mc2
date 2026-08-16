@@ -88,7 +88,7 @@ pub async fn delete_stack(
 }
 
 /// Resolve the named-volume root: `--volume-dir` if set, else the msb default.
-fn volume_root(volume_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+pub(crate) fn volume_root(volume_dir: Option<&std::path::Path>) -> std::path::PathBuf {
     volume_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| crate::expand_data_dir("~/.microsandbox/volumes"))
