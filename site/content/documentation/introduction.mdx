@@ -108,14 +108,17 @@ and boots one detached microVM. Without an explicit `command`, the default is
 into it:
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 up -f stack.yaml
 mc2 ps
 ```
 
+The CLI talks to `http://127.0.0.1:7443` by default. After
+[Quickstart](/documentation/quickstart) (`mc2 setup` + the printed
+`mc2 server` command), no extra env vars are required.
+
 <Callout type="tip" title="Where to start">
-  Follow the [Quickstart](/documentation/quickstart) to install MC2, boot the
-  server, and run your first real service. Then read
+  Follow the [Quickstart](/documentation/quickstart) — `mc2 setup` is the
+  first-run path. Then read
   [Desired state & reconciliation](/documentation/concepts/desired-state) to
   understand the model that makes everything else make sense.
 </Callout>

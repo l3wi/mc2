@@ -50,17 +50,20 @@ trust rules applied.
 
 ## Remote management loop
 
-1. **On the server:** bootstrap with auth (save the printed token), run with
-   `--public-hostname mc2.example.com` and a cert resolver so the control
-   plane itself appears in the Traefik catalog (`https://mc2.example.com`).
-2. **On the client:** `mc2 context set prod --api https://mc2.example.com
-   --token 'mc2at_…'` once, then `mc2 context use prod` — every command now
-   manages the remote server.
+Use the wizard on each machine (`mc2 setup` never starts the server or Traefik):
 
-`mc2 setup` scaffolds both trees interactively: the **server** tree writes a
-default `traefik.static.yml`, prints the runnable `mc2 server …` command, and
-a finish-setup checklist; the **client** tree saves and activates a context
-with an optional live verify.
+1. **On the server:** `mc2 setup server`. Accept the defaults or override
+   them (bind, data dir, auth, public hostname, Traefik). Start the printed
+   `mc2 server …` command and save the one-time API token. With a public
+   hostname, the control plane itself appears in the Traefik catalog
+   (`https://mc2.example.com`).
+2. **On the client:** `mc2 setup client`. Paste the URL and token; it saves
+   and activates the context and can verify the live connection.
+
+The equivalent hand-typed commands are
+`mc2 server --public-hostname mc2.example.com …` and
+`mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'`.
+See [Manage a remote server](/documentation/guides/manage-a-remote-server).
 
 ## Key behaviors
 

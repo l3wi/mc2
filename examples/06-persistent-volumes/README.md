@@ -63,11 +63,10 @@ coordination is the application's responsibility.
 ## Run it (lab)
 
 Start the server using the
-[quickstart](../../site/content/documentation/quickstart.mdx), optionally pointing it at
-a throwaway volume root:
+[quickstart](../../site/content/documentation/quickstart.mdx). Volumes land
+under the default named-volume root (`~/.microsandbox/volumes`):
 
 ```bash
-mc2 server --volume-dir /tmp/mc2-lab-volumes ...
 mc2 up -f examples/06-persistent-volumes/stack.yaml
 ```
 
@@ -87,7 +86,7 @@ mc2 exec smoke-volumes/keep/0 cat /data/marker
 mc2 ps
 
 # 4. Volume data remains on disk after stack removal.
-ls /tmp/mc2-lab-volumes/mc2-smoke-volumes--data/
+ls ~/.microsandbox/volumes/mc2-smoke-volumes--data/
 ```
 
 `GET /v1/instances` shows the instance bound to its node while the node is

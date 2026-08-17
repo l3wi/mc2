@@ -206,8 +206,9 @@ Five top-level tabs. Icons mirror microsandbox conventions.
    Docker Compose vs Kubernetes vs Firecracker); "Why MC2"; "What's
    possible" (agent swarm, compose migration, remote SSH, test grid, browser
    fleet); "Minimal example" (smallest stack + `mc2 up`); next-steps cards.
-2. `quickstart` — Install -> `mc2 doctor` -> start server (`--no-auth` lab)
-   -> `mc2 up -f examples/01-hello-service` -> `mc2 ps` -> `curl`. Ends with
+2. `quickstart` — Install -> `mc2 doctor` -> `mc2 setup` (server then
+   client; lab skip: `mc2 server --no-auth` with defaults) ->
+   `mc2 up -f examples/01-hello-service` -> `mc2 ps` -> `curl`. Ends with
    "What just happened?" debrief (desired state published, reconcile loop,
    phase transitions) and next steps.
 

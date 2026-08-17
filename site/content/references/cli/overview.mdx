@@ -15,6 +15,7 @@ loopback or a remote install over TLS. For the API it talks to, see the
 | Command | Role |
 | ------- | ---- |
 | `mc2 server` | The orchestrator — SQLite, REST, scheduler, embedded microsandbox runtime |
+| `mc2 setup` | First-run wizard: **Server** (flags + Traefik scaffold) or **Client** (save a context) |
 | `mc2 node ls` | Show the local node (capacity, status) |
 | `mc2 up -f <file>` | Bring up a stack (publish desired state, converge) |
 | `mc2 down <stack> [--volumes]` | Tear down a stack (`rm` is an alias) |
@@ -30,7 +31,6 @@ loopback or a remote install over TLS. For the API it talks to, see the
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
 | `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |
 | `mc2 doctor` | Host / msb readiness checks |
-| `mc2 setup` | Interactive setup wizard (server / client trees) |
 | `mc2 completions <shell>` | Shell completions (bash/zsh/fish) |
 | `mc2 version` | Show version info |
 

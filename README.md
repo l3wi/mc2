@@ -81,29 +81,57 @@ curl -fsSL https://github.com/l3wi/mc2/releases/latest/download/mc2-installer.sh
 Or grab the checksummed `.tar.xz` for your platform from
 [releases](https://github.com/l3wi/mc2/releases).
 
-## Quick start (dev)
+## First run
 
 Requirements: `mc2` on your PATH (see [Install](#install)) and a hypervisor
-(Linux KVM / Apple Silicon HVF) for running sandboxes. Full walkthrough:
-[site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx).
+(Linux KVM / Apple Silicon HVF) for running sandboxes. Check the host, then
+let the wizard collect flags and print the commands to finish:
 
 ```bash
-DATA=/tmp/mc2-dev
 mc2 doctor
+mc2 setup
+```
 
-# Terminal 1 — the orchestrator (one process)
-# Lab (no token): --no-auth
-# Default: prints the API token once on first bootstrap
-mc2 server --data-dir "$DATA" --bind 127.0.0.1:7443 --no-auth
+`mc2 setup` is interactive (needs a TTY). Pick a tree, or jump straight to
+one with `mc2 setup server` / `mc2 setup client`. The wizard only scaffolds
+config — it never starts the server or Traefik.
 
-# Terminal 2 — operator (token only if server was not --no-auth)
-export MC2_API=http://127.0.0.1:7443
-# export MC2_API_KEY="<api-token>"   # when auth is enabled
+1. **On the machine that will run VMs** choose **Server**. It asks for bind
+   address, data dir, API key on/off, optional public hostname / Traefik, then
+   prints a copy-paste `mc2 server …` command and a finish-setup checklist.
+2. **Start the server** with that command. Auth is on by default; the API
+   token prints **once** on first bootstrap — save it. (`--no-auth` is lab
+   only.)
+3. **On your laptop** (or the same machine) run `mc2 setup` again and choose
+   **Client**. Paste the control-plane URL and token; it saves a named
+   context in `~/.mc2/config.toml` (0600) and can verify the connection.
+4. **Operate:**
+
+```bash
 mc2 node ls
 mc2 up -f examples/01-hello-service/stack.yaml
 mc2 ps
-curl -s "$MC2_API/v1/status"
-# after hello is Running: curl -s http://127.0.0.1:18091/
+# after hello is Running:
+curl -s http://127.0.0.1:18091/
+```
+
+Full walkthrough:
+[site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx).
+
+### Skip the wizard (lab)
+
+Two terminals, no context file, no auth. Defaults are data dir `~/.mc2` and
+bind `127.0.0.1:7443`; the CLI already talks to that loopback URL.
+
+```bash
+# Terminal 1 — the orchestrator (one process)
+mc2 server --no-auth
+
+# Terminal 2 — operator
+mc2 node ls
+mc2 up -f examples/01-hello-service/stack.yaml
+mc2 ps
+curl -s http://127.0.0.1:7443/v1/status
 ```
 
 Optional OTLP:
@@ -133,8 +161,8 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | `mc2 volume ls` | Named volumes retained on the node (stack, size, path) |
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
 | `mc2 ssh add-key\|keys\|show-key\|rm-key\|ls\|open\|close` | SSH keys + open/close endpoints |
+| `mc2 setup` | First-run wizard: **Server** (flags + Traefik scaffold) or **Client** (save a context) |
 | `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |
-| `mc2 setup` | Interactive setup wizard (server / client trees) |
 | `mc2 doctor` | Host / msb readiness checks |
 | `mc2 completions <shell>` | Shell completions (bash/zsh/fish) |
 
@@ -151,11 +179,6 @@ host outside loopback is `remote` mode (`mc2 status` reports it); plaintext
 Traefik ingress catalog so `mc2 context set prod --api https://mc2.example.com
 --token mc2at_… && mc2 context use prod` manages a remote install over TLS. See
 [site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx#remote-management).
-
-**Interactive setup:** `mc2 setup` walks two trees — **Server** (on the VPS:
-server flags, a one-time default `traefik.static.yml`, and a finish-setup
-checklist) and **Client** (locally: URL + API key → saved context, optional
-live verify).
 
 **Service networks:** `expose` → default-allow east–west with `<service>.<network>.svc.mc2` DNS (server-wide — stacks can share a network); `mc2 network` lists networks, members, and ports. See [examples/03-networks/](examples/03-networks/).
 

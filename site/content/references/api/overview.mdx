@@ -73,6 +73,9 @@ Errors are returned as JSON with an `error` message. The convention:
 
 ## Calling from curl
 
+The CLI already talks to the loopback default. `curl` needs the URL
+explicitly (`http://127.0.0.1:7443`):
+
 ```bash
 export MC2_API=http://127.0.0.1:7443
 export MC2_API_KEY='mc2at_...'

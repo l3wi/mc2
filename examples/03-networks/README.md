@@ -4,7 +4,6 @@ Same-node mediated networking (D13): an echo server + client reach each other
 over the stack's default network via `echo.<stack>.svc.mc2` DNS.
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 up -f examples/03-networks/stack.yaml
 mc2 network
 mc2 network smoke-networks

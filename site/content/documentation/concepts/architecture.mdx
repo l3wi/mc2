@@ -51,14 +51,16 @@ runtime error instead.
 ## In practice
 
 ```bash
-mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+mc2 setup    # first run: collect flags, print the command
+mc2 server   # defaults: data dir ~/.mc2, bind 127.0.0.1:7443, auth on
 ```
 
 Server-level knobs (all also env vars) include `--node-name`, `--label
 KEY=VALUE`, `--volume-dir` (durable volume root), `--ingress-config-dir`
 (Traefik file catalog), and `--reconcile-interval-secs`. Auth is on by
 default — the API token prints once on first bootstrap; `--no-auth` is for
-open lab installs.
+open lab installs. Use `--data-dir /srv/mc2` when a dedicated service user
+should own state.
 
 ## Key behaviors
 

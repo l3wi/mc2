@@ -16,16 +16,17 @@ and Traefik installed. This guide mirrors `examples/04-http-ingress`.
 
 ## Start the server with a catalog directory
 
+`mc2 setup` already asks for this (default `~/.mc2/ingress`). This lab
+example's Traefik static config is hardcoded to `/tmp/mc2-ingress`, so
+match that path:
+
 ```bash
-mkdir -p /tmp/mc2-ingress
-mc2 server \
-  --bind 127.0.0.1:7443 \
-  --no-auth \
-  --ingress-config-dir /tmp/mc2-ingress
+mc2 server --no-auth --ingress-config-dir /tmp/mc2-ingress
 ```
 
 The `--ingress-config-dir` tells the server where to write the Traefik
-file-provider catalog (`catalog.json`) as instances become Ready.
+file-provider catalog (`catalog.json`) as instances become Ready. Data dir
+and bind stay at their defaults (`~/.mc2`, `127.0.0.1:7443`).
 
 ## Map the hostname
 
@@ -58,7 +59,6 @@ The ingress rule's `port` must equal a `ports[].target` on the service.
 ## Apply and start Traefik
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 up -f examples/04-http-ingress/stack.yaml
 mc2 ps
 
@@ -78,7 +78,8 @@ The server only writes catalog entries for instances that are **Ready**
 what it wrote:
 
 ```bash
-curl -s "$MC2_API/v1/ingress" | jq .
+mc2 ingress
+curl -s http://127.0.0.1:7443/v1/ingress | jq .
 cat /tmp/mc2-ingress/catalog.json | jq .
 ```
 

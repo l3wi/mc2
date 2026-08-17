@@ -37,12 +37,14 @@ and [Run the server](/documentation/operations/run-the-server).
 | `--limit-disk-mib <n>` | `MC2_LIMIT_DISK_MIB` | `0` | Max MC2-used disk MiB: data dir + named volumes (`0` = unlimited) |
 
 ```bash
-mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
-mc2 server --data-dir /srv/mc2 --ingress-config-dir /srv/mc2-ingress --public-hostname mc2.example.com
+mc2 setup     # first run: collect flags, print the command
+mc2 server    # defaults: ~/.mc2, 127.0.0.1:7443, auth on
+mc2 server --ingress-config-dir ~/.mc2/ingress --public-hostname mc2.example.com
 ```
 
 Auth is on by default — the API token prints once on first bootstrap. `--no-auth`
-is for open lab installs.
+is for open lab installs. Override `--data-dir /srv/mc2` when a dedicated
+service user should own state.
 
 ## doctor
 
@@ -72,9 +74,12 @@ mc2 node ls
 
 ## setup, completions, version
 
+`mc2 setup` is the first-run path: it collects flags, scaffolds Traefik
+config, and prints the commands to finish. It never starts the server.
+
 | Command | Meaning |
 | ------- | ------- |
-| `mc2 setup` | Interactive setup wizard; pick a tree |
+| `mc2 setup` | First-run wizard; pick a tree |
 | `mc2 setup server` | Jump straight to the server tree |
 | `mc2 setup client` | Jump straight to the client tree |
 | `mc2 completions <shell>` | Generate shell completions (bash/zsh/fish) |

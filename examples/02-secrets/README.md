@@ -4,7 +4,6 @@
 not yet provide a complete guest-side command that proves the injected value.
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 secret set SMOKE_TOKEN --value 'lab-only-token'
 mc2 up -f examples/02-secrets/stack.yaml
 mc2 ps

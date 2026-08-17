@@ -1,6 +1,6 @@
 ---
 title: Quickstart
-description: Install MC2, boot the server, and run your first service in under five minutes.
+description: Install MC2, run the setup wizard, and bring up your first service in under five minutes.
 ---
 
 Single-machine path for **Linux (KVM)** and **macOS Apple Silicon (HVF)**.
@@ -45,29 +45,32 @@ assume `mc2` is on your PATH.
 
 ## Run the orchestrator
 
-Open two terminals.
-
-**Terminal 1 — the server.** One process, no auth (open lab install):
+First run uses the interactive wizard. It needs a TTY; it only scaffolds
+config and prints the commands to finish — it never starts the server or
+Traefik.
 
 ```bash
-DATA=/tmp/mc2-lab
-mkdir -p "$DATA"
-
-mc2 server \
-  --data-dir "$DATA" \
-  --bind 127.0.0.1:7443 \
-  --no-auth
+mc2 setup
 ```
 
-**Terminal 2 — the operator.** The CLI is a REST client; point it at the
-server and bring up your first stack:
+Jump straight to a tree with `mc2 setup server` (on the host that will run
+VMs) or `mc2 setup client` (on your laptop).
+
+1. **Server tree.** Bind address, data dir, API key on/off, optional public
+   hostname / Traefik. It prints a copy-paste `mc2 server …` command and a
+   finish-setup checklist. Start the server with that command. Auth is on by
+   default; the API token prints **once** on first bootstrap — save it.
+2. **Client tree.** Context name, control-plane URL, and the token. It saves
+   and activates a context in `~/.mc2/config.toml` (0600) and can verify the
+   live connection.
+
+Then bring up your first stack:
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 node ls
 mc2 up -f examples/01-hello-service/stack.yaml
 mc2 ps
-curl -s "$MC2_API/v1/status" | jq .
+curl -s http://127.0.0.1:7443/v1/status | jq .
 ```
 
 The example runs one HTTP service publishing host port `18091`:
@@ -76,6 +79,21 @@ The example runs one HTTP service publishing host port `18091`:
 curl -s http://127.0.0.1:18091/
 # hello world
 ```
+
+<Callout type="note" title="Skip the wizard (lab)">
+  Two terminals, no context file, no auth. Defaults are data dir
+  `~/.mc2` and bind `127.0.0.1:7443`; the CLI already talks to that
+  loopback URL.
+
+  ```bash
+  # Terminal 1
+  mc2 server --no-auth
+
+  # Terminal 2
+  mc2 node ls
+  mc2 up -f examples/01-hello-service/stack.yaml
+  ```
+</Callout>
 
 ## What just happened?
 

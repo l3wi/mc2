@@ -16,8 +16,8 @@ Auth is **on by default**. On first bootstrap the server prints a single
 Every operator request must present it:
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
-export MC2_API_KEY='mc2at_…'
+# After `mc2 setup client`, the context already has the token.
+export MC2_API_KEY='mc2at_…'   # ad-hoc; CLI already targets loopback
 mc2 node ls
 ```
 
@@ -31,7 +31,7 @@ Run the server without `--no-auth` and save the printed token on first
 bootstrap — it is not printed again.
 
 ```bash
-mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+mc2 server
 # ← save the printed API token (mc2at_…) now
 ```
 
@@ -48,7 +48,7 @@ can reach the API is the operator. It exists for open lab installs on
 loopback:
 
 ```bash
-mc2 server --data-dir /tmp/mc2-dev --bind 127.0.0.1:7443 --no-auth
+mc2 server --no-auth
 ```
 
 <Callout type="danger" title="Never --no-auth on anything reachable">

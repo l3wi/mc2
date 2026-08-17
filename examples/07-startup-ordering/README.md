@@ -4,7 +4,6 @@ Compose-style `depends_on` with a `service_healthy` condition: the web service
 waits for the DB to be healthy (its healthcheck passes) before starting.
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 up -f examples/07-startup-ordering/stack.yaml
 mc2 ps
 ```

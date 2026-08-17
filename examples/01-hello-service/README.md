@@ -5,11 +5,10 @@ server that returns `hello world`. The stack file is deliberately minimal —
 `name` is omitted and filled in by `mc2 up` from the file name (compose-style,
 see [stack.yaml reference](../../site/content/references/stack/overview.mdx)).
 
-Start the server and agent using [the quickstart](../../site/content/documentation/quickstart.mdx),
-then run:
+Follow [the quickstart](../../site/content/documentation/quickstart.mdx)
+(`mc2 setup`, then start the printed `mc2 server` command), then run:
 
 ```bash
-export MC2_API=http://127.0.0.1:7443
 mc2 up -f examples/01-hello-service/stack.yaml
 mc2 ps
 curl http://127.0.0.1:18091/

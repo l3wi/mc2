@@ -5,17 +5,20 @@ description: Server flags, environment variables, auth bootstrap, and day-2 oper
 
 `mc2 server` is the whole orchestrator. This page is the day-2 reference for
 running it: flags, environment variables, auth bootstrap, and operational
-details. For the mental model, see [Architecture](/documentation/concepts/architecture).
+details. First run is [Quickstart](/documentation/quickstart) (`mc2 setup`).
+For the mental model, see [Architecture](/documentation/concepts/architecture).
 
 ## Start it
 
 ```bash
-mc2 server --data-dir /srv/mc2 --bind 127.0.0.1:7443
+mc2 setup     # first run: collect flags, print the command
+mc2 server    # defaults: data dir ~/.mc2, bind 127.0.0.1:7443, auth on
 ```
 
 Auth is **on by default**: on first bootstrap the API token prints once —
 save it (the operator REST bearer). Use `--no-auth` only for open lab
-installs.
+installs. Override `--data-dir /srv/mc2` when a dedicated service user
+should own state.
 
 ## Server flags
 
@@ -42,10 +45,13 @@ Every flag also has an environment variable. Defaults in parentheses.
 
 ## Auth bootstrap
 
-1. Run `mc2 server --data-dir /srv/mc2` (no `--no-auth`).
+1. Run `mc2 server` (no `--no-auth`), or start the command `mc2 setup`
+   printed.
 2. Capture the printed `mc2at_…` token.
-3. Use it from the CLI: `export MC2_API_KEY='mc2at_…'`, or save a
-   [context](/documentation/guides/manage-a-remote-server).
+3. On the client, `mc2 setup client` saves a
+   [context](/documentation/guides/manage-a-remote-server). Ad-hoc:
+   `export MC2_API_KEY='mc2at_…'` (the CLI already targets the loopback
+   default).
 
 The token never prints again — back it up with the data dir.
 

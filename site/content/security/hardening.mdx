@@ -44,8 +44,8 @@ nothing here requires tools MC2 does not ship or document.
 - [ ] **Always https + a token remotely.** Bind appropriately and, for remote
       management, publish the control plane via `--public-hostname` with a
       cert resolver — then reach it as `https://…` from a saved context.
-- [ ] Use contexts rather than scattering tokens: `mc2 context set prod --api
-      https://… --token 'mc2at_…'`.
+- [ ] Use contexts rather than scattering tokens: `mc2 setup client`, or
+      `mc2 context set prod --api https://… --token 'mc2at_…'`.
 - [ ] Restrict who can read `~/.mc2/config.toml` (mode 0600). It holds bearer
       tokens in plaintext.
 
