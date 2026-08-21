@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-dev.202608210254"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/l3wi/mc2"
