@@ -12,9 +12,8 @@ pub(crate) const NETWORK_NAME_MAX: usize = 63;
 pub(crate) const VOLUME_NAME_MAX: usize = 63;
 
 /// Maximum service `cpus`. The microsandbox builder takes the vCPU count as a
-/// `u8` and `mc2-runtime` clamps to `[1, 255]`, so anything above 255 would be
-/// silently distorted into a smaller reservation than the YAML asks for.
-pub(crate) const MAX_CPUS: f64 = 255.0;
+/// `u8`, so anything above 255 cannot be honoured.
+pub(crate) const MAX_CPUS: u32 = 255;
 
 /// Network profile closed set (`none` must be the only entry; unknown values
 /// are rejected — never treated as `public`).
@@ -67,12 +66,11 @@ pub(crate) fn validate_stack(doc: &StackDocument) -> Result<(), String> {
         if svc.scale == 0 {
             return Err(format!("service {name}: scale must be >= 1 for MVP"));
         }
-        // The runtime clamps to [1, 255] vCPUs, so a non-positive/NaN cpus
-        // would reserve nothing (or an unreadable `null`) while the VM takes a
-        // full vCPU. Reject anything the clamp would distort.
-        if !svc.cpus.is_finite() || svc.cpus <= 0.0 || svc.cpus > MAX_CPUS {
+        // `cpus` is already a whole number (the decoder rejects fractions);
+        // 0 would reserve nothing while the VM needs a vCPU.
+        if svc.cpus == 0 || svc.cpus > MAX_CPUS {
             return Err(format!(
-                "service {name}: cpus must be a finite number in (0, {MAX_CPUS}] (got {})",
+                "service {name}: cpus must be between 1 and {MAX_CPUS} (got {})",
                 svc.cpus
             ));
         }

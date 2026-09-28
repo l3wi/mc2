@@ -70,6 +70,10 @@ pub enum StoreError {
     /// User-supplied input rejected (e.g. an invalid SSH public key).
     #[error("{0}")]
     InvalidArgument(String),
+    /// A host port another stack already claims (C4). The message names the
+    /// port and, when the backend can report it cheaply, the owner.
+    #[error("{0}")]
+    Conflict(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -91,6 +95,101 @@ pub struct ClusterCounts {
     pub instances: u32,
 }
 
+/// Transport protocol of a [`HostPortClaim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    /// Classify a spec `protocol` string the way the runtime binds it: anything
+    /// that is not `udp` (case-insensitively) publishes as TCP.
+    pub fn from_spec(protocol: &str) -> Self {
+        if protocol.eq_ignore_ascii_case("udp") {
+            Self::Udp
+        } else {
+            Self::Tcp
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// Why a host port is claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// A `ports[].published` host port of one replica.
+    Publish,
+    /// An `expose[]` listener, claimed once for the whole service.
+    Expose,
+}
+
+impl ClaimKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Expose => "expose",
+        }
+    }
+}
+
+/// One host port a stack claims, recorded in `host_port_claims`.
+///
+/// Host ports are exclusive server-wide: a guest resolves every name to the one
+/// gateway IP and msb rewrites `gateway:P` to host `127.0.0.1:P` with no remap,
+/// so `(port, protocol)` — not the owning stack — is the identity of a host
+/// listener. The table's primary key is the uniqueness backstop behind the
+/// apply-time allocation checks (C4).
+///
+/// The owning stack is [`StackPlan::stack`], not a field here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPortClaim {
+    /// Never `0`: an unallocated publish port is not a claim.
+    pub port: u16,
+    pub protocol: PortProtocol,
+    /// Service that binds the port.
+    pub service: String,
+    /// Replica ordinal for a [`ClaimKind::Publish`] claim; `None` for
+    /// [`ClaimKind::Expose`], whose single claim every replica shares.
+    pub ordinal: Option<u32>,
+    pub kind: ClaimKind,
+}
+
+impl HostPortClaim {
+    /// `"8080/tcp"` — how a port is named in conflict messages.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.port, self.protocol.as_str())
+    }
+}
+
+/// Message for [`StoreError::Conflict`] when a host port is already taken (C4).
+///
+/// `owner` is the claiming stack and service when the backend can report them
+/// cheaply; `None` when all the constraint says is that the port is taken.
+pub fn host_port_conflict_message(
+    requested: &HostPortClaim,
+    requester_stack: &str,
+    owner: Option<(&str, &str)>,
+) -> String {
+    let owner = match owner {
+        Some((stack, service)) => format!("{stack}/{service}"),
+        None => "another stack".to_string(),
+    };
+    format!(
+        "host port {} is already claimed by {owner} ({} of {requester_stack}/{}); \
+         host ports are exclusive server-wide",
+        requested.key(),
+        requested.kind.as_str(),
+        requested.service,
+    )
+}
+
 /// The complete desired instance set for one stack, produced by
 /// `mc2_server::apply::plan_stack` and written atomically by
 /// [`Store::commit_stack_plan`].
@@ -107,6 +206,9 @@ pub struct StackPlan {
     pub raw_yaml: String,
     /// Desired instances, ordered by `(service, ordinal)`.
     pub instances: Vec<PlannedInstance>,
+    /// Host ports this plan claims, asserted by the store's `(port, protocol)`
+    /// uniqueness constraint in the same transaction (C4).
+    pub host_ports: Vec<HostPortClaim>,
 }
 
 /// One desired instance in a [`StackPlan`]. Whether it is created or updated is
@@ -125,6 +227,9 @@ impl StackPlan {
     ///
     /// Replacing a stack that already owns instances also removes the ones the
     /// plan does not mention — see [`Store::commit_stack_plan`].
+    ///
+    /// The plan claims no host ports; attach them with
+    /// [`StackPlan::with_host_ports`] when the scenario cares (C4).
     pub fn replicas<'a>(
         stack: &str,
         labels_json: &str,
@@ -146,7 +251,14 @@ impl StackPlan {
             labels_json: labels_json.to_string(),
             raw_yaml: raw_yaml.to_string(),
             instances,
+            host_ports: Vec::new(),
         }
+    }
+
+    /// The host ports this plan asserts at commit (C4).
+    pub fn with_host_ports(mut self, host_ports: Vec<HostPortClaim>) -> Self {
+        self.host_ports = host_ports;
+        self
     }
 }
 
@@ -204,11 +316,20 @@ pub trait Store: Send + Sync {
     /// config hash are preserved so the node decides on a recreate); anything
     /// else the stack owns is deleted (ssh/network rows cascade).
     ///
+    /// The same transaction replaces this stack's host-port claims
+    /// ([`StackPlan::host_ports`]) and asserts them against every other
+    /// stack's: host ports are exclusive server-wide, so a `(port, protocol)`
+    /// another stack already claims — or that this plan lists twice — fails
+    /// with [`StoreError::Conflict`] and rolls the whole commit back.
+    ///
     /// Returns the stack's instances ordered by `(service, ordinal)`.
     async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError>;
 
     /// Delete a stack and its instances (cascades ssh/network rows) in one
     /// transaction. Returns false when the stack did not exist.
+    ///
+    /// Its host-port claims go with it, so the ports it held become claimable
+    /// again (C4).
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError>;
 
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError>;

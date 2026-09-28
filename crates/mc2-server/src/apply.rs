@@ -2,12 +2,15 @@
 
 use crate::host_metrics::dir_size_mib;
 use crate::scheduler::{
-    effective_vcpus, pick_node, reserved_capacity_excluding, residual_capacity, service_load_map,
+    pick_node, reserved_capacity_excluding, residual_capacity, service_load_map,
 };
 use crate::ResourceLimits;
 use anyhow::{Context, Result};
 use mc2_api::{parse_stack_yaml, ServiceSpec, StackDocument};
-use mc2_store::{InstanceRecord, NodeStatus, PlannedInstance, StackPlan, Store};
+use mc2_store::{
+    ClaimKind, HostPortClaim, InstanceRecord, NodeStatus, PlannedInstance, PortProtocol, StackPlan,
+    Store, StoreError,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,8 +104,7 @@ impl ApplyConfig {
         let mut mem = 0u64;
         for svc in doc.services.values() {
             let scale = svc.scale.max(1) as u64;
-            cpu = cpu
-                .saturating_add(u64::from(effective_vcpus(svc.cpus)).saturating_mul(scale) as u32);
+            cpu = cpu.saturating_add(u64::from(svc.cpus).saturating_mul(scale) as u32);
             mem = mem.saturating_add(svc.mem_limit_mib.saturating_mul(scale));
         }
         (cpu, mem)
@@ -658,11 +660,49 @@ async fn plan_stack(
         }
     }
 
+    // C4: the host ports this plan claims, asserted by the store's
+    // `(port, protocol)` constraint inside the commit's transaction. The checks
+    // above are the primary path; these rows are the backstop, and they also
+    // free the stack's previous block when a `published` base moves.
+    let mut host_ports: Vec<HostPortClaim> = Vec::new();
+    for (svc_name, specs) in &resolved {
+        for (ordinal, spec) in specs.iter().enumerate() {
+            for p in &spec.ports {
+                // `published: 0` was resolved to a concrete port for every
+                // replica; a stored spec never carries one.
+                if p.published != 0 {
+                    host_ports.push(HostPortClaim {
+                        port: p.published,
+                        protocol: PortProtocol::from_spec(&p.protocol),
+                        service: svc_name.clone(),
+                        ordinal: Some(ordinal as u32),
+                        kind: ClaimKind::Publish,
+                    });
+                }
+            }
+        }
+        // `expose` is one exclusive server-wide claim per service+port — the
+        // shared splice binds it once, for every replica — so `ordinal` is None.
+        // Validation makes the port list identical across replicas.
+        if let Some(spec) = specs.first() {
+            for ex in &spec.expose {
+                host_ports.push(HostPortClaim {
+                    port: ex.port,
+                    protocol: PortProtocol::from_spec(&ex.protocol),
+                    service: svc_name.clone(),
+                    ordinal: None,
+                    kind: ClaimKind::Expose,
+                });
+            }
+        }
+    }
+
     Ok(StackPlan {
         stack: doc.name.clone(),
         labels_json: "{}".to_string(),
         raw_yaml: raw_yaml.to_string(),
         instances,
+        host_ports,
     })
 }
 
@@ -676,10 +716,18 @@ pub async fn apply_stack(
 
     // All-or-nothing: the stack row and every instance create/update/delete
     // land in one transaction, alone in its own commit.
-    let committed = store
-        .commit_stack_plan(&plan)
-        .await
-        .context("commit stack plan")?;
+    let committed = match store.commit_stack_plan(&plan).await {
+        Ok(committed) => committed,
+        // C4 backstop: the database constraint caught a host-port claim the
+        // checks above did not (a lost race between two applies). It is the same
+        // user-facing class as any other allocation conflict.
+        Err(StoreError::Conflict(msg)) => return Err(ApplyError::Allocation(msg)),
+        Err(e) => {
+            return Err(ApplyError::Other(
+                anyhow::Error::from(e).context("commit stack plan"),
+            ))
+        }
+    };
     let total_instances = committed.len() as u32;
 
     let scheduled = run_scheduler(store.clone()).await?;
@@ -769,7 +817,7 @@ pub async fn run_scheduler(store: Arc<dyn Store>) -> Result<u32> {
             .with_context(|| format!("bind {}", inst.id))?;
 
         if let Some(entry) = residual_mut.get_mut(&node_id) {
-            entry.0 = entry.0.saturating_sub(effective_vcpus(spec.cpus));
+            entry.0 = entry.0.saturating_sub(spec.cpus);
             entry.1 = entry.1.saturating_sub(spec.mem_limit_mib);
         }
         // update snapshot
@@ -800,7 +848,7 @@ mod tests {
         ServiceSpec {
             image: "alpine".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![PortSpec {
                 published: 0,
@@ -830,7 +878,7 @@ mod tests {
         ServiceSpec {
             image: "alpine".into(),
             scale,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![PortSpec {
                 published,
@@ -1959,4 +2007,80 @@ async fn fixed_port_block_is_stable_and_may_move() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApplyError::Allocation(_)), "{err:?}");
+}
+
+/// C4: a commit rejected by the store's host-port constraint is an allocation
+/// conflict (HTTP 400), not a 500 — and the rejected apply writes nothing.
+///
+/// Only a lost race reaches this path: the checks in `plan_stack` read the
+/// stored instance specs, so a claim whose owning stack is gone from that scan
+/// (as after a concurrent apply that won the race) is exactly what the
+/// database backstop is for.
+#[tokio::test]
+async fn store_host_port_conflict_is_an_allocation_error() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    store
+        .commit_stack_plan(
+            &StackPlan::replicas("ghost", "{}", "yaml", []).with_host_ports(vec![HostPortClaim {
+                port: 8080,
+                protocol: PortProtocol::Tcp,
+                service: "web".into(),
+                ordinal: Some(0),
+                kind: ClaimKind::Publish,
+            }]),
+        )
+        .await
+        .unwrap();
+
+    let yaml = "name: app\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:80\"]\n";
+    let err = apply_stack_yaml(store.clone(), &cfg_default(), yaml)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Allocation(_)), "{err:?}");
+    assert!(err.to_string().contains("8080/tcp"), "{err}");
+    assert!(
+        store.get_stack("app").await.unwrap().is_none(),
+        "the rejected apply wrote nothing"
+    );
+}
+
+/// Apply records the plan's host ports, for both `ports[]` (per replica) and
+/// `expose[]` (once per service) — the store then refuses them to any other
+/// stack even when the application-level scan sees no owner in the specs.
+#[tokio::test]
+async fn apply_records_host_port_claims() {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    let yaml = "name: shop\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:80\"]\n  db:\n    image: postgres\n    expose: [15432]\n";
+    // A probe that always succeeds: the `expose` port is this test's subject,
+    // not whether the host happens to listen on it.
+    let cfg = ApplyConfig {
+        port_probe: |_p| Ok(()),
+        ..cfg_default()
+    };
+    apply_stack_yaml(store.clone(), &cfg, yaml).await.unwrap();
+
+    for (port, kind) in [(8080u16, ClaimKind::Publish), (15432, ClaimKind::Expose)] {
+        let err = store
+            .commit_stack_plan(
+                &StackPlan::replicas("other", "{}", "yaml", []).with_host_ports(vec![
+                    HostPortClaim {
+                        port,
+                        protocol: PortProtocol::Tcp,
+                        service: "api".into(),
+                        ordinal: None,
+                        kind,
+                    },
+                ]),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "port {port}: {err:?}"
+        );
+        assert!(err.to_string().contains(&format!("{port}/tcp")), "{err}");
+        assert!(err.to_string().contains("shop/"), "{err}");
+    }
 }

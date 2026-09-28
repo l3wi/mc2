@@ -96,4 +96,7 @@ See [Networking](/documentation/concepts/networking).
   sees accept-then-close while no backend is Ready), and refuses to create a
   VM whose allowed port has no listener (fail closed). Ports below 1024 need
   `CAP_NET_BIND_SERVICE` on Linux. `mc2 network` prints the owner of each claim.
+  Claims are additionally enforced by a database uniqueness constraint on
+  `(port, protocol)` — for `ports[].published` and `expose[]` alike — so even
+  two applies racing each other can never both win the same host port.
 </Callout>

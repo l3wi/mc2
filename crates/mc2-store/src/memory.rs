@@ -1,10 +1,10 @@
 //! In-memory store for unit tests.
 
 use crate::{
-    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
-    InstanceNetworkRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat,
-    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan,
-    StackRecord, Store, StoreError,
+    host_port_conflict_message, ssh_fingerprint, validate_public_key, verify_token, ClusterCounts,
+    ClusterMeta, InstanceNetworkRecord, InstancePhase, InstanceRecord, InstanceSshRecord,
+    NodeHeartbeat, NodeJoin, NodeRecord, NodeStatus, PortProtocol, SecretBlob, SecretMeta,
+    SshAuthorizedKey, StackPlan, StackRecord, Store, StoreError,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -12,6 +12,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Who holds a host port in a [`MemoryStore`] — everything the backend needs to
+/// report a conflict exactly like SQLite's primary key does.
+#[derive(Debug, Clone)]
+struct HostPortOwner {
+    stack: String,
+    service: String,
+}
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -24,6 +32,9 @@ struct Inner {
     instance_ssh: HashMap<String, InstanceSshRecord>,
     instance_network: HashMap<String, InstanceNetworkRecord>,
     settings: HashMap<String, String>,
+    /// Host ports claimed, keyed by `(port, protocol)` — exclusive
+    /// server-wide, exactly like SQLite's `host_port_claims` primary key (C4).
+    host_port_claims: HashMap<(u16, PortProtocol), HostPortOwner>,
 }
 
 #[derive(Debug, Default)]
@@ -167,10 +178,39 @@ impl Store for MemoryStore {
 
     async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError> {
         // One write lock for the whole plan: the stack row plus every instance
-        // create/update/delete. Readers never observe a half-applied stack, and
-        // no operation here can fail, so there is nothing to roll back.
+        // create/update/delete. Readers never observe a half-applied stack. The
+        // only step that can fail is the host-port claim check (C4), so it runs
+        // before the first mutation and a conflict leaves the store untouched —
+        // what SQLite gets by rolling the transaction back.
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
+
+        // Host ports are exclusive server-wide: a `(port, protocol)` another
+        // stack claims, or one this plan lists twice, is a conflict. This
+        // stack's own previous claims are replaced, so they never clash with
+        // themselves.
+        let mut claimed_in_plan: HashMap<(u16, PortProtocol), &str> = HashMap::new();
+        for claim in &plan.host_ports {
+            let key = (claim.port, claim.protocol);
+            let owner = g
+                .host_port_claims
+                .get(&key)
+                .filter(|o| o.stack != plan.stack)
+                .map(|o| (o.stack.as_str(), o.service.as_str()))
+                .or_else(|| {
+                    claimed_in_plan
+                        .get(&key)
+                        .map(|service| (plan.stack.as_str(), *service))
+                });
+            if owner.is_some() {
+                return Err(StoreError::Conflict(host_port_conflict_message(
+                    claim,
+                    &plan.stack,
+                    owner,
+                )));
+            }
+            claimed_in_plan.insert(key, claim.service.as_str());
+        }
 
         // Stack row: update in place (keeping created_at) or insert.
         let created_at = g
@@ -249,6 +289,18 @@ impl Store for MemoryStore {
             }
         }
 
+        // Replace this stack's claims with the plan's (validated above).
+        g.host_port_claims.retain(|_, o| o.stack != plan.stack);
+        for claim in &plan.host_ports {
+            g.host_port_claims.insert(
+                (claim.port, claim.protocol),
+                HostPortOwner {
+                    stack: plan.stack.clone(),
+                    service: claim.service.clone(),
+                },
+            );
+        }
+
         let mut out: Vec<InstanceRecord> = g
             .instances
             .values()
@@ -273,6 +325,9 @@ impl Store for MemoryStore {
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
         let mut g = self.inner.write().await;
         let existed = g.stacks.remove(name).is_some();
+        // Its host-port claims go with it, so the ports become claimable again —
+        // SQLite gets this from the FK's ON DELETE CASCADE (C4).
+        g.host_port_claims.retain(|_, o| o.stack != name);
         let removed_ids: Vec<String> = g
             .instances
             .values()

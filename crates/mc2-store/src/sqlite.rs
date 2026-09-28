@@ -1,13 +1,15 @@
 //! SQLite-backed store (default production backend).
 
 use crate::{
-    ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
-    InstanceNetworkRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord,
-    SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan, StackRecord, Store, StoreError,
+    host_port_conflict_message, ssh_fingerprint, validate_public_key, verify_token, ClusterCounts,
+    ClusterMeta, InstanceNetworkRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin,
+    NodeRecord, SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan, StackRecord, Store,
+    StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;
 use chrono::Utc;
+use sqlx::error::DatabaseError;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
@@ -409,6 +411,56 @@ impl Store for SqliteStore {
             }
         }
 
+        // Host-port claims (C4): replace this stack's, then assert the plan's.
+        // The application checks ports before planning, so a violation here is
+        // the backstop — a lost race, or a path that bypassed the check. The
+        // `(port, protocol)` primary key rejects a port another stack holds (or
+        // one this plan lists twice), and the error rolls the whole commit
+        // back, so the previous allocation survives a rejected apply.
+        sqlx::query("DELETE FROM host_port_claims WHERE stack = ?1")
+            .bind(&plan.stack)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        for claim in &plan.host_ports {
+            let inserted = sqlx::query(
+                r#"INSERT INTO host_port_claims (port, protocol, stack, service, ordinal, kind)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            )
+            .bind(claim.port as i64)
+            .bind(claim.protocol.as_str())
+            .bind(&plan.stack)
+            .bind(&claim.service)
+            .bind(claim.ordinal.map(i64::from))
+            .bind(claim.kind.as_str())
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = inserted {
+                if e.as_database_error()
+                    .is_some_and(DatabaseError::is_unique_violation)
+                {
+                    // Only the failing statement rolled back, so the row that
+                    // holds the port is still readable and names the owner.
+                    let owner = sqlx::query(
+                        "SELECT stack, service FROM host_port_claims \
+                         WHERE port = ?1 AND protocol = ?2",
+                    )
+                    .bind(claim.port as i64)
+                    .bind(claim.protocol.as_str())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StoreError::Other(e.into()))?
+                    .map(|r| (r.get::<String, _>("stack"), r.get::<String, _>("service")));
+                    return Err(StoreError::Conflict(host_port_conflict_message(
+                        claim,
+                        &plan.stack,
+                        owner.as_ref().map(|(s, svc)| (s.as_str(), svc.as_str())),
+                    )));
+                }
+                return Err(StoreError::Other(e.into()));
+            }
+        }
+
         // Drop every instance the plan does not keep: a service removed from the
         // YAML, or an ordinal past a scale-down. ssh/network rows cascade.
         let keep: std::collections::BTreeSet<(&str, u32)> = plan
@@ -531,8 +583,10 @@ impl Store for SqliteStore {
 
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
         // One transaction: instances first (no FK from instances→stacks), then
-        // the stack row. ssh/network rows cascade; a mid-way failure rolls both
-        // statements back so a down never leaves a half-deleted stack.
+        // the stack row. ssh/network rows cascade, and the stack row's delete
+        // also cascades its host_port_claims (C4), so a `down` frees its ports.
+        // A mid-way failure rolls both statements back so a down never leaves a
+        // half-deleted stack.
         let mut tx = self
             .pool
             .begin()

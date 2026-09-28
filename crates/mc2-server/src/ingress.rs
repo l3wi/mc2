@@ -282,7 +282,7 @@ mod tests {
         ServiceSpec {
             image: "alpine".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![PortSpec {
                 published: 8080,

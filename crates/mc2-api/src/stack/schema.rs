@@ -4,7 +4,7 @@
 //! lives in [`super::validate`].
 
 use crate::stack::decode::{
-    de_command, de_depends_on, de_disk_size_mib, de_duration, de_env, de_expose,
+    de_command, de_cpus, de_depends_on, de_disk_size_mib, de_duration, de_env, de_expose,
     de_healthcheck_test, de_healthcheck_timeout, de_interval, de_mem_limit, de_ports, de_ssh,
     se_disk_size_mib, se_mem_limit,
 };
@@ -132,9 +132,10 @@ pub struct ServiceSpec {
     /// Replica count (compose `scale`).
     #[serde(default = "default_scale")]
     pub scale: u32,
-    /// vCPUs (float, as compose `cpus`).
-    #[serde(default = "default_cpus_f64")]
-    pub cpus: f64,
+    /// Whole vCPUs (compose `cpus`). Fractional values are rejected: each
+    /// microVM gets whole vCPUs, so `1.5` would silently mean `1`.
+    #[serde(default = "default_cpus", deserialize_with = "de_cpus")]
+    pub cpus: u32,
     /// Guest memory MiB (compose `mem_limit`, accepts `512m`/`1g`/bytes).
     #[serde(
         default = "default_memory_mib",
@@ -249,8 +250,8 @@ fn default_restart() -> String {
     "no".into()
 }
 
-fn default_cpus_f64() -> f64 {
-    1.0
+fn default_cpus() -> u32 {
+    1
 }
 
 fn default_memory_mib() -> u64 {

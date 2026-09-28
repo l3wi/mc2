@@ -44,8 +44,8 @@ itself.
   reconcile pass.
 - **`command`** — guest argv as a list or a shell-split string. Omitted
   defaults to `sleep infinity` so a shell-less image stays alive.
-- **`cpus` / `mem_limit`** — vCPU count (float) and guest memory
-  (`512m`, `1g`, `1.5g`, or bytes).
+- **`cpus` / `mem_limit`** — whole vCPUs (`1`–`255`; fractions are rejected)
+  and guest memory (`512m`, `1g`, `1.5g`, or bytes).
 - **`depends_on`** — startup ordering; see below.
 - **`healthcheck`** — exec health probe that gates health.
 

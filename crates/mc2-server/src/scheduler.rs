@@ -40,7 +40,7 @@ pub fn pick_node(
                 .get(&n.id)
                 .copied()
                 .unwrap_or((n.cpus, n.memory_mib));
-            (cpu >= effective_vcpus(spec.cpus)) && mem >= spec.mem_limit_mib
+            (cpu >= spec.cpus) && mem >= spec.mem_limit_mib
         })
         .collect();
 
@@ -161,21 +161,6 @@ fn restart_policy(spec_json: &str) -> RestartPolicy {
         .unwrap_or(RestartPolicy::OnFailure)
 }
 
-/// vCPUs the sandbox runtime actually allocates for a declared `cpus`.
-///
-/// Mirrors `create_detached` in `mc2-runtime` (`msb_sdk.rs`), which hands the
-/// builder `(cpus.clamp(1.0, 255.0)) as u8`: values are clamped to `[1, 255]`
-/// and truncated to a whole vCPU. Reservation accounting must charge exactly
-/// this, or a stack could reserve less than its VMs take. A non-finite `cpus`
-/// can never create a VM (validation rejects it), so charge the minimum
-/// rather than letting the NaN → 0 cast reserve nothing.
-pub fn effective_vcpus(cpus: f64) -> u32 {
-    if !cpus.is_finite() {
-        return 1;
-    }
-    u32::from(cpus.clamp(1.0, 255.0) as u8)
-}
-
 /// Cluster-wide reserved CPU/memory across bound instances (same accounting as
 /// [`residual_capacity`]). Used for apply-time budget checks.
 pub fn reserved_capacity(instances: &[InstanceRecord]) -> (u32, u64) {
@@ -238,7 +223,7 @@ fn resources_from_spec_json(spec_json: &str) -> (u32, u64) {
         Ok(s) => s,
         Err(_) => return (1, 512),
     };
-    (effective_vcpus(spec.cpus), spec.mem_limit_mib)
+    (spec.cpus, spec.mem_limit_mib)
 }
 
 #[cfg(test)]
@@ -284,7 +269,7 @@ mod tests {
         let mut spec = ServiceSpec {
             image: "x".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
@@ -333,7 +318,7 @@ mod tests {
         let spec = ServiceSpec {
             image: "x".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
@@ -370,7 +355,7 @@ mod tests {
         let spec = ServiceSpec {
             image: "x".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
@@ -423,29 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn effective_vcpus_matches_what_the_runtime_allocates() {
-        // `create_detached` (mc2-runtime) clamps to [1, 255] then truncates.
-        assert_eq!(effective_vcpus(0.0), 1, "sub-1 vCPU is raised to one");
-        assert_eq!(effective_vcpus(0.5), 1);
-        assert_eq!(effective_vcpus(1.0), 1);
-        assert_eq!(effective_vcpus(1.9), 1, "the fraction is dropped");
-        assert_eq!(effective_vcpus(2.5), 2);
-        assert_eq!(effective_vcpus(255.0), 255);
-        assert_eq!(
-            effective_vcpus(300.0),
-            255,
-            "capped at the u8 the runtime takes"
-        );
-        assert_eq!(
-            effective_vcpus(f64::NAN),
-            1,
-            "a NaN cpus never creates a VM"
-        );
-    }
-
-    #[test]
     fn reserved_capacity_excludes_the_stack_being_applied() {
-        fn bound(stack: &str, service: &str, cpus: f64) -> InstanceRecord {
+        fn bound(stack: &str, service: &str, cpus: u32) -> InstanceRecord {
             InstanceRecord {
                 id: format!("{stack}-{service}"),
                 stack: stack.into(),
@@ -462,11 +426,11 @@ mod tests {
             }
         }
         let instances = vec![
-            bound("app", "web", 3.0),
-            bound("other", "db", 2.0),
+            bound("app", "web", 3),
+            bound("other", "db", 2),
             InstanceRecord {
                 node_id: None,
-                ..bound("pending", "job", 4.0)
+                ..bound("pending", "job", 4)
             },
         ];
         assert_eq!(

@@ -141,6 +141,62 @@ where
     d.deserialize_any(V)
 }
 
+/// Parse compose `cpus` as whole vCPUs: accepts `2`, `2.0` and `"2"`, and
+/// rejects fractional values (`1.5`, `"0.5"`) with a message that names the
+/// nearest whole choices. The 1..=255 range is checked in validation.
+pub(crate) fn de_cpus<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = u32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a whole number of vCPUs")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
+            u32::try_from(v).map_err(|_| E::custom(format!("cpus {v} is out of range")))
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u32, E> {
+            u32::try_from(v).map_err(|_| E::custom(format!("cpus must be at least 1 (got {v})")))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<u32, E> {
+            whole_cpus(v).map_err(E::custom)
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u32, E> {
+            let n: f64 = v
+                .trim()
+                .parse()
+                .map_err(|_| E::custom(format!("cpus must be a whole number (got {v:?})")))?;
+            whole_cpus(n).map_err(E::custom)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+fn whole_cpus(v: f64) -> Result<u32, String> {
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("cpus must be a whole number of vCPUs (got {v})"));
+    }
+    if v.fract() != 0.0 {
+        let lo = v.floor().max(1.0);
+        let hi = v.ceil();
+        let hint = if lo == hi {
+            format!("use {hi}")
+        } else {
+            format!("use {lo} or {hi}")
+        };
+        return Err(format!(
+            "cpus must be a whole number of vCPUs (got {v}): each microVM gets whole vCPUs \
+             — {hint}"
+        ));
+    }
+    if v > f64::from(u32::MAX) {
+        return Err(format!("cpus {v} is out of range"));
+    }
+    Ok(v as u32)
+}
+
 /// Parse compose `mem_limit` (`512m`, `1g`, `1.5g`, or bytes) → MiB.
 pub(crate) fn de_mem_limit<'de, D>(d: D) -> Result<u64, D::Error>
 where

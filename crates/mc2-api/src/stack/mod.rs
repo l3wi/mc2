@@ -88,7 +88,7 @@ mod tests {
         let s = ServiceSpec {
             image: "alpine".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
@@ -204,19 +204,30 @@ services:
     }
 
     #[test]
-    fn rejects_non_positive_or_oversized_cpus() {
-        for bad in ["0", "-1", ".nan", ".inf", "1000"] {
+    fn cpus_must_be_whole_vcpus_in_range() {
+        for bad in ["0", "-1", ".nan", ".inf", "1000", "1.5", "0.5", "\"2.5\""] {
             let yaml =
                 format!("name: demo\nservices:\n  web:\n    image: alpine\n    cpus: {bad}\n");
             let err = parse_stack_yaml(&yaml).unwrap_err();
             assert!(err.contains("cpus"), "{bad:?}: {err}");
         }
-        // The boundary and the fractional values the runtime can honour parse.
-        for ok in ["1", "0.5", "255"] {
+        // Whole values parse in every spelling Compose files use.
+        for (ok, want) in [("1", 1), ("2.0", 2), ("\"4\"", 4), ("255", 255)] {
             let yaml =
                 format!("name: demo\nservices:\n  web:\n    image: alpine\n    cpus: {ok}\n");
-            parse_stack_yaml(&yaml).unwrap_or_else(|e| panic!("cpus {ok:?} must parse: {e}"));
+            let doc = parse_stack_yaml(&yaml).unwrap_or_else(|e| panic!("cpus {ok}: {e}"));
+            assert_eq!(doc.services["web"].cpus, want, "{ok}");
         }
+    }
+
+    #[test]
+    fn fractional_cpus_error_names_the_whole_choices() {
+        let err = parse_stack_yaml("name: d\nservices:\n  w:\n    image: a\n    cpus: 1.5\n")
+            .unwrap_err();
+        assert!(err.contains("use 1 or 2"), "{err}");
+        let err = parse_stack_yaml("name: d\nservices:\n  w:\n    image: a\n    cpus: 0.5\n")
+            .unwrap_err();
+        assert!(err.contains("use 1"), "{err}");
     }
 
     #[test]
@@ -412,12 +423,12 @@ services:
     image: alpine:3.20
 "#;
         let doc = parse_stack_yaml(yaml).unwrap();
-        assert_eq!(doc.services["web"].cpus, 1.0);
+        assert_eq!(doc.services["web"].cpus, 1);
         assert_eq!(doc.services["web"].mem_limit_mib, 512);
         let s = ServiceSpec {
             image: "x".into(),
             scale: 1,
-            cpus: 1.0,
+            cpus: 1,
             mem_limit_mib: 512,
             ports: vec![],
             network: Default::default(),
@@ -436,7 +447,7 @@ services:
             networks: vec![],
             depends_on: BTreeMap::new(),
         };
-        assert_eq!(s.cpus, 1.0);
+        assert_eq!(s.cpus, 1);
         assert_eq!(s.mem_limit_mib, 512);
     }
 

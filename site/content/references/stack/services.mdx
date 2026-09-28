@@ -12,7 +12,7 @@ and the runtime behavior that turns it into one or more sandbox instances.
 | --- | --- | --- | --- |
 | `image` | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). |
 | `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
-| `cpus` | no | `1` | vCPUs (float). Must be `> 0` and at most `255`; the runtime allocates at least 1 vCPU and drops the fraction (`1.5` → 1, `0.5` → 1). |
+| `cpus` | no | `1` | Whole vCPUs, `1`–`255` (`2`, `2.0` and `"2"` are accepted). Fractional values such as `0.5` or `1.5` are rejected: each microVM gets whole vCPUs. Unlike Docker, this is a VM size, not a CPU-time quota. |
 | `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
 | `storage_opt` | no | `{size: 4GiB}` | Guest writable root-disk size (compose `storage_opt.size`). Compose byte sizes (`8GiB`, `512m`, or bytes); max 1 TiB. Changing it recreates the VM — files outside volumes are **not** kept. |
 | `command` | no | `sleep infinity` | Guest argv. List (`["echo", "hi"]`) or string (`echo "hi there"`, split shell-like). Omit to keep a shell-less image alive. |

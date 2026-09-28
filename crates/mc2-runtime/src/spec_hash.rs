@@ -13,7 +13,7 @@ pub fn desired_recreate_hash(d: &DesiredSandbox) -> String {
     h.update(b"|");
     h.update(d.spec.restart.as_bytes());
     h.update(b"|");
-    h.update(d.spec.cpus.to_bits().to_le_bytes());
+    h.update(d.spec.cpus.to_le_bytes());
     h.update(d.spec.mem_limit_mib.to_le_bytes());
     // Root-disk size is a create-time property (msb `root_disk`): a change
     // recreates the VM, so files outside volumes are not kept.
@@ -111,7 +111,7 @@ mod tests {
             spec: ServiceSpec {
                 image: image.into(),
                 scale: 1,
-                cpus: 1.0,
+                cpus: 1,
                 mem_limit_mib: 128,
                 ports: vec![],
                 network: Default::default(),

@@ -4,6 +4,18 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Port claims and whole vCPUs (breaking, pre-release)
+
+- **Host ports are enforced by the database.** A `host_port_claims` table
+  (migration 010, primary key `(port, protocol)`) is written in the same
+  transaction as each apply; a second claim on a published or exposed port is
+  refused even if the application checks were bypassed, and the apply returns
+  400 naming the owner. TCP and UDP are separate key spaces; `mc2 down` frees
+  the stack's ports.
+- **`cpus` is whole vCPUs.** `cpus: 2`, `2.0` and `"2"` are accepted;
+  fractional values (`0.5`, `1.5`) are rejected with the nearest whole choices
+  instead of being silently truncated. Range 1–255.
+
 ### CLI, docs and boundary cleanup (Wave 6)
 
 - **SSH refs.** `mc2 ssh open|show|close` accept `stack/service/ordinal`;

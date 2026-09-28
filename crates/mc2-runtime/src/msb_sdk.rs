@@ -159,7 +159,7 @@ async fn create_detached(
     }
     ensure_local_backend().await?;
 
-    let cpus = (desired.spec.cpus.clamp(1.0, 255.0)) as u8;
+    let cpus = desired.spec.cpus.clamp(1, 255) as u8;
     let mem = desired.spec.mem_limit_mib.min(u32::MAX as u64) as u32;
     let root_disk_mib = desired.spec.root_disk_mib().clamp(1, u32::MAX as u64) as u32;
 
@@ -675,7 +675,7 @@ mod tests {
             spec: ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
-                cpus: 1.0,
+                cpus: 1,
                 mem_limit_mib: 256,
                 ports: vec![],
                 network: mc2_api::stack::NetworkSpec {
@@ -717,7 +717,7 @@ mod tests {
             spec: ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
-                cpus: 1.0,
+                cpus: 1,
                 mem_limit_mib: 256,
                 ports: vec![],
                 network: mc2_api::stack::NetworkSpec {
@@ -774,7 +774,7 @@ mod tests {
             spec: ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
-                cpus: 1.0,
+                cpus: 1,
                 mem_limit_mib: 256,
                 ports: vec![],
                 network: mc2_api::stack::NetworkSpec {

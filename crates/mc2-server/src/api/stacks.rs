@@ -104,7 +104,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use mc2_store::{MemoryStore, StackPlan, Store};
+    use http_body_util::BodyExt;
+    use mc2_store::{ClaimKind, HostPortClaim, MemoryStore, PortProtocol, StackPlan, Store};
     use tower::ServiceExt;
 
     use crate::api::router;
@@ -278,5 +279,52 @@ services:
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// C4: a host-port clash the store's constraint catches is still a user
+    /// error — the REST layer answers 400 with the reason, never 500.
+    #[tokio::test]
+    async fn store_host_port_conflict_is_a_bad_request() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        // A claim with no matching instance spec: what a concurrent apply that
+        // won the race leaves behind for the pre-commit scans to miss, so the
+        // database constraint is the only thing that can reject it.
+        store
+            .commit_stack_plan(
+                &StackPlan::replicas("ghost", "{}", "yaml", []).with_host_ports(vec![
+                    HostPortClaim {
+                        port: 8080,
+                        protocol: PortProtocol::Tcp,
+                        service: "web".into(),
+                        ordinal: Some(0),
+                        kind: ClaimKind::Publish,
+                    },
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let app = router(test_state_open(store));
+        let body = serde_json::json!({
+            "yaml": "name: app\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:80\"]\n"
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/stacks:apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = v["error"].as_str().unwrap_or("");
+        assert!(msg.contains("8080/tcp"), "{v}");
+        assert!(msg.contains("ghost/web"), "names the owner: {v}");
     }
 }

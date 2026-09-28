@@ -6,7 +6,10 @@
 //! constraint failure (a `RAISE(ABORT)` trigger) to prove the commit is one
 //! transaction.
 
-use mc2_store::{InstanceRecord, InstanceSshRecord, MemoryStore, SqliteStore, StackPlan, Store};
+use mc2_store::{
+    ClaimKind, HostPortClaim, InstanceRecord, InstanceSshRecord, MemoryStore, PortProtocol,
+    SqliteStore, StackPlan, Store, StoreError,
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -49,6 +52,231 @@ fn ssh_row(instance_id: &str) -> InstanceSshRecord {
         desired: true,
         ..Default::default()
     }
+}
+
+/// A `ports[].published` claim: one host port of one replica.
+fn publish(port: u16, protocol: PortProtocol, service: &str, ordinal: u32) -> HostPortClaim {
+    HostPortClaim {
+        port,
+        protocol,
+        service: service.to_string(),
+        ordinal: Some(ordinal),
+        kind: ClaimKind::Publish,
+    }
+}
+
+/// An `expose` claim: one host port of a service, shared by every replica.
+fn expose(port: u16, service: &str) -> HostPortClaim {
+    HostPortClaim {
+        port,
+        protocol: PortProtocol::Tcp,
+        service: service.to_string(),
+        ordinal: None,
+        kind: ClaimKind::Expose,
+    }
+}
+
+/// A one-replica plan for `stack` asserting `host_ports` (C4).
+fn claiming(stack: &str, service: &str, host_ports: Vec<HostPortClaim>) -> StackPlan {
+    StackPlan::replicas(
+        stack,
+        "{}",
+        &format!("name: {stack}\n"),
+        vec![(service, vec![spec("alpine")])],
+    )
+    .with_host_ports(host_ports)
+}
+
+/// Committing a plan asserting a host port another stack holds fails with
+/// [`StoreError::Conflict`] naming port and owner, and leaves **both** stacks
+/// exactly as they were: a port clash is never a half-applied stack (C4).
+async fn conflicting_claim_commits_nothing(store: Arc<dyn Store>) {
+    let shop = claiming(
+        "shop",
+        "web",
+        vec![publish(8080, PortProtocol::Tcp, "web", 0)],
+    );
+    store.commit_stack_plan(&shop).await.unwrap();
+
+    let other = claiming(
+        "other",
+        "api",
+        vec![publish(8080, PortProtocol::Tcp, "api", 0)],
+    );
+    let err = store.commit_stack_plan(&other).await.unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("8080/tcp"), "names the port: {msg}");
+    assert!(msg.contains("shop/web"), "names the owner: {msg}");
+
+    // The loser wrote nothing — stack row, instance rows and claims alike.
+    assert!(store.get_stack("other").await.unwrap().is_none());
+    assert!(store
+        .list_instances()
+        .await
+        .unwrap()
+        .iter()
+        .all(|i| i.stack == "shop"));
+    assert!(store
+        .commit_stack_plan(&claiming(
+            "third",
+            "api",
+            vec![publish(8080, PortProtocol::Tcp, "api", 0)]
+        ))
+        .await
+        .is_err());
+    assert!(store.get_stack("third").await.unwrap().is_none());
+
+    // The winner is untouched (its spec was not rewritten) and its own plan
+    // still commits: a stack never conflicts with the claims it is replacing.
+    let stack = store.get_stack("shop").await.unwrap().unwrap();
+    assert_eq!(stack.raw_yaml, "name: shop\n");
+    store
+        .commit_stack_plan(&shop)
+        .await
+        .expect("a stack replaces its own claims");
+    assert_eq!(instances(&store, "shop", "web").await.len(), 1);
+}
+
+/// The same number on different protocols is two different host listeners.
+async fn protocols_are_separate_key_spaces(store: Arc<dyn Store>) {
+    store
+        .commit_stack_plan(&claiming(
+            "shop",
+            "web",
+            vec![publish(5000, PortProtocol::Tcp, "web", 0)],
+        ))
+        .await
+        .unwrap();
+    store
+        .commit_stack_plan(&claiming(
+            "other",
+            "dns",
+            vec![publish(5000, PortProtocol::Udp, "dns", 0)],
+        ))
+        .await
+        .expect("udp 5000 does not clash with tcp 5000");
+    assert!(store.get_stack("shop").await.unwrap().is_some());
+    assert!(store.get_stack("other").await.unwrap().is_some());
+}
+
+/// A re-commit replaces the stack's claims instead of piling up duplicates, and
+/// moving a port releases the old one for another stack.
+async fn recommit_replaces_claims_and_releases_moved_ports(store: Arc<dyn Store>) {
+    let plan = claiming(
+        "shop",
+        "web",
+        vec![publish(8080, PortProtocol::Tcp, "web", 0)],
+    );
+    store.commit_stack_plan(&plan).await.unwrap();
+    store
+        .commit_stack_plan(&plan)
+        .await
+        .expect("the same ports re-committed are not a duplicate");
+
+    // A scaled block: each replica ordinal is its own claim.
+    store
+        .commit_stack_plan(&claiming(
+            "shop",
+            "web",
+            vec![
+                publish(8081, PortProtocol::Tcp, "web", 0),
+                publish(8082, PortProtocol::Tcp, "web", 1),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // 8080 moved away, so it is free; 8081/8082 are still shop's.
+    store
+        .commit_stack_plan(&claiming(
+            "other",
+            "api",
+            vec![publish(8080, PortProtocol::Tcp, "api", 0)],
+        ))
+        .await
+        .expect("the moved-away port is released");
+    for port in [8081, 8082] {
+        let err = store
+            .commit_stack_plan(&claiming(
+                "third",
+                "api",
+                vec![publish(port, PortProtocol::Tcp, "api", 0)],
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(_)),
+            "port {port}: {err:?}"
+        );
+    }
+    assert!(store.get_stack("third").await.unwrap().is_none());
+}
+
+/// Deleting a stack frees its ports (FK cascade in SQLite, explicit in memory).
+async fn deleting_a_stack_frees_its_ports(store: Arc<dyn Store>) {
+    store
+        .commit_stack_plan(&claiming(
+            "shop",
+            "web",
+            vec![
+                publish(8080, PortProtocol::Tcp, "web", 0),
+                expose(5432, "web"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(store.delete_stack("shop").await.unwrap());
+
+    store
+        .commit_stack_plan(&claiming(
+            "other",
+            "api",
+            vec![
+                publish(8080, PortProtocol::Tcp, "api", 0),
+                expose(5432, "api"),
+            ],
+        ))
+        .await
+        .expect("both ports are free again");
+}
+
+/// `expose` and `publish` share the `(port, 'tcp')` key space on purpose: both
+/// bind host loopback, so one port can never carry both.
+async fn publish_and_expose_share_the_tcp_key_space(store: Arc<dyn Store>) {
+    store
+        .commit_stack_plan(&claiming("shop", "db", vec![expose(5432, "db")]))
+        .await
+        .unwrap();
+    let err = store
+        .commit_stack_plan(&claiming(
+            "other",
+            "api",
+            vec![publish(5432, PortProtocol::Tcp, "api", 0)],
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("5432/tcp") && msg.contains("shop/db"), "{msg}");
+    assert!(store.get_stack("other").await.unwrap().is_none());
+
+    // And the other way round: a foreign publish blocks an `expose` claim.
+    assert!(store.delete_stack("shop").await.unwrap());
+    store
+        .commit_stack_plan(&claiming(
+            "other",
+            "api",
+            vec![publish(5432, PortProtocol::Tcp, "api", 0)],
+        ))
+        .await
+        .unwrap();
+    let err = store
+        .commit_stack_plan(&claiming("shop", "db", vec![expose(5432, "db")]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    assert!(err.to_string().contains("other/api"), "{err}");
 }
 
 /// The plan is the *whole* desired state: replicas are created, matched in place
@@ -277,4 +505,59 @@ async fn failed_commit_rolls_back_sqlite() {
 async fn failed_delete_stack_leaves_instances_sqlite() {
     let (store, _dir) = sqlite_concrete().await;
     failed_delete_stack_leaves_instances(store.clone(), store.pool()).await;
+}
+
+#[tokio::test]
+async fn conflicting_claim_commits_nothing_memory() {
+    conflicting_claim_commits_nothing(memory().await).await;
+}
+
+#[tokio::test]
+async fn conflicting_claim_commits_nothing_sqlite() {
+    let (store, _dir) = sqlite().await;
+    conflicting_claim_commits_nothing(store).await;
+}
+
+#[tokio::test]
+async fn protocols_are_separate_key_spaces_memory() {
+    protocols_are_separate_key_spaces(memory().await).await;
+}
+
+#[tokio::test]
+async fn protocols_are_separate_key_spaces_sqlite() {
+    let (store, _dir) = sqlite().await;
+    protocols_are_separate_key_spaces(store).await;
+}
+
+#[tokio::test]
+async fn recommit_replaces_claims_and_releases_moved_ports_memory() {
+    recommit_replaces_claims_and_releases_moved_ports(memory().await).await;
+}
+
+#[tokio::test]
+async fn recommit_replaces_claims_and_releases_moved_ports_sqlite() {
+    let (store, _dir) = sqlite().await;
+    recommit_replaces_claims_and_releases_moved_ports(store).await;
+}
+
+#[tokio::test]
+async fn deleting_a_stack_frees_its_ports_memory() {
+    deleting_a_stack_frees_its_ports(memory().await).await;
+}
+
+#[tokio::test]
+async fn deleting_a_stack_frees_its_ports_sqlite() {
+    let (store, _dir) = sqlite().await;
+    deleting_a_stack_frees_its_ports(store).await;
+}
+
+#[tokio::test]
+async fn publish_and_expose_share_the_tcp_key_space_memory() {
+    publish_and_expose_share_the_tcp_key_space(memory().await).await;
+}
+
+#[tokio::test]
+async fn publish_and_expose_share_the_tcp_key_space_sqlite() {
+    let (store, _dir) = sqlite().await;
+    publish_and_expose_share_the_tcp_key_space(store).await;
 }
