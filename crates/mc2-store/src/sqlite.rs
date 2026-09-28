@@ -374,165 +374,15 @@ impl Store for SqliteStore {
             .begin()
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
-
-        // The stack row: update in place (keeping created_at) or insert.
-        let created: Option<String> = sqlx::query("SELECT created_at FROM stacks WHERE name = ?1")
-            .bind(&plan.stack)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?
-            .map(|r| r.get("created_at"));
-        match created {
-            Some(_) => {
-                sqlx::query(
-                    r#"UPDATE stacks SET labels_json = ?1, raw_yaml = ?2, updated_at = ?3 WHERE name = ?4"#,
-                )
-                .bind(&plan.labels_json)
-                .bind(&plan.raw_yaml)
-                .bind(&now)
-                .bind(&plan.stack)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Other(e.into()))?;
-            }
-            None => {
-                sqlx::query(
-                    r#"INSERT INTO stacks (name, labels_json, raw_yaml, created_at, updated_at)
-                       VALUES (?1, ?2, ?3, ?4, ?5)"#,
-                )
-                .bind(&plan.stack)
-                .bind(&plan.labels_json)
-                .bind(&plan.raw_yaml)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Other(e.into()))?;
-            }
+        if let Err(e) = write_stack_plan(&mut tx, plan, &now).await {
+            // Roll back explicitly: a dropped transaction only queues its
+            // ROLLBACK, so SQLite would keep the write lock and the next
+            // writer (another pooled connection) would fail with SQLITE_BUSY.
+            // The plan error is what the caller needs; a failed rollback
+            // closes the connection anyway.
+            let _ = tx.rollback().await;
+            return Err(e);
         }
-
-        // Host-port claims (C4): replace this stack's, then assert the plan's.
-        // The application checks ports before planning, so a violation here is
-        // the backstop — a lost race, or a path that bypassed the check. The
-        // `(port, protocol)` primary key rejects a port another stack holds (or
-        // one this plan lists twice), and the error rolls the whole commit
-        // back, so the previous allocation survives a rejected apply.
-        sqlx::query("DELETE FROM host_port_claims WHERE stack = ?1")
-            .bind(&plan.stack)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-        for claim in &plan.host_ports {
-            let inserted = sqlx::query(
-                r#"INSERT INTO host_port_claims (port, protocol, stack, service, ordinal, kind)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-            )
-            .bind(claim.port as i64)
-            .bind(claim.protocol.as_str())
-            .bind(&plan.stack)
-            .bind(&claim.service)
-            .bind(claim.ordinal.map(i64::from))
-            .bind(claim.kind.as_str())
-            .execute(&mut *tx)
-            .await;
-            if let Err(e) = inserted {
-                if e.as_database_error()
-                    .is_some_and(DatabaseError::is_unique_violation)
-                {
-                    // Only the failing statement rolled back, so the row that
-                    // holds the port is still readable and names the owner.
-                    let owner = sqlx::query(
-                        "SELECT stack, service FROM host_port_claims \
-                         WHERE port = ?1 AND protocol = ?2",
-                    )
-                    .bind(claim.port as i64)
-                    .bind(claim.protocol.as_str())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Other(e.into()))?
-                    .map(|r| (r.get::<String, _>("stack"), r.get::<String, _>("service")));
-                    return Err(StoreError::Conflict(host_port_conflict_message(
-                        claim,
-                        &plan.stack,
-                        owner.as_ref().map(|(s, svc)| (s.as_str(), svc.as_str())),
-                    )));
-                }
-                return Err(StoreError::Other(e.into()));
-            }
-        }
-
-        // Drop every instance the plan does not keep: a service removed from the
-        // YAML, or an ordinal past a scale-down. ssh/network rows cascade.
-        let keep: std::collections::BTreeSet<(&str, u32)> = plan
-            .instances
-            .iter()
-            .map(|i| (i.service.as_str(), i.ordinal))
-            .collect();
-        let stored = sqlx::query("SELECT id, service, ordinal FROM instances WHERE stack = ?1")
-            .bind(&plan.stack)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-        for row in &stored {
-            let service: String = row.get("service");
-            let ordinal = row.get::<i64, _>("ordinal") as u32;
-            if keep.contains(&(service.as_str(), ordinal)) {
-                continue;
-            }
-            let id: String = row.get("id");
-            sqlx::query("DELETE FROM instances WHERE id = ?1")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Other(e.into()))?;
-        }
-
-        // Create or refresh each planned instance. An update touches only
-        // spec_json/updated_at: placement, runtime id, observed phase and the
-        // applied-config hash stay put so the node can decide on a recreate.
-        for pi in &plan.instances {
-            let existing = sqlx::query(
-                r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
-            )
-            .bind(&plan.stack)
-            .bind(&pi.service)
-            .bind(pi.ordinal as i64)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-
-            match existing {
-                Some(row) => {
-                    let id: String = row.get("id");
-                    sqlx::query(
-                        r#"UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3"#,
-                    )
-                    .bind(&pi.spec_json)
-                    .bind(&now)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Other(e.into()))?;
-                }
-                None => {
-                    sqlx::query(
-                        r#"INSERT INTO instances
-                           (id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at)
-                           VALUES (?1, ?2, ?3, ?4, NULL, 'Pending', NULL, NULL, ?5, ?6)"#,
-                    )
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(&plan.stack)
-                    .bind(&pi.service)
-                    .bind(pi.ordinal as i64)
-                    .bind(&pi.spec_json)
-                    .bind(&now)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Other(e.into()))?;
-                }
-            }
-        }
-
         tx.commit().await.map_err(|e| StoreError::Other(e.into()))?;
 
         // `SELECT *` so this readback never goes stale as columns are added.
@@ -1123,6 +973,174 @@ impl Store for SqliteStore {
             updated_at: r.get("updated_at"),
         }))
     }
+}
+
+/// Every write of [`Store::commit_stack_plan`], run inside the caller's
+/// transaction: the stack row, its host-port claims, instance deletes for
+/// services/ordinals the plan drops, and instance creates/refreshes.
+async fn write_stack_plan(
+    conn: &mut sqlx::SqliteConnection,
+    plan: &StackPlan,
+    now: &str,
+) -> Result<(), StoreError> {
+    // The stack row: update in place (keeping created_at) or insert.
+    let created: Option<String> = sqlx::query("SELECT created_at FROM stacks WHERE name = ?1")
+        .bind(&plan.stack)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?
+        .map(|r| r.get("created_at"));
+    match created {
+        Some(_) => {
+            sqlx::query(
+                r#"UPDATE stacks SET labels_json = ?1, raw_yaml = ?2, updated_at = ?3 WHERE name = ?4"#,
+            )
+            .bind(&plan.labels_json)
+            .bind(&plan.raw_yaml)
+            .bind(now)
+            .bind(&plan.stack)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+        None => {
+            sqlx::query(
+                r#"INSERT INTO stacks (name, labels_json, raw_yaml, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            )
+            .bind(&plan.stack)
+            .bind(&plan.labels_json)
+            .bind(&plan.raw_yaml)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+    }
+
+    // Host-port claims (C4): replace this stack's, then assert the plan's.
+    // The application checks ports before planning, so a violation here is
+    // the backstop — a lost race, or a path that bypassed the check. The
+    // `(port, protocol)` primary key rejects a port another stack holds (or
+    // one this plan lists twice), and the error rolls the whole commit
+    // back, so the previous allocation survives a rejected apply.
+    sqlx::query("DELETE FROM host_port_claims WHERE stack = ?1")
+        .bind(&plan.stack)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+    for claim in &plan.host_ports {
+        let inserted = sqlx::query(
+            r#"INSERT INTO host_port_claims (port, protocol, stack, service, ordinal, kind)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        )
+        .bind(claim.port as i64)
+        .bind(claim.protocol.as_str())
+        .bind(&plan.stack)
+        .bind(&claim.service)
+        .bind(claim.ordinal.map(i64::from))
+        .bind(claim.kind.as_str())
+        .execute(&mut *conn)
+        .await;
+        if let Err(e) = inserted {
+            if e.as_database_error()
+                .is_some_and(DatabaseError::is_unique_violation)
+            {
+                // Only the failing statement rolled back, so the row that
+                // holds the port is still readable and names the owner.
+                let owner = sqlx::query(
+                    "SELECT stack, service FROM host_port_claims \
+                     WHERE port = ?1 AND protocol = ?2",
+                )
+                .bind(claim.port as i64)
+                .bind(claim.protocol.as_str())
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?
+                .map(|r| (r.get::<String, _>("stack"), r.get::<String, _>("service")));
+                return Err(StoreError::Conflict(host_port_conflict_message(
+                    claim,
+                    &plan.stack,
+                    owner.as_ref().map(|(s, svc)| (s.as_str(), svc.as_str())),
+                )));
+            }
+            return Err(StoreError::Other(e.into()));
+        }
+    }
+
+    // Drop every instance the plan does not keep: a service removed from the
+    // YAML, or an ordinal past a scale-down. ssh/network rows cascade.
+    let keep: std::collections::BTreeSet<(&str, u32)> = plan
+        .instances
+        .iter()
+        .map(|i| (i.service.as_str(), i.ordinal))
+        .collect();
+    let stored = sqlx::query("SELECT id, service, ordinal FROM instances WHERE stack = ?1")
+        .bind(&plan.stack)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+    for row in &stored {
+        let service: String = row.get("service");
+        let ordinal = row.get::<i64, _>("ordinal") as u32;
+        if keep.contains(&(service.as_str(), ordinal)) {
+            continue;
+        }
+        let id: String = row.get("id");
+        sqlx::query("DELETE FROM instances WHERE id = ?1")
+            .bind(&id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+    }
+
+    // Create or refresh each planned instance. An update touches only
+    // spec_json/updated_at: placement, runtime id, observed phase and the
+    // applied-config hash stay put so the node can decide on a recreate.
+    for pi in &plan.instances {
+        let existing = sqlx::query(
+            r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
+        )
+        .bind(&plan.stack)
+        .bind(&pi.service)
+        .bind(pi.ordinal as i64)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Other(e.into()))?;
+
+        match existing {
+            Some(row) => {
+                let id: String = row.get("id");
+                sqlx::query(
+                    r#"UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3"#,
+                )
+                .bind(&pi.spec_json)
+                .bind(now)
+                .bind(&id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            }
+            None => {
+                sqlx::query(
+                    r#"INSERT INTO instances
+                       (id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, NULL, 'Pending', NULL, NULL, ?5, ?6)"#,
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&plan.stack)
+                .bind(&pi.service)
+                .bind(pi.ordinal as i64)
+                .bind(&pi.spec_json)
+                .bind(now)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
