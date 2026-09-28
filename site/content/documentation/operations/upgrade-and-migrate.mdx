@@ -42,7 +42,17 @@ the API token and the secrets encryption key. To upgrade:
    running stacks; nothing is lost or re-declared by hand.
 
 Volumes under `--volume-dir` are plain directories and survive upgrades as
-long as the path is unchanged.
+long as the path is unchanged. The token is stored only as a hash: if it is
+lost, rotate it instead of restoring an older data-dir copy —
+`mc2 server token rotate --data-dir <dir>`.
+
+The secrets key is part of the pair with `mc2.db`: a restored database whose
+secret rows were encrypted with a key that is no longer present (or no longer
+matches) is **refused at startup** rather than silently re-keyed — restore
+`secrets.key` with the database, or the stored values are gone. If the key is
+truly lost, `mc2 server secrets purge --data-dir <dir> --yes` deletes the
+undecryptable rows; the server then starts (generating a new key) and you set
+the values again with `mc2 secret set`.
 
 ## Migrating an existing install
 

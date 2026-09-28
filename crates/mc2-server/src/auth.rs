@@ -1,55 +1,45 @@
-//! Bearer token auth for operator REST API (optional when no API token configured).
+//! Bearer token auth for the operator REST API.
+//!
+//! Auth is a router-level middleware ([`require_auth`]) applied to every `/v1`
+//! route, so a handler cannot forget it. `/health` stays public. The bearer is
+//! verified against the store on every request, so `mc2 server token rotate`
+//! takes effect immediately.
+//!
+//! `--no-auth` is a per-process switch (`AppState::no_auth`): the token still
+//! exists in the store; this process just skips the check.
 
 use crate::AppState;
 use axum::{
-    extract::FromRequestParts,
-    http::{header, request::Parts, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
 
-/// Extracted operator identity. When the cluster has no API token configured,
-/// requests are allowed without a bearer.
-#[derive(Debug, Clone)]
-pub struct AuthUser;
+/// Middleware: require a valid operator bearer token on protected routes.
+pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if state.no_auth {
+        // Explicit per-start opt-out (`--no-auth`), validated at startup.
+        return next.run(req).await;
+    }
 
-impl FromRequestParts<AppState> for AuthUser {
-    type Rejection = Response;
+    let Some(token) = extract_bearer(req.headers()) else {
+        return unauthorized();
+    };
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let required = match state.store.api_auth_required().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, "api_auth_required");
-                return Err(internal());
-            }
-        };
-
-        if !required {
-            // Open cluster: no bearer required.
-            return Ok(AuthUser);
-        }
-
-        let Some(token) = extract_bearer(&parts.headers) else {
-            return Err(unauthorized());
-        };
-
-        match state.store.verify_api_token(&token).await {
-            Ok(true) => Ok(AuthUser),
-            Ok(false) => Err(unauthorized()),
-            Err(e) => {
-                tracing::error!(error = %e, "token verification failed");
-                Err(internal())
-            }
+    match state.store.verify_api_token(&token).await {
+        Ok(true) => next.run(req).await,
+        Ok(false) => unauthorized(),
+        Err(e) => {
+            tracing::error!(error = %e, "token verification failed");
+            internal()
         }
     }
 }
 
-fn extract_bearer(headers: &http::HeaderMap) -> Option<String> {
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value
         .strip_prefix("Bearer ")
@@ -78,4 +68,34 @@ fn internal() -> Response {
         Json(json!({ "error": "internal error" })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn extracts_bearer_case_insensitively() {
+        assert_eq!(
+            extract_bearer(&headers("Bearer abc")).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            extract_bearer(&headers("bearer abc")).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_empty_or_wrong_scheme() {
+        assert!(extract_bearer(&HeaderMap::new()).is_none());
+        assert!(extract_bearer(&headers("Bearer ")).is_none());
+        assert!(extract_bearer(&headers("Basic abc")).is_none());
+    }
 }

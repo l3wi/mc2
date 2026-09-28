@@ -28,19 +28,42 @@ resolved as `<service>.<network>.svc.mc2` DNS.
   sandbox must not have any network reach at all.
 </Callout>
 
-## Port claims are unique server-wide
+## Port claims are exclusive server-wide
 
-Exposed guest ports are effectively unique server-wide. When `scale > 1`, each
-replica gets a distinct host port (fixed `8080` becomes `8080, 8081, 8082`;
-target-only ports get a stable auto host port). A second claim on an
-already-bound port fails:
+Exposed guest ports are exclusive server-wide and claimed at **apply** time,
+for the claim's whole lifetime. A guest resolves every name to the one gateway
+IP and msb rewrites `gateway:P` to host `127.0.0.1:P` with no remap, so the
+port alone identifies the shared splice — two stacks cannot hold the same
+`expose` port. When `scale > 1`, each replica gets a distinct host port (fixed
+`8080` becomes `8080, 8081, 8082`; target-only ports get a stable auto host
+port).
 
-<Callout type="warning" title="Failed network edge">
-  The second service to claim an already-bound exposed port reports a
-  `Failed` network edge rather than silently sharing or stealing the port.
-  `mc2 network <stack>/<service>/<ordinal>` shows each instance's observed
-  exposes and edges.
+<Callout type="warning" title="Rejected at apply, not at runtime">
+  `mc2 up` returns `400` for an `expose` port another stack already claims
+  (naming the owner and suggesting another port), for a port MC2 already takes
+  — the REST bind, any SSH listener, any published `ports:` host port, or `53`
+  — and for a loopback port a host process is already listening on. The
+  listener is then held from apply until the stack is removed, so a client sees
+  *accept-then-close* while the service has no running backend, and no host
+  process can take the port meanwhile. `mc2 network` prints the owner of every
+  claimed port.
 </Callout>
+
+## Egress is narrow and fail-closed
+
+A guest's east–west egress is a create-time `Host:tcp:P` rule per reachable
+port — no `host` profile, no broad loopback grant (that is exactly why
+`network.profiles: [host]` needs the server flag `--allow-host-profile`). A
+rule cannot be narrowed after the virtual machine exists, so the node **fails
+closed**: if the listener for one of an instance's allowed ports cannot be
+bound, that instance is reported `Failed` with the port and cause and its
+microVM is never created.
+
+On Linux, `expose` ports below the unprivileged threshold (typically 1024) are
+rejected with the fix: grant `CAP_NET_BIND_SERVICE` (`setcap` or systemd
+`AmbientCapabilities`), lower `net.ipv4.ip_unprivileged_port_start`, or choose a
+higher port. Host ports always bind loopback in any case, so a privileged port
+buys reachability from the node itself, never from the network.
 
 ## Host ports: loopback only
 
@@ -56,6 +79,14 @@ termination and certificates are yours to operate — point your Traefik file
 provider at the catalog and it terminates TLS for the hostnames you own. MC2
 publishes the control plane itself the same way when you set
 `--public-hostname`, so a remote install is manageable over TLS.
+
+Ingress inputs are strictly validated before they reach the catalog: hosts must
+be exact lowercase RFC 1123 names (no ports, wildcards or trailing dots), paths
+must start with `/` and hold no whitespace/quotes/backticks/backslashes/control
+characters, and `certResolver`/`entryPoint`/TCP route names are restricted to
+`[A-Za-z0-9_-]+`. The catalog is rendered from typed structs, so an invalid or
+injected value is rejected at apply rather than written into Traefik's dynamic
+config.
 
 ## Remote control plane transport
 

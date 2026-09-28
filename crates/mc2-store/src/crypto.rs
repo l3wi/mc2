@@ -24,41 +24,66 @@ impl SecretsKey {
         Ok(Self(key))
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    /// Encrypt `plaintext` for the secret `name`.
+    ///
+    /// `name` is bound to the ciphertext as AEAD associated data
+    /// (`aad_for`), so a row cannot be swapped between secret names.
+    pub fn encrypt(&self, name: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         let cipher =
             XChaCha20Poly1305::new_from_slice(&self.0).map_err(|_| CryptoError::InvalidKey)?;
         let mut nonce_bytes = [0u8; 24];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
+        let aad = aad_for(name);
         let ciphertext = cipher
             .encrypt(
                 nonce,
                 Payload {
                     msg: plaintext,
-                    aad: b"",
+                    aad: aad.as_slice(),
                 },
             )
             .map_err(|_| CryptoError::Encrypt)?;
         Ok((nonce_bytes.to_vec(), ciphertext))
     }
 
-    pub fn decrypt(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    /// Decrypt ciphertext previously encrypted for the secret `name`.
+    ///
+    /// A name mismatch fails authentication (see `aad_for`).
+    pub fn decrypt(
+        &self,
+        name: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         if nonce.len() != 24 {
             return Err(CryptoError::InvalidNonce);
         }
         let cipher =
             XChaCha20Poly1305::new_from_slice(&self.0).map_err(|_| CryptoError::InvalidKey)?;
         let nonce = XNonce::from_slice(nonce);
+        let aad = aad_for(name);
         cipher
             .decrypt(
                 nonce,
                 Payload {
                     msg: ciphertext,
-                    aad: b"",
+                    aad: aad.as_slice(),
                 },
             )
             .map_err(|_| CryptoError::Decrypt)
     }
+}
+
+/// AEAD associated data binding a ciphertext to its secret name.
+///
+/// Format: `mc2-secret-v1\0<name>`. The NUL separator keeps (`a`, `b`) and
+/// (`ab`, ``) distinct; the version prefix allows a future format change.
+fn aad_for(name: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(14 + name.len());
+    aad.extend_from_slice(b"mc2-secret-v1\0");
+    aad.extend_from_slice(name.as_bytes());
+    aad
 }
 
 impl std::fmt::Debug for SecretsKey {
@@ -90,8 +115,20 @@ mod tests {
     #[test]
     fn roundtrip() {
         let key = SecretsKey::from_bytes([7u8; 32]);
-        let (n, c) = key.encrypt(b"super-secret").unwrap();
-        let plain = key.decrypt(&n, &c).unwrap();
+        let (n, c) = key.encrypt("DB_PASS", b"super-secret").unwrap();
+        let plain = key.decrypt("DB_PASS", &n, &c).unwrap();
         assert_eq!(plain, b"super-secret");
+    }
+
+    #[test]
+    fn ciphertext_is_bound_to_secret_name() {
+        let key = SecretsKey::from_bytes([7u8; 32]);
+        let (n, c) = key.encrypt("A", b"super-secret").unwrap();
+        // Decrypting as any other name must fail authentication.
+        assert!(key.decrypt("B", &n, &c).is_err());
+        // Prefix collisions are not a match either (`A` vs `AB`).
+        assert!(key.decrypt("AB", &n, &c).is_err());
+        // The right name still works.
+        assert_eq!(key.decrypt("A", &n, &c).unwrap(), b"super-secret");
     }
 }

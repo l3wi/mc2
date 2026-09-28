@@ -27,11 +27,15 @@ a shared named network.
 
 ## `network.profiles`
 
-The `network.profiles` key on a service selects its posture from `public`,
-`private`, `host`, and `none` (`none` disables the guest network entirely). It
-is independent of `networks[]` membership — membership says *which* networks,
-the profile says *how*. See [Services](./services#network-profiles) for the
-full table.
+The `network.profiles` key on a service selects its posture from the closed
+set `public`, `private`, `host`, and `none`. `none` disables the guest network
+entirely and must be the only entry; duplicates and any other value (including
+`local`/`any`) are rejected at parse time rather than defaulting to `public`.
+`host` is only accepted when the server runs with `--allow-host-profile`. An
+empty list keeps the `public` default. The profile is independent of
+`networks[]` membership —
+membership says *which* networks, the profile says *how*. See
+[Services](./services#network-profiles) for the full table.
 
 ## `networks` (top-level)
 
@@ -61,20 +65,20 @@ file export (`mc2 server --ingress-config-dir`).
 | Key | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Mark routes TLS in the catalog. Certs/ACME live in the proxy. |
-| `certResolver` | — | Traefik certificate resolver name from the proxy static config. |
+| `certResolver` | — | Traefik certificate resolver name from the proxy static config (`[A-Za-z0-9_-]+`). |
 
 ### `rules[]`
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `host` | yes | — | Hostname to route. |
+| `host` | yes | — | Exact lowercase RFC 1123 hostname (labels 1–63 of `[a-z0-9-]`, ≤ 253 total): no port, no wildcard, no trailing dot. |
 | `paths` | yes (≥1) | — | Path → backend entries. |
 
 #### `rules[].paths[]`
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `path` | no | `/` | Route path prefix/exact match. |
+| `path` | no | `/` | Route path: must start with `/` and contain no whitespace, quotes, backticks, backslashes or control characters. |
 | `pathType` | no | `Prefix` | `Prefix` or `Exact`. |
 | `service` | yes | — | Backend service in this stack. |
 | `port` | yes | — | Must equal a `ports[].target` on that service; backend `ports` entry must be `tcp` with a non-zero `published`. |
@@ -97,8 +101,8 @@ ingress:
 
 | Key | Required | Description |
 | --- | --- | --- |
-| `name` | yes | Stable route name for the Traefik config. |
-| `entryPoint` | yes | Traefik entrypoint accepting TCP connections. |
+| `name` | yes | Stable route name for the Traefik config (`[A-Za-z0-9_-]+`). |
+| `entryPoint` | yes | Traefik entrypoint accepting TCP connections (`[A-Za-z0-9_-]+`). |
 | `service` | yes | Backend service; must have `ssh.enabled` with a fixed (non-zero) `ssh.port`. |
 
 ```yaml
@@ -114,5 +118,8 @@ ingress:
   and that `ports` entry must be `tcp` with a non-zero `published` (`udp`
   backends and auto-allocated ports are rejected). TCP routes target services
   through their `ssh` front end, which must have `ssh.enabled` and a fixed
-  (non-zero) `ssh.port`. Violations return `400` at apply.
+  (non-zero) `ssh.port`. Hosts, paths and Traefik identifiers are strictly
+  validated (see the tables above), and two routes that would collapse to the
+  same Traefik router key are rejected rather than overwriting one another.
+  Violations return `400` at apply.
 </Callout>

@@ -55,7 +55,8 @@ mc2 status -o json
 ## network & ingress
 
 `mc2 network [name | inst-ref] [-o json]` shows server-wide network
-membership.
+membership, the owner of every claimed `expose` port, and each instance's
+exposed ports.
 
 | Arg | Meaning |
 | --- | ------- |
@@ -81,7 +82,8 @@ mc2 ingress -o json
 
 `mc2 volume ls [-o json]` lists the named volumes retained on the node —
 directories under `mc2 server --volume-dir` (default
-`~/.microsandbox/volumes`), each resolved as `mc2-<stack>--<volume>`.
+`~/.mc2/volumes`), each resolved as `mc2-<stack>--<volume>`. Each row shows
+the declared `size` limit and the measured usage.
 
 ```bash
 mc2 volume ls

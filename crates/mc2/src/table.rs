@@ -82,7 +82,8 @@ impl Table {
                 .collect();
             t.add_row(cells);
         }
-        t.to_string()
+        // comfy-table omits the final newline; callers `print!` the result.
+        format!("{t}\n")
     }
 }
 

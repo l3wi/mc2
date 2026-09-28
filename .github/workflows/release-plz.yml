@@ -6,49 +6,82 @@
 # - `release` job: when a release PR merges, creates the `vX.Y.Z` git tag.
 #   cargo-dist's `release.yml` then builds installers and publishes the
 #   GitHub Release.
+#
+# The tag is pushed with a GitHub App installation token, *not* the default
+# `GITHUB_TOKEN`: GitHub does not start workflows (including `release.yml`)
+# for refs pushed with `GITHUB_TOKEN`, so an automated tag would never produce
+# a release. The same token is used for the release PR so CI runs on it.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   RELEASE_APP_ID           — the GitHub App's numeric App ID
+#   RELEASE_APP_PRIVATE_KEY  — the App's PEM private key
+# Install the App on this repository with:
+#   Contents: Read and write       (push tags/branches, update the release PR)
+#   Pull requests: Read and write  (open/update the release PR)
+#   Administration: Read and write (only if the repository protects tags)
 name: Release-plz
 
 on:
   push:
     branches: [main]
 
+# Least privilege: jobs take their write scope from the App installation token,
+# so the workflow token itself stays read-only.
+permissions:
+  contents: read
+
 jobs:
   release:
     name: Tag merged release PR
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: read
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # Only what the `release` command needs (create the tag).
+          permission-contents: write
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: release-plz/action@v0.5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           command: release
+        env:
+          # Pushing the tag as the App is what makes `release.yml` run.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   release-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
-    # Job-level permissions: creating the release PR needs pull-requests: write.
-    permissions:
-      contents: write
-      pull-requests: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # Opening/updating the release PR needs both.
+          permission-contents: write
+          permission-pull-requests: write
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: release-plz/action@v0.5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

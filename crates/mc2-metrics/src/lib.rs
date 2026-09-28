@@ -25,10 +25,12 @@ pub struct Mc2Metrics {
     pub reconcile_errors: Counter<u64>,
     pub applies: Counter<u64>,
     pub schedule_binds: Counter<u64>,
-    pub reschedule_unbinds: Counter<u64>,
     pub instances: Gauge<u64>,
     pub nodes_ready: Gauge<u64>,
     pub nodes_total: Gauge<u64>,
+    /// Per-instance disk usage / declared limit (A9), in MiB.
+    pub instance_disk_used_mib: Gauge<u64>,
+    pub instance_disk_limit_mib: Gauge<u64>,
 }
 
 impl Mc2Metrics {
@@ -50,10 +52,6 @@ impl Mc2Metrics {
                 .u64_counter("mc2.server.schedule_binds")
                 .with_description("Instances bound to a node by the scheduler")
                 .build(),
-            reschedule_unbinds: meter
-                .u64_counter("mc2.server.reschedule_unbinds")
-                .with_description("Instances unbound from NotReady nodes")
-                .build(),
             instances: meter
                 .u64_gauge("mc2.server.instances")
                 .with_description("Cluster instance count by phase")
@@ -65,6 +63,16 @@ impl Mc2Metrics {
             nodes_total: meter
                 .u64_gauge("mc2.server.nodes_total")
                 .with_description("Registered nodes")
+                .build(),
+            instance_disk_used_mib: meter
+                .u64_gauge("mc2.instance.disk_used_mib")
+                .with_description("Instance root-disk / volume usage (MiB), attribute target")
+                .build(),
+            instance_disk_limit_mib: meter
+                .u64_gauge("mc2.instance.disk_limit_mib")
+                .with_description(
+                    "Instance root-disk / volume declared limit (MiB), attribute target",
+                )
                 .build(),
         }
     }
@@ -165,11 +173,17 @@ pub fn record_schedule_binds(n: u64) {
     }
 }
 
-pub fn record_reschedule_unbinds(n: u64) {
+/// Export one instance's disk usage/limit pair (A9).
+///
+/// `target` is `root-disk` or `volume:<name>`.
+pub fn record_instance_disk(instance_id: &str, target: &str, used_mib: u64, limit_mib: u64) {
     if let Some(m) = metrics() {
-        if n > 0 {
-            m.reschedule_unbinds.add(n, &[]);
-        }
+        let attrs = [
+            KeyValue::new("instance", instance_id.to_string()),
+            KeyValue::new("target", target.to_string()),
+        ];
+        m.instance_disk_used_mib.record(used_mib, &attrs);
+        m.instance_disk_limit_mib.record(limit_mib, &attrs);
     }
 }
 
@@ -202,7 +216,6 @@ mod tests {
         record_reconcile(true);
         record_apply();
         record_schedule_binds(2);
-        record_reschedule_unbinds(1);
         set_cluster_gauges(1, 1, &[("Running".into(), 1)]);
     }
 }

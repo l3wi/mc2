@@ -11,17 +11,31 @@ commands, and `ssh` manages authorized keys and open/close SSH endpoints.
 ## exec
 
 `mc2 exec <instance> <cmd...>` runs a command inside an instance's sandbox.
-Piped stdin is forwarded.
+There is no implicit shell: the tokens after the instance ref are the guest
+argv, passed through verbatim — tokens starting with `-` included, no `--`
+needed. MC2's own global flags (`--token`, `--context`, …) are therefore only
+recognised *before* the instance ref. Use `--` to be explicit, or to forward a
+guest `--help`/`-h`/`-V`, which clap keeps for `mc2` itself.
 
 | Arg | Meaning |
 | --- | ------- |
 | `<instance>` | Instance id, or `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) |
-| `<cmd...>` | Command to run in the sandbox |
+| `<cmd...>` | Command and arguments to run (trailing; passed verbatim) |
 
 ```bash
 mc2 exec demo/web/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
 echo "input" | mc2 exec demo/web/0 tee /dev/stdin
 ```
+
+Shell syntax — redirects, `;`, `&&`, globs — needs a shell; spell it out:
+
+```bash
+mc2 exec demo/web/0 /bin/sh -c 'echo hi > /data/marker'
+mc2 exec demo/web/0 -- /bin/sh -c 'uname -a'
+```
+
+stdin, stdout and stderr are raw bytes end to end (base64 on the wire), so
+binary data round-trips unchanged; the request cap leaves ~12 MiB of raw stdin.
 
 ## ssh keys
 

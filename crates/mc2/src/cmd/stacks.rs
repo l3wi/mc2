@@ -1,7 +1,7 @@
 //! Stack lifecycle commands: `up`, `down` (alias `rm`), `config`.
 
 use crate::cli::{ConfigArgs, DownArgs, UpArgs};
-use crate::client::{api_error, operator_post, urlencoding_simple};
+use crate::client::{api_error, operator_get, operator_post, urlencoding_simple};
 use crate::context::Conn;
 use anyhow::{Context, Result};
 
@@ -24,7 +24,49 @@ pub(crate) async fn up_cmd(args: UpArgs, conn: &Conn) -> Result<()> {
     }
     println!("{body}");
     print_ssh_endpoints(&body);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(stack) = v["stack"].as_str() {
+            print_disk_conditions(conn, stack).await;
+        }
+    }
     Ok(())
+}
+
+/// After `mc2 up`, print the full disk-condition text for that stack's
+/// instances (nothing when they are healthy).
+async fn print_disk_conditions(conn: &Conn, stack: &str) {
+    let url = format!("{}/v1/instances", conn.url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let Ok(res) = operator_get(&client, &url, conn.token.as_deref())
+        .send()
+        .await
+    else {
+        return;
+    };
+    if !res.status().is_success() {
+        return;
+    }
+    let Ok(body) = res.text().await else {
+        return;
+    };
+    let Ok(instances) = serde_json::from_str::<Vec<mc2_store::InstanceRecord>>(&body) else {
+        return;
+    };
+    let mut header = false;
+    for i in instances.iter().filter(|i| i.stack == stack) {
+        let Some(message) = i.message.as_deref() else {
+            continue;
+        };
+        let text = mc2_api::disk::full_text_from_message(message, &i.stack, &i.service, i.ordinal);
+        if text.is_empty() {
+            continue;
+        }
+        if !header {
+            println!("disk:");
+            header = true;
+        }
+        println!("{text}");
+    }
 }
 
 /// After `mc2 up`, print the declared SSH front ends and their ingress
@@ -137,8 +179,8 @@ fn fill_stack_defaults(raw: &str, file_path: &str) -> String {
 
 /// Stack name from the file path: the sanitized stem, or — when the stem is
 /// the generic `stack` (e.g. `examples/01-hello-service/stack.yaml`) — the
-/// sanitized parent directory name. Result is lowercase, volume-safe charset,
-/// no `--` (the volume namespace separator).
+/// sanitized parent directory name. The result always satisfies the stack-name
+/// grammar `[a-z0-9]([a-z0-9_-]*[a-z0-9])?` (lowercase, no `--`, ≤ 40).
 fn stack_name_from_path(file_path: &str) -> String {
     let path = std::path::Path::new(file_path);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("stack");
@@ -159,23 +201,26 @@ fn stack_name_from_path(file_path: &str) -> String {
     }
 }
 
-/// Lowercase, volume-safe charset; collapse `--` and trim edge dashes.
+/// Lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?` (the stack-name grammar): maps
+/// every other character (including `.`) to `-`, collapses `--`, trims edge
+/// `-`/`_`, and caps at 40 characters.
 fn sanitize_stack_name(source: &str) -> String {
-    let mut out: String = source
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    while out.contains("--") {
-        out = out.replace("--", "-");
+    let mut out = String::with_capacity(source.len());
+    let mut prev_dash = false;
+    for c in source.to_ascii_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
     }
-    out.trim_matches('-').to_string()
+    let mut s: String = out.trim_matches(['-', '_']).chars().take(40).collect();
+    while s.ends_with('-') || s.ends_with('_') {
+        s.pop();
+    }
+    s
 }
 
 #[cfg(test)]
@@ -212,6 +257,24 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(doc.name, "01-hello-service");
+    }
+
+    #[test]
+    fn derived_stack_names_satisfy_the_name_grammar() {
+        let raw = "services:\n  web:\n    image: alpine:3.20\n";
+        for (path, want) in [
+            ("My App.v2.yaml", "my-app-v2"),
+            ("Team_A.yaml", "team_a"),
+            ("UPPER.yaml", "upper"),
+        ] {
+            let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(raw, path)).unwrap();
+            assert_eq!(doc.name, want, "{path}");
+        }
+
+        // Long stems are truncated to the 40-character cap and still validate.
+        let long = format!("{}.yaml", "a".repeat(60));
+        let doc = mc2_api::parse_stack_yaml(&fill_stack_defaults(raw, &long)).unwrap();
+        assert_eq!(doc.name.len(), 40);
     }
 
     #[test]

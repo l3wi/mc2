@@ -25,8 +25,15 @@ Content-Type: application/json
 { "yaml": "name: demo\nservices:\n  web:\n    image: alpine:3.20\n" }
 ```
 
-Apply is idempotent. Validation errors — malformed YAML, duplicate `expose`
-ports, allocation or capacity failures — return `400` with an `error` message.
+Apply is idempotent and **atomic**: the stack definition and every instance
+create/update/delete it implies are committed in one transaction. Validation
+errors — malformed YAML, duplicate `expose` ports, allocation or capacity
+failures — return `400` with an `error` message and leave the previously
+applied stack unchanged.
+
+The posted YAML is the whole desired state for that stack: a service removed
+from the document is torn down by the next apply, and a lower `scale` deletes
+the replicas above the new count. Named volumes are never removed by an apply.
 
 ```bash
 curl -s -H "Authorization: Bearer mc2at_..." \
@@ -72,15 +79,25 @@ returns the captured output.
 | Body field | Meaning |
 | ---------- | ------- |
 | `cmd` | Command array (required; empty `cmd` → `400`) |
-| `stdin` | Optional stdin to forward |
+| `stdinBase64` | Optional stdin, base64-encoded (raw bytes; malformed base64 → `400`) |
 
-Response fields: `instanceId`, `exitCode`, `stdout`, `stderr`. An instance with
-no sandbox runtime yet returns `400`.
+Response fields: `instanceId`, `exitCode`, `stdoutBase64`, `stderrBase64` —
+both streams are base64 because guest output need not be valid UTF-8. An
+instance with no sandbox runtime yet returns `400`.
+
+The body limit is 16 MiB, and base64 costs 4/3, so the largest raw stdin is
+~12 MiB.
 
 ```bash
+# echo -n hi | base64  →  aGk=
 curl -s -H "Authorization: Bearer mc2at_..." \
   -X POST http://127.0.0.1:7443/v1/instances/<id>/exec \
-  -d '{"cmd":["echo","hi"]}' | jq .
+  -d '{"cmd":["echo","hi"],"stdinBase64":"aGk="}' | jq .
+
+# Decode the captured output.
+curl -s -H "Authorization: Bearer mc2at_..." \
+  -X POST http://127.0.0.1:7443/v1/instances/<id>/exec \
+  -d '{"cmd":["echo","hi"]}' | jq -r .stdoutBase64 | base64 -d
 ```
 
 `GET /v1/instances/{id}/logs` returns recent sandbox logs.
@@ -102,7 +119,9 @@ curl -s -H "Authorization: Bearer mc2at_..." \
 
 `GET /v1/volumes` lists the named volumes retained on the node — directories
 under the server's volume root (`mc2 server --volume-dir`, default
-`~/.microsandbox/volumes`), each resolved as `mc2-<stack>--<volume>`.
+`~/.mc2/volumes`), each resolved as `mc2-<stack>--<volume>`. Each entry
+carries `limit_mib` (declared `volumes.<name>.size`, `null` when the stack is
+gone) and `used_mib` (measured usage).
 
 ```
 GET /v1/volumes

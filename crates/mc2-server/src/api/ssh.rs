@@ -31,10 +31,7 @@ pub struct InstanceSshPutBody {
     pub authorized_keys: Vec<String>,
 }
 
-pub async fn list_ssh_keys(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<Vec<SshAuthorizedKey>> {
+pub async fn list_ssh_keys(State(state): State<AppState>) -> ApiResult<Vec<SshAuthorizedKey>> {
     state
         .store
         .list_ssh_keys()
@@ -45,7 +42,6 @@ pub async fn list_ssh_keys(
 
 pub async fn get_ssh_key(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult<SshAuthorizedKey> {
     match state.store.get_ssh_key(&name).await {
@@ -57,7 +53,6 @@ pub async fn get_ssh_key(
 
 pub async fn put_ssh_key(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
     Json(body): Json<SshKeyBody>,
 ) -> ApiResult<SshAuthorizedKey> {
@@ -70,7 +65,6 @@ pub async fn put_ssh_key(
 
 pub async fn delete_ssh_key(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     match state.store.delete_ssh_key(&name).await {
@@ -82,7 +76,6 @@ pub async fn delete_ssh_key(
 
 pub async fn get_instance_ssh(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
     if state
@@ -104,7 +97,6 @@ pub async fn get_instance_ssh(
 
 pub async fn put_instance_ssh(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
     Json(body): Json<InstanceSshPutBody>,
 ) -> ApiResult<serde_json::Value> {
@@ -152,7 +144,6 @@ pub async fn put_instance_ssh(
 
 pub async fn delete_instance_ssh(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     if state
@@ -172,10 +163,7 @@ pub async fn delete_instance_ssh(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn list_ssh_endpoints(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<serde_json::Value> {
+pub async fn list_ssh_endpoints(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
     let rows = state
         .store
         .list_instance_ssh()

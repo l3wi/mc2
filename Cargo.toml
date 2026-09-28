@@ -28,6 +28,7 @@ mc2-runtime = { path = "crates/mc2-runtime" }
 mc2-metrics = { path = "crates/mc2-metrics" }
 
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -63,8 +64,15 @@ targets = [
 ]
 # Release notes from CHANGELOG.md sections.
 changelog = true
+# Sign release artifacts with GitHub Artifact Attestations, so users can run
+# `gh attestation verify mc2-<target>.tar.xz --repo l3wi/mc2` against a release.
+# The generated CI adds an `actions/attest` step (with `id-token: write` and
+# `attestations: write`) to `build-local-artifacts`; release.yml is
+# hand-tuned, so that step is maintained there.
+github-attestations = true
 # The generated release.yml is hand-tuned (installs libcap-ng-dev for the
-# Linux microsandbox link); allow cargo-dist to accept the drift.
+# Linux microsandbox link; SHA-pinned actions; checksum-verified dist install);
+# allow cargo-dist to accept the drift.
 allow-dirty = ["ci"]
 # cargo-dist release builds use the `dist` profile (release + LTO/strip).
 [profile.dist]

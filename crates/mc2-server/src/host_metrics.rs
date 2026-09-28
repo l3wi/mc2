@@ -66,47 +66,15 @@ pub fn disk_usage_mib(path: &Path) -> (u64, u64) {
     (total, free)
 }
 
-/// Recursive on-disk size of `path` in bytes (real directories only; symlinked
-/// directories are not followed, so symlink cycles cannot loop).
-pub fn dir_size_bytes(path: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
-            }
-        }
-    }
-    total
-}
-
-/// Recursive on-disk size of `path` in MiB.
+/// Recursive on-disk size of `path` in MiB (same walk as the runtime's
+/// volume-quota measurement, so the two cannot drift apart).
 pub fn dir_size_mib(path: &Path) -> u64 {
-    dir_size_bytes(path) / (1024 * 1024)
+    mc2_runtime::dir_size_mib(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dir_size_counts_files_recursively() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
-        std::fs::write(dir.path().join("one"), vec![1u8; 2048]).unwrap();
-        std::fs::write(dir.path().join("a/two"), vec![2u8; 1024]).unwrap();
-        std::fs::write(dir.path().join("a/b/three"), vec![3u8; 4096]).unwrap();
-        assert_eq!(dir_size_bytes(dir.path()), 2048 + 1024 + 4096);
-    }
 
     #[test]
     fn disk_usage_reads_filesystem() {

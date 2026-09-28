@@ -7,35 +7,40 @@ mod auth;
 mod bootstrap;
 pub mod desired;
 mod host_metrics;
+mod http_serve;
 mod ingress;
 mod ingress_files;
+mod limits;
 mod network_serve;
 mod networks;
 mod node;
-mod reschedule;
 mod scheduler;
 mod secrets;
 mod ssh;
 mod ssh_serve;
-mod watcher;
 
 pub use api::router;
-pub use apply::{apply_stack_yaml, run_scheduler, ApplyResult};
-pub use bootstrap::{expand_data_dir, Bootstrap, BootstrapResult, FreshCredentials};
-pub use desired::build_desired_set;
-pub use reschedule::reschedule_not_ready;
+pub use apply::{
+    apply_stack_yaml, probe_host_loopback_port, run_scheduler, ApplyResult, PortProbe,
+};
+pub use bootstrap::{
+    deliver_bootstrap_token, expand_data_dir, generate_api_token, rotate_api_token, Bootstrap,
+    BootstrapResult, FreshCredentials,
+};
+pub use desired::{build_desired_set, DesiredFailure, DesiredSet};
+pub use limits::HttpLimits;
 pub use secrets::{decrypt_secret, set_secret};
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use mc2_store::{SecretsKey, SqliteStore, Store};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
 /// Arguments for `mc2 server` (the single-process orchestrator).
-#[derive(Debug, Clone, Parser)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct ServerArgs {
     /// Address to bind the operator REST API
     #[arg(long, default_value = "127.0.0.1:7443", env = "MC2_BIND")]
@@ -49,15 +54,8 @@ pub struct ServerArgs {
     #[arg(long, env = "MC2_SECRETS_KEY_PATH")]
     pub secrets_key_path: Option<String>,
 
-    /// Seconds without heartbeat before a Ready node becomes NotReady
-    #[arg(long, default_value_t = 45, env = "MC2_HEARTBEAT_GRACE_SECS")]
-    pub heartbeat_grace_secs: u64,
-
-    /// Interval for reschedule + Pending schedule loops (seconds)
-    #[arg(long, default_value_t = 5, env = "MC2_RESCHEDULE_INTERVAL_SECS")]
-    pub reschedule_interval_secs: u64,
-
-    /// Local node name (defaults to hostname)
+    /// Local node name (defaults to hostname). Display only — the node's
+    /// identity is persisted in the store, so renaming keeps placements.
     #[arg(long, env = "MC2_NODE_NAME")]
     pub node_name: Option<String>,
 
@@ -82,8 +80,9 @@ pub struct ServerArgs {
     #[arg(long, default_value = "le", env = "MC2_PUBLIC_TLS_CERT_RESOLVER")]
     pub public_tls_cert_resolver: String,
 
-    /// Named-volume root on durable node storage (default ~/.microsandbox/volumes).
-    /// Volumes persist across sandbox recreation and are retained on stack removal.
+    /// Root for MC2-owned named-volume directories (default ~/.mc2/volumes).
+    /// Each volume is a plain host directory mounted into the VM as a bind
+    /// mount with a `size` quota; data persists across recreate and stack removal.
     #[arg(long, env = "MC2_VOLUME_DIR")]
     pub volume_dir: Option<PathBuf>,
 
@@ -91,10 +90,64 @@ pub struct ServerArgs {
     #[arg(long)]
     pub init_only: bool,
 
-    /// Initialize without an API token (lab only). Only applies on first
-    /// bootstrap of a data dir.
+    /// Run this process without API auth (per-start switch; lab only).
+    ///
+    /// The API token still exists in the store — auth is just skipped for this
+    /// run. Requires a loopback `--bind` unless
+    /// `--allow-unauthenticated-remote` is also set, and is refused together
+    /// with `--public-hostname`.
     #[arg(long, env = "MC2_NO_AUTH", default_value_t = false)]
     pub no_auth: bool,
+
+    /// Explicit confirmation for `--no-auth` on a non-loopback bind (escape
+    /// hatch; logs a warning on every start).
+    #[arg(
+        long,
+        env = "MC2_ALLOW_UNAUTHENTICATED_REMOTE",
+        default_value_t = false
+    )]
+    pub allow_unauthenticated_remote: bool,
+
+    /// Allow stack services to request `network.profiles: [host]`.
+    ///
+    /// `host` gives the guest the whole host loopback — the control API and
+    /// every published port — so it is refused at apply unless this is set.
+    #[arg(long, env = "MC2_ALLOW_HOST_PROFILE", default_value_t = false)]
+    pub allow_host_profile: bool,
+
+    /// Max concurrent REST connections; beyond this the listener answers 503
+    /// (minimum 1)
+    #[arg(
+        long,
+        default_value_t = crate::limits::DEFAULT_MAX_CONNECTIONS,
+        env = "MC2_MAX_CONNECTIONS"
+    )]
+    pub max_connections: usize,
+
+    /// Whole-request deadline for ordinary REST routes, seconds
+    /// (`exec` and `logs` are exempt; `0` disables the deadline)
+    #[arg(
+        long,
+        default_value_t = crate::limits::DEFAULT_REQUEST_TIMEOUT_SECS,
+        env = "MC2_REQUEST_TIMEOUT_SECS"
+    )]
+    pub request_timeout_secs: u64,
+
+    /// Max concurrent SSH sessions across every instance listener (minimum 1)
+    #[arg(
+        long,
+        default_value_t = crate::limits::DEFAULT_MAX_SSH_SESSIONS,
+        env = "MC2_MAX_SSH_SESSIONS"
+    )]
+    pub max_ssh_sessions: usize,
+
+    /// Max concurrent SSH sessions for one instance listener (minimum 1)
+    #[arg(
+        long,
+        default_value_t = crate::limits::DEFAULT_MAX_SSH_SESSIONS_PER_LISTENER,
+        env = "MC2_MAX_SSH_SESSIONS_PER_LISTENER"
+    )]
+    pub max_ssh_sessions_per_listener: usize,
 
     /// Max reserved CPUs across the cluster; `0` = unlimited (default)
     #[arg(long, default_value_t = 0, env = "MC2_LIMIT_CPUS")]
@@ -104,7 +157,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 0, env = "MC2_LIMIT_MEMORY_MIB")]
     pub limit_memory_mib: u64,
 
-    /// Max MC2-used disk MiB (data dir + named volumes); `0` = unlimited (default)
+    /// Max reserved disk MiB across all stacks — declared-or-default volume
+    /// sizes (`volumes.<name>.size`) plus root disks × replicas
+    /// (`services.<name>.storage_opt.size`); `0` = unlimited (default)
     #[arg(long, default_value_t = 0, env = "MC2_LIMIT_DISK_MIB")]
     pub limit_disk_mib: u64,
 
@@ -115,8 +170,9 @@ pub struct ServerArgs {
 
 /// Cluster reservation budget enforced at apply time. `0` = unlimited.
 ///
-/// CPU/RAM are reserved from instance specs; disk is the measured on-disk size
-/// of the data dir + named volumes (volumes have no declared size).
+/// CPU/RAM are reserved from instance specs. Disk is a **reservation**: the
+/// declared-or-default volume sizes plus each replica's root disk, summed over
+/// every stack (checked before the store is touched).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceLimits {
     pub cpus: u32,
@@ -137,6 +193,83 @@ pub struct AppState {
     pub runtime: Arc<dyn mc2_runtime::NodeRuntime>,
     /// Cluster resource budget (`--limit-*`); all-zero = unlimited.
     pub limits: ResourceLimits,
+    /// REST listener admission limits (`--max-connections`,
+    /// `--request-timeout-secs`).
+    pub http_limits: HttpLimits,
+    /// Per-process `--no-auth`: skip the bearer check for this run only.
+    pub no_auth: bool,
+    /// Operator REST bind port; reserved against `expose` claims. `0` = unknown.
+    pub rest_port: u16,
+    /// `--allow-host-profile`: permit `network.profiles: [host]`.
+    pub allow_host_profile: bool,
+    /// Host-loopback probe for `expose` ports (real in production, stubbed in tests).
+    pub port_probe: apply::PortProbe,
+    /// Serializes applies (and stack deletes) so `expose` port claims cannot race.
+    pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// True when a bind spec (`host:port`, bare host, or `[ipv6]:port`) is loopback.
+///
+/// `localhost` and any `127.0.0.0/8` / `::1` address count. Unparseable hosts
+/// are treated as non-loopback (fail closed).
+pub fn bind_is_loopback(bind: &str) -> bool {
+    let host = if let Some(rest) = bind.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if bind.matches(':').count() > 1 {
+        // Bare IPv6 literal, no port.
+        bind
+    } else {
+        bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind)
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Startup guard for `--no-auth`.
+///
+/// * never allowed with `--public-hostname` (would publish an open control plane);
+/// * a non-loopback bind needs the explicit `--allow-unauthenticated-remote`.
+pub fn validate_auth_startup(
+    no_auth: bool,
+    bind: &str,
+    public_hostname: Option<&str>,
+    allow_unauthenticated_remote: bool,
+) -> Result<()> {
+    if !no_auth {
+        return Ok(());
+    }
+    if public_hostname.is_some() {
+        anyhow::bail!(
+            "--no-auth cannot be combined with --public-hostname: that would publish the control \
+             plane with no credential. Drop --no-auth (recommended), or drop --public-hostname."
+        );
+    }
+    if !bind_is_loopback(bind) && !allow_unauthenticated_remote {
+        anyhow::bail!(
+            "--no-auth with a non-loopback bind ({bind}) would expose the orchestrator to the \
+             network with no credential. Use a loopback --bind (e.g. 127.0.0.1:7443), or add \
+             --allow-unauthenticated-remote to confirm unauthenticated remote access."
+        );
+    }
+    Ok(())
+}
+
+/// Startup guard for the values rendered into the Traefik catalog for the
+/// control-plane route (`--public-hostname`, `--public-tls-cert-resolver`).
+pub fn validate_public_endpoint_flags(
+    public_hostname: Option<&str>,
+    cert_resolver: &str,
+) -> Result<()> {
+    if let Some(host) = public_hostname {
+        mc2_api::validate_hostname(host)
+            .map_err(|e| anyhow::anyhow!("invalid --public-hostname {host:?}: {e}"))?;
+    }
+    mc2_api::validate_traefik_ident(cert_resolver).map_err(|e| {
+        anyhow::anyhow!("invalid --public-tls-cert-resolver {cert_resolver:?}: {e}")
+    })?;
+    Ok(())
 }
 
 /// Periodically export status gauges (when OTLP is enabled).
@@ -167,6 +300,17 @@ async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
 
 /// Run the orchestrator (REST + scheduler + local node loop).
 pub async fn run(args: ServerArgs) -> Result<()> {
+    validate_auth_startup(
+        args.no_auth,
+        &args.bind,
+        args.public_hostname.as_deref(),
+        args.allow_unauthenticated_remote,
+    )?;
+    validate_public_endpoint_flags(
+        args.public_hostname.as_deref(),
+        &args.public_tls_cert_resolver,
+    )?;
+
     let data_dir = expand_data_dir(&args.data_dir);
     let secrets_key_path = args
         .secrets_key_path
@@ -182,47 +326,39 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         "MicroCommandControl server starting"
     );
 
+    if args.no_auth {
+        tracing::warn!(
+            bind = %args.bind,
+            loopback = bind_is_loopback(&args.bind),
+            "API auth is DISABLED for this run (--no-auth); the control plane is unauthenticated"
+        );
+    }
+
     let _otlp = mc2_metrics::init("mc2-server").context("init OTLP metrics")?;
 
     let boot = Bootstrap {
         data_dir: data_dir.clone(),
         secrets_key_path: secrets_key_path.clone(),
-        no_auth: args.no_auth,
     }
     .ensure()
     .await
     .context("bootstrap data directory")?;
 
-    let secrets_key = Arc::new(
-        SecretsKey::load_file(&boot.secrets_key_path)
-            .with_context(|| format!("load secrets key {}", boot.secrets_key_path.display()))?,
-    );
+    let secrets_key = Arc::new(boot.secrets_key);
 
     let store = SqliteStore::open(&boot.db_path)
         .await
         .context("open store")?;
 
-    if let Some(ref host) = args.public_hostname {
+    if let Some(host) = &args.public_hostname {
         store
             .set_setting("public_hostname", host)
             .await
             .context("persist public hostname")?;
         info!(hostname = %host, "advertising control plane through ingress catalog");
     }
-    if let Some(ref plain) = boot.fresh_credentials {
-        eprintln!("=== MicroCommandControl bootstrap credentials (save these; shown once) ===");
-        eprintln!(
-            "API token  (REST Authorization: Bearer …): {}",
-            plain.api_token
-        );
-        eprintln!("Data dir: {}", data_dir.display());
-        eprintln!("=========================================================================");
-    } else if args.no_auth {
-        if store.api_auth_required().await.unwrap_or(true) {
-            info!("MC2_NO_AUTH/--no-auth ignored: API auth already configured");
-        } else {
-            info!(db = %boot.db_path.display(), "open install (no API token)");
-        }
+    if let Some(fresh) = &boot.fresh_credentials {
+        crate::bootstrap::deliver_bootstrap_token(&data_dir, &fresh.api_token)?;
     } else {
         info!(db = %boot.db_path.display(), "data directory already initialized");
     }
@@ -237,8 +373,57 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     }
 
     let runtime: Arc<dyn mc2_runtime::NodeRuntime> = Arc::new(
-        mc2_runtime::MicrosandboxRuntime::new(args.volume_dir.clone()),
+        mc2_runtime::MicrosandboxRuntime::new(args.volume_dir.clone())
+            .with_install_id(boot.install_id.clone()),
     );
+
+    // SSH admission limits are process-wide (one process = one node).
+    crate::ssh_serve::configure_limits(crate::limits::SshLimits {
+        handshake_timeout: crate::limits::SSH_HANDSHAKE_TIMEOUT,
+        max_sessions: args.max_ssh_sessions,
+        max_sessions_per_listener: args.max_ssh_sessions_per_listener,
+    });
+    let http_limits = HttpLimits {
+        max_connections: args.max_connections,
+        request_timeout: Duration::from_secs(args.request_timeout_secs),
+        header_read_timeout: crate::limits::HEADER_READ_TIMEOUT,
+    };
+
+    // Bind the REST listener before building state so the apply-time port
+    // checks know the reserved REST port.
+    let rest_listener = tokio::net::TcpListener::bind(&args.bind)
+        .await
+        .with_context(|| format!("bind REST {}", args.bind))?;
+    let rest_addr = rest_listener.local_addr().context("rest local_addr")?;
+
+    // Embedded node configuration (single node: this process).
+    let node_cfg = node::NodeConfig {
+        name: args
+            .node_name
+            .clone()
+            .or_else(hostname)
+            .unwrap_or_else(|| "local".into()),
+        install_id: boot.install_id.clone(),
+        labels_json: serde_json::to_string(&parse_labels(&args.labels)?)
+            .unwrap_or_else(|_| "{}".into()),
+        // Node capacity is auto-derived from the host; `--limit-*` is the
+        // operator's resource budget. Fall back to 8192 MiB if detection fails.
+        cpus: num_cpus::get() as u32,
+        memory_mib: crate::host_metrics::host_memory_mib().max(8192),
+        reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
+        ingress_config_dir: args.ingress_config_dir.clone(),
+        public_hostname: args.public_hostname.clone(),
+        public_tls_cert_resolver: args.public_tls_cert_resolver.clone(),
+        rest_port: rest_addr.port(),
+    };
+
+    // Register the node **before** the REST listener accepts: an apply that
+    // arrives with the node missing would be rejected for lack of capacity.
+    // The id is stable (persisted), so a restart under a different
+    // `--node-name` keeps every placement.
+    let store_dyn = store.clone() as Arc<dyn Store>;
+    let node_id = node::ensure_local_node(store_dyn, &node_cfg).await?;
+    info!(node_id = %node_id, name = %node_cfg.name, "local node registered");
 
     let state = AppState {
         store: store.clone() as Arc<dyn Store>,
@@ -252,74 +437,48 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             memory_mib: args.limit_memory_mib,
             disk_mib: args.limit_disk_mib,
         },
+        http_limits,
+        no_auth: args.no_auth,
+        rest_port: rest_addr.port(),
+        allow_host_profile: args.allow_host_profile,
+        port_probe: apply::probe_host_loopback_port,
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let app = router(state);
-    let rest_listener = tokio::net::TcpListener::bind(&args.bind)
-        .await
-        .with_context(|| format!("bind REST {}", args.bind))?;
-    let rest_addr = rest_listener.local_addr().context("rest local_addr")?;
 
-    let grace = Duration::from_secs(args.heartbeat_grace_secs);
-    let store_watch = store.clone() as Arc<dyn Store>;
-    tokio::spawn(async move {
-        watcher::not_ready_loop(store_watch, grace, Duration::from_secs(5)).await;
-    });
-
-    let reschedule_every = Duration::from_secs(args.reschedule_interval_secs.max(1));
-    let store_resched = store.clone() as Arc<dyn Store>;
-    tokio::spawn(async move {
-        reschedule::reschedule_loop(store_resched, reschedule_every).await;
-    });
-    let store_sched = store.clone() as Arc<dyn Store>;
-    tokio::spawn(async move {
-        reschedule::schedule_loop(store_sched, reschedule_every).await;
-    });
     let store_metrics = store.clone() as Arc<dyn Store>;
     tokio::spawn(async move {
         metrics_loop(store_metrics, Duration::from_secs(15)).await;
     });
 
-    // Local node loop (embedded microsandbox runtime).
+    // Local node loop (embedded microsandbox runtime). Pending instances are
+    // bound by the apply that created them, so there is no periodic scheduler.
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-    let node_cfg = node::NodeConfig {
-        name: args
-            .node_name
-            .clone()
-            .or_else(hostname)
-            .unwrap_or_else(|| "local".into()),
-        labels_json: serde_json::to_string(&parse_labels(&args.labels)?)
-            .unwrap_or_else(|_| "{}".into()),
-        // Node capacity is auto-derived from the host; `--limit-*` is the
-        // operator's resource budget. Fall back to 8192 MiB if detection fails.
-        cpus: num_cpus::get() as u32,
-        memory_mib: crate::host_metrics::host_memory_mib().max(8192),
-        reconcile_interval: Duration::from_secs(args.reconcile_interval_secs.max(1)),
-        ingress_config_dir: args.ingress_config_dir.clone(),
-        public_hostname: args.public_hostname.clone(),
-        public_tls_cert_resolver: args.public_tls_cert_resolver.clone(),
-        rest_port: rest_addr.port(),
-    };
     let store_node = store.clone() as Arc<dyn Store>;
     let runtime_node = runtime.clone();
     let node_task = tokio::spawn(async move {
-        if let Err(e) =
-            node::run(store_node, secrets_key, runtime_node, node_cfg, shutdown_rx).await
+        if let Err(e) = node::run(
+            store_node,
+            secrets_key,
+            runtime_node,
+            node_id,
+            node_cfg,
+            shutdown_rx,
+        )
+        .await
         {
             tracing::error!(error = %e, "local node loop failed");
         }
     });
 
     let (rest_tx, rest_rx) = tokio::sync::oneshot::channel::<()>();
-    let rest_task = tokio::spawn(async move {
-        let _ = axum::serve(rest_listener, app)
-            .with_graceful_shutdown(async {
-                let _ = rest_rx.await;
-            })
-            .await;
-    });
-
-    info!(%rest_addr, "REST listening; health: GET /health, status: GET /v1/status, nodes: GET /v1/nodes");
+    let rest_task = tokio::spawn(crate::http_serve::serve(
+        rest_listener,
+        app,
+        http_limits,
+        rest_rx,
+    ));
 
     shutdown_signal().await;
     let _ = shutdown_tx.send(());
@@ -417,8 +576,6 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             data_dir: dir.path().to_string_lossy().into(),
             secrets_key_path: None,
-            heartbeat_grace_secs: 45,
-            reschedule_interval_secs: 5,
             node_name: None,
             labels: vec![],
             reconcile_interval_secs: 10,
@@ -428,6 +585,12 @@ mod tests {
             volume_dir: None,
             init_only: false,
             no_auth: false,
+            allow_unauthenticated_remote: false,
+            allow_host_profile: false,
+            max_connections: crate::limits::DEFAULT_MAX_CONNECTIONS,
+            request_timeout_secs: crate::limits::DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_ssh_sessions: crate::limits::DEFAULT_MAX_SSH_SESSIONS,
+            max_ssh_sessions_per_listener: crate::limits::DEFAULT_MAX_SSH_SESSIONS_PER_LISTENER,
             limit_cpus: 0,
             limit_memory_mib: 0,
             limit_disk_mib: 0,
@@ -436,5 +599,102 @@ mod tests {
         run(args).await.expect("dry_run should succeed");
         assert!(dir.path().join("mc2.db").exists());
         assert!(dir.path().join("secrets.key").exists());
+    }
+
+    #[test]
+    fn bind_loopback_detection() {
+        for b in [
+            "127.0.0.1:7443",
+            "127.0.0.5:7443",
+            "localhost:7443",
+            "LOCALHOST:7443",
+            "[::1]:7443",
+            "::1",
+            "127.0.0.1",
+        ] {
+            assert!(bind_is_loopback(b), "{b} should be loopback");
+        }
+        for b in [
+            "0.0.0.0:7443",
+            "192.168.1.10:7443",
+            "[::]:7443",
+            "mc2.example.com:7443",
+            "not-an-ip:7443",
+        ] {
+            assert!(!bind_is_loopback(b), "{b} should not be loopback");
+        }
+    }
+
+    #[test]
+    fn no_auth_loopback_is_allowed() {
+        validate_auth_startup(true, "127.0.0.1:7443", None, false).unwrap();
+        validate_auth_startup(true, "localhost:7443", None, false).unwrap();
+    }
+
+    #[test]
+    fn no_auth_non_loopback_requires_hatch() {
+        let err = validate_auth_startup(true, "0.0.0.0:7443", None, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--allow-unauthenticated-remote"), "{msg}");
+        assert!(msg.contains("loopback"), "{msg}");
+        // With the hatch it passes.
+        validate_auth_startup(true, "0.0.0.0:7443", None, true).unwrap();
+    }
+
+    #[test]
+    fn no_auth_with_public_hostname_always_refused() {
+        // No hatch on this path.
+        for hatch in [false, true] {
+            let err = validate_auth_startup(true, "127.0.0.1:7443", Some("mc2.example.com"), hatch)
+                .unwrap_err();
+            assert!(err.to_string().contains("--public-hostname"), "{err}");
+        }
+    }
+
+    #[test]
+    fn auth_on_never_trips_the_guard() {
+        validate_auth_startup(false, "0.0.0.0:7443", Some("mc2.example.com"), false).unwrap();
+    }
+
+    #[test]
+    fn public_endpoint_flags_reject_injection() {
+        validate_public_endpoint_flags(Some("mc2.example.com"), "le").unwrap();
+        validate_public_endpoint_flags(None, "le").unwrap();
+        assert!(validate_public_endpoint_flags(Some("a.com\"\n  x: y"), "le").is_err());
+        assert!(validate_public_endpoint_flags(Some("mc2.example.com"), "le\nfoo: bar").is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_no_auth_non_loopback_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ServerArgs {
+            bind: "0.0.0.0:0".into(),
+            data_dir: dir.path().to_string_lossy().into(),
+            secrets_key_path: None,
+            node_name: None,
+            labels: vec![],
+            reconcile_interval_secs: 10,
+            ingress_config_dir: None,
+            public_hostname: None,
+            public_tls_cert_resolver: "le".into(),
+            volume_dir: None,
+            init_only: false,
+            no_auth: true,
+            allow_unauthenticated_remote: false,
+            allow_host_profile: false,
+            max_connections: crate::limits::DEFAULT_MAX_CONNECTIONS,
+            request_timeout_secs: crate::limits::DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_ssh_sessions: crate::limits::DEFAULT_MAX_SSH_SESSIONS,
+            max_ssh_sessions_per_listener: crate::limits::DEFAULT_MAX_SSH_SESSIONS_PER_LISTENER,
+            limit_cpus: 0,
+            limit_memory_mib: 0,
+            limit_disk_mib: 0,
+            dry_run: true,
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("--allow-unauthenticated-remote"),
+            "{err}"
+        );
     }
 }

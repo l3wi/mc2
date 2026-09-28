@@ -107,9 +107,10 @@ async fn desired_routes(
     Vec<mc2_runtime::DesiredIngressRoute>,
 ) {
     let key = load_key(cluster);
-    build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
+    let set = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect("build desired set")
+        .expect("build desired set");
+    (set.sandboxes, set.ingress_routes)
 }
 
 async fn apply_yaml(cluster: &TestCluster, yaml: &str) -> serde_json::Value {
@@ -368,9 +369,10 @@ async fn no_ingress_routes_without_local_instances() {
     assert_eq!(scheduled, 1);
 
     let key = load_key(&cluster);
-    let (_, routes) = build_desired_set(cluster.store.clone(), &key, &node.id)
+    let routes = build_desired_set(cluster.store.clone(), &key, &node.id)
         .await
-        .expect("build desired set");
+        .expect("build desired set")
+        .ingress_routes;
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0].host_port, 18080);
 }

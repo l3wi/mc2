@@ -2,15 +2,17 @@
 #
 #   mc2 up -f examples/06-persistent-volumes/stack.yaml
 #
-# The volume `data` is backed by a named directory volume on the node
-# (default ~/.microsandbox/volumes, override with `mc2 server --volume-dir`).
-# Data survives sandbox recreate/restart and stack removal. CI covers
-# apply → desired-set mount material in tests/tests/volumes.rs (no hypervisor).
+# The volume `data` is an MC2-owned directory on the node (default
+# ~/.mc2/volumes, override with `mc2 server --volume-dir`), mounted into the VM
+# with a `size` write quota. Data survives sandbox recreate/restart and stack
+# removal. CI covers apply → desired-set mount material in
+# tests/tests/volumes.rs (no hypervisor).
 name: smoke-volumes
 
 volumes:
   data:
     kind: dir
+    size: 1GiB
 
 services:
   keep:

@@ -18,7 +18,7 @@ Defaults applied by the CLI when fields are absent:
 
 | Field | Default |
 | --- | --- |
-| `name` | the file name (lowercased, sanitized) |
+| `name` | the file name, sanitized to the stack-name grammar (`[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, ≤ 40) |
 | `services.<svc>.scale` | `1` |
 | `services.<svc>.cpus` | `1` |
 | `services.<svc>.mem_limit` | `512m` |

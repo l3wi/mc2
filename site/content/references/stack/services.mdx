@@ -12,8 +12,9 @@ and the runtime behavior that turns it into one or more sandbox instances.
 | --- | --- | --- | --- |
 | `image` | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). |
 | `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
-| `cpus` | no | `1` | vCPUs (float, e.g. `0.5`); rounded up. |
+| `cpus` | no | `1` | vCPUs (float). Must be `> 0` and at most `255`; the runtime allocates at least 1 vCPU and drops the fraction (`1.5` → 1, `0.5` → 1). |
 | `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
+| `storage_opt` | no | `{size: 4GiB}` | Guest writable root-disk size (compose `storage_opt.size`). Compose byte sizes (`8GiB`, `512m`, or bytes); max 1 TiB. Changing it recreates the VM — files outside volumes are **not** kept. |
 | `command` | no | `sleep infinity` | Guest argv. List (`["echo", "hi"]`) or string (`echo "hi there"`, split shell-like). Omit to keep a shell-less image alive. |
 | `restart` | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`. Drives node restart/recreate on failure. |
 | `environment` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
@@ -37,7 +38,7 @@ The last four — `ssh`, `expose`/`networks`, `healthcheck`/`depends_on`, and
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `profiles` | `[]` → `public` | List from `public`, `private`, `host`, `none`. `none` disables the guest network entirely. Network reachable ports are always allowed via narrow rules regardless of profile. |
+| `profiles` | `[]` → `public` | Closed set: `public`, `private`, `host`, `none`. `none` must be the only entry; duplicates and any other value are rejected (there are no `local`/`any` aliases). `host` requires the server flag `--allow-host-profile`. Network reachable ports are always allowed via narrow rules regardless of profile. |
 
 Profiles select the guest's network posture:
 
@@ -45,8 +46,10 @@ Profiles select the guest's network posture:
   its reachable ports are exposed north-south.
 - **`private`** — guest traffic stays on its own networks; no north-south
   exposure.
-- **`host`** — host networking semantics for the guest.
-- **`none`** — the guest network is disabled entirely.
+- **`host`** — host networking semantics for the guest: the whole host
+  loopback. Refused at apply unless the server runs with
+  `--allow-host-profile` (env `MC2_ALLOW_HOST_PROFILE`).
+- **`none`** — the guest network is disabled entirely; must be the only entry.
 
 Regardless of profile, reachable ports are always allowed via narrow rules, so
 the profile only controls the default posture. See
@@ -66,6 +69,26 @@ command: echo "hi there"       # string form: split shell-like
 A string is split shell-like, so quoting behaves as you'd expect — useful for
 `sh -c "…"`-style invocation or one-line commands. Omit the key entirely to get
 the `sleep infinity` default.
+
+## `storage_opt.size`
+
+The guest's writable root disk — packages, `/root`, anything outside a volume.
+Everything a guest writes is otherwise capped: `/tmp` is a RAM-backed tmpfs and
+logs rotate, but the root disk is the space your workload actually uses.
+
+```yaml
+services:
+  web:
+    image: python:3.12
+    storage_opt:
+      size: 8GiB        # default 4 GiB
+```
+
+Changing `size` recreates the VM, so files outside volumes are **not** kept —
+put anything that must survive in a [volume](/documentation/concepts/storage).
+When the root disk (or a volume) fills, guests see
+`No space left on device`; MC2 reports the condition in `mc2 ps` (`NOTES`
+column) and prints the exact fix from `mc2 exec`/`mc2 ssh open`/`mc2 logs`.
 
 <Callout type="tip" title="Related service keys">
   Startup ordering and probes: [Healthchecks & depends_on](./health-depends).

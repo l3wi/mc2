@@ -49,7 +49,7 @@ Everywhere a command wants an instance, you can pass a UUID **or** the
 human-readable `<stack>/<service>/<ordinal>` form:
 
 ```bash
-mc2 exec shop/web/0 'echo hi'
+mc2 exec shop/web/0 /bin/sh -c 'echo hi'
 mc2 logs shop/web/2 --tail 20
 ```
 

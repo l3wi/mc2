@@ -102,22 +102,43 @@ pub fn load() -> Result<ClientConfig> {
     toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Persist the config with mode 0600.
+/// Persist the config with mode 0600 (created that way; never briefly readable).
 pub fn save(cfg: &ClientConfig) -> Result<()> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
-    let raw = toml::to_string_pretty(cfg).context("serialize config")?;
-    std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
 
+    let raw = toml::to_string_pretty(cfg).context("serialize config")?;
+
+    // Write a 0600 temp file in the same directory, then rename over the target
+    // so the config is never observable at a looser mode (or half-written).
+    let tmp = parent.join(format!(".config.toml.tmp-{}", std::process::id()));
+    write_private(&tmp, raw.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
+/// Write `contents` to `path` with mode 0600 (created that way on Unix).
+fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        // `mode()` only applies at creation; enforce 0600 on overwrite too.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
     Ok(())
 }
 

@@ -110,9 +110,10 @@ async fn secret_reaches_desired_set_for_sandbox() {
     assert_eq!(body["pending"], 0);
 
     let key = load_key(&cluster);
-    let (desired, _) = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
+    let desired = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect("build desired set with resolved secrets");
+        .expect("build desired set with resolved secrets")
+        .sandboxes;
     assert_eq!(desired.len(), 1);
 
     let d = &desired[0];
@@ -158,10 +159,10 @@ async fn secret_reaches_desired_set_for_sandbox() {
     assert_eq!(arr[0]["node_id"], cluster.local_node_id);
 }
 
-/// Missing secret is fine at apply (desired state stores refs) but the desired
-/// set fails closed.
+/// Missing secret is fine at apply (desired state stores refs); the desired set
+/// reports the instance Failed instead of aborting the node (B4).
 #[tokio::test]
-async fn desired_set_fails_when_secret_missing() {
+async fn desired_set_reports_missing_secret_per_instance() {
     let cluster = TestCluster::start().await.expect("start");
 
     let yaml = r#"
@@ -191,19 +192,27 @@ services:
     assert_eq!(body["scheduled"], 1);
 
     let key = load_key(&cluster);
-    let err = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
+    // B4: the missing secret is a per-instance failure, not a node-wide abort.
+    let set = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect_err("desired set must refuse missing secret");
-    let msg = format!("{err:#}").to_lowercase();
+        .expect("an unresolvable instance must not fail the whole desired set");
+    assert!(set.sandboxes.is_empty(), "nothing may be started");
+    assert_eq!(set.failures.len(), 1, "one instance reported failed");
+    let failure = &set.failures[0];
+    assert_eq!(failure.stack, "sec-missing");
+    assert_eq!(failure.service, "web");
+    assert_eq!(failure.runtime_id, "sec-missing--web--0");
+    let msg = failure.message.to_lowercase();
     assert!(
         msg.contains("missing_secret") || msg.contains("not found") || msg.contains("secret"),
         "unexpected message: {msg}"
     );
 }
 
-/// Empty allowHosts must not produce inject-able material (msb requires host allowlist).
+/// Empty allowHosts must not produce inject-able material (msb requires host
+/// allowlist) — reported as a per-instance failure (B4), not a node-wide abort.
 #[tokio::test]
-async fn desired_set_fails_when_allow_hosts_empty() {
+async fn desired_set_reports_empty_allow_hosts_per_instance() {
     let cluster = TestCluster::start().await.expect("start");
 
     let put = cluster
@@ -241,9 +250,13 @@ services:
     assert_eq!(res.status(), StatusCode::OK);
 
     let key = load_key(&cluster);
-    let err = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
+    let set = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
-        .expect_err("desired set must refuse empty allowHosts");
-    let msg = format!("{err:#}").to_lowercase();
+        .expect("an unresolvable instance must not fail the whole desired set");
+    assert!(set.sandboxes.is_empty());
+    assert_eq!(set.failures.len(), 1);
+    let failure = &set.failures[0];
+    assert_eq!(failure.runtime_id, "sec-empty-hosts--web--0");
+    let msg = failure.message.to_lowercase();
     assert!(msg.contains("allow"), "message={msg}");
 }

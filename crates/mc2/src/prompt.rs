@@ -50,11 +50,12 @@ pub fn confirm(prompt: &str, default: bool) -> Result<bool> {
         .context("confirmation failed (no TTY?)")
 }
 
-/// Masked secret input (e.g. the API token).
-pub fn secret(prompt: &str) -> Result<String> {
+/// Masked secret input that may be left empty (e.g. a no-auth server has no
+/// token to paste). Returns an empty string when skipped.
+pub fn secret_optional(prompt: &str) -> Result<String> {
     dialoguer::Password::new()
         .with_prompt(prompt)
-        .allow_empty_password(false)
+        .allow_empty_password(true)
         .interact()
         .context("secret input failed (no TTY?)")
 }

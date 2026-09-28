@@ -8,22 +8,35 @@ mod ssh;
 mod stacks;
 mod volumes;
 
+use crate::limits::EXEC_BODY_LIMIT_BYTES;
 use crate::AppState;
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde_json::json;
-use tower_http::trace::TraceLayer;
+use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(meta::health))
+    // Long-running routes: **no whole-request deadline**. `exec` runs a
+    // process that can take minutes and `logs` (with `follow=true`) is an
+    // infinite SSE stream. `exec` also gets an explicit, larger body limit
+    // for its stdin payload; every other route keeps axum's 2 MiB default.
+    let long_running = Router::new()
+        .route(
+            "/v1/instances/{id}/exec",
+            post(instances::exec_instance).layer(DefaultBodyLimit::max(EXEC_BODY_LIMIT_BYTES)),
+        )
+        .route("/v1/instances/{id}/logs", get(instances::get_instance_logs));
+
+    // Everything else answers within the request deadline (408 on expiry).
+    let ordinary = Router::new()
         .route("/v1/status", get(meta::status))
         .route("/v1/nodes", get(meta::list_nodes))
-        .route("/v1/stacks:apply", axum::routing::post(stacks::apply_stack))
+        .route("/v1/stacks:apply", post(stacks::apply_stack))
         .route(
             "/v1/stacks/{name}",
             axum::routing::delete(stacks::delete_stack),
@@ -34,11 +47,6 @@ pub fn router(state: AppState) -> Router {
             get(instances::get_instance_network),
         )
         .route("/v1/networks", get(instances::list_networks))
-        .route(
-            "/v1/instances/{id}/exec",
-            axum::routing::post(instances::exec_instance),
-        )
-        .route("/v1/instances/{id}/logs", get(instances::get_instance_logs))
         .route("/v1/ingress", get(ingress::list_ingress))
         .route("/v1/volumes", get(volumes::list_volumes))
         .route("/v1/secrets", get(secrets::list_secrets))
@@ -59,7 +67,38 @@ pub fn router(state: AppState) -> Router {
             get(ssh::get_instance_ssh)
                 .put(ssh::put_instance_ssh)
                 .delete(ssh::delete_instance_ssh),
-        )
+        );
+
+    assemble(state, ordinary, long_running)
+}
+
+/// Assemble the operator router.
+///
+/// The `ordinary` group is wrapped in the whole-request deadline; the
+/// `long_running` group (`exec`, `logs`) never is. Everything under `/v1` sits
+/// behind the auth middleware so a handler cannot forget the check; `/health`
+/// stays public for liveness probes.
+fn assemble(state: AppState, ordinary: Router<AppState>, long_running: Router<AppState>) -> Router {
+    let timeout = state.http_limits.request_timeout;
+    // `0` disables the whole-request deadline.
+    let with_deadline = |router: Router<AppState>| -> Router<AppState> {
+        if timeout.is_zero() {
+            router
+        } else {
+            router.layer(TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                timeout,
+            ))
+        }
+    };
+    let public = with_deadline(Router::new().route("/health", get(meta::health)));
+    let protected = with_deadline(ordinary).merge(long_running).route_layer(
+        axum::middleware::from_fn_with_state(state.clone(), crate::auth::require_auth),
+    );
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -114,17 +153,16 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use mc2_store::{hash_token, MemoryStore, NodeJoin, Store};
+    use mc2_store::{hash_token, MemoryStore, NodeJoin, StackPlan, Store};
     use tower::ServiceExt;
 
     use crate::api::router;
-    use crate::api::testing::test_state;
+    use crate::api::testing::{test_state, test_state_open};
 
     #[tokio::test]
     async fn apply_network_validation_returns_400() {
         let store = MemoryStore::new();
-        store.init_cluster("").await.unwrap();
-        let app = router(test_state(store));
+        let app = router(test_state_open(store));
         let body = serde_json::json!({
             "yaml": r#"
 name: bad
@@ -204,10 +242,10 @@ services:
     }
 
     #[tokio::test]
-    async fn open_cluster_status_without_token() {
+    async fn no_auth_state_allows_status_without_token() {
         let store = MemoryStore::new();
-        store.init_cluster("").await.unwrap();
-        let app = router(test_state(store));
+        store.init_cluster(&hash_token("secret")).await.unwrap();
+        let app = router(test_state_open(store));
         let res = app
             .oneshot(
                 Request::builder()
@@ -223,12 +261,11 @@ services:
     #[tokio::test]
     async fn status_reports_public_hostname() {
         let store = MemoryStore::new();
-        store.init_cluster("").await.unwrap();
         store
             .set_setting("public_hostname", "mc2.example.com")
             .await
             .unwrap();
-        let app = router(test_state(store));
+        let app = router(test_state_open(store));
         let res = app
             .oneshot(
                 Request::builder()
@@ -247,15 +284,16 @@ services:
     #[tokio::test]
     async fn status_reports_resources() {
         let store = MemoryStore::new();
-        store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
-            .reconcile_service_replicas(
+            .commit_stack_plan(&StackPlan::replicas(
                 "demo",
-                "web",
-                1,
-                r#"{"image":"x","cpus":1.0,"mem_limit":"512m"}"#,
-            )
+                "{}",
+                "yaml",
+                vec![(
+                    "web",
+                    vec![r#"{"image":"x","cpus":1.0,"mem_limit":"512m"}"#.to_string()],
+                )],
+            ))
             .await
             .unwrap();
         // Bind the instance so it counts toward reserved usage.
@@ -268,7 +306,7 @@ services:
             .await
             .unwrap();
 
-        let mut state = test_state(store);
+        let mut state = test_state_open(store);
         state.limits = crate::ResourceLimits {
             cpus: 4,
             memory_mib: 8192,
@@ -332,6 +370,188 @@ services:
         assert_eq!(v[0]["status"], "Ready");
         assert!(v[0].get("node_token_hash").is_none());
     }
+
+    /// A5: every registered `/v1` route sits behind the auth middleware.
+    #[tokio::test]
+    async fn every_v1_route_requires_a_token() {
+        use axum::http::Method;
+
+        let store = MemoryStore::new();
+        store.init_cluster(&hash_token("secret")).await.unwrap();
+        let app = router(test_state(store));
+
+        let routes: &[(Method, &str)] = &[
+            (Method::GET, "/v1/status"),
+            (Method::GET, "/v1/nodes"),
+            (Method::POST, "/v1/stacks:apply"),
+            (Method::DELETE, "/v1/stacks/demo"),
+            (Method::GET, "/v1/instances"),
+            (Method::GET, "/v1/instances/x/network"),
+            (Method::GET, "/v1/networks"),
+            (Method::POST, "/v1/instances/x/exec"),
+            (Method::GET, "/v1/instances/x/logs"),
+            (Method::GET, "/v1/ingress"),
+            (Method::GET, "/v1/volumes"),
+            (Method::GET, "/v1/secrets"),
+            (Method::PUT, "/v1/secrets/DB_PASS"),
+            (Method::DELETE, "/v1/secrets/DB_PASS"),
+            (Method::GET, "/v1/ssh/keys"),
+            (Method::PUT, "/v1/ssh/keys/laptop"),
+            (Method::GET, "/v1/ssh/keys/laptop"),
+            (Method::DELETE, "/v1/ssh/keys/laptop"),
+            (Method::GET, "/v1/ssh/endpoints"),
+            (Method::GET, "/v1/instances/x/ssh"),
+            (Method::PUT, "/v1/instances/x/ssh"),
+            (Method::DELETE, "/v1/instances/x/ssh"),
+        ];
+
+        for (method, uri) in routes {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(*uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+
+        // `/health` stays public.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A5: a valid token still reaches a previously-unguarded route.
+    #[tokio::test]
+    async fn valid_token_reaches_volumes() {
+        let store = MemoryStore::new();
+        store.init_cluster(&hash_token("secret")).await.unwrap();
+        let app = router(test_state(store));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/volumes")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// Serve the full router on an ephemeral loopback port.
+    async fn serve_app(
+        state: AppState,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let http_limits = state.http_limits;
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = crate::http_serve::serve(listener, app, http_limits, rx).await;
+        });
+        (addr, tx)
+    }
+
+    /// A10: the request deadline wraps the ordinary group, never the
+    /// long-running group (`exec`, `logs`).
+    #[tokio::test]
+    async fn request_deadline_wraps_ordinary_routes_only() {
+        use std::time::Duration;
+
+        let mut state = test_state_open(MemoryStore::new());
+        state.http_limits.request_timeout = Duration::from_millis(50);
+        let slow = || {
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                StatusCode::OK
+            })
+        };
+        let app = assemble(
+            state,
+            Router::new().route("/ordinary", slow()),
+            Router::new().route("/long-running", slow()),
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ordinary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/long-running")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A10: with a stalled request body, an ordinary route hits the request
+    /// deadline (`408`) while `exec` — exempt — keeps waiting for the body.
+    #[tokio::test]
+    async fn stalled_body_times_out_ordinary_routes_but_not_exec() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut state = test_state_open(MemoryStore::new());
+        state.http_limits.request_timeout = Duration::from_millis(200);
+        let (addr, _shutdown) = serve_app(state).await;
+
+        let mut ordinary = TcpStream::connect(addr).await.unwrap();
+        ordinary
+            .write_all(
+                b"POST /v1/stacks:apply HTTP/1.1\r\nhost: mc2\r\ncontent-type: application/json\r\ncontent-length: 4096\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), ordinary.read(&mut buf))
+            .await
+            .expect("ordinary route should answer at the request deadline")
+            .expect("read the response");
+        let head = String::from_utf8_lossy(&buf[..n]);
+        assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+
+        // `POST /v1/instances/{id}/exec` is exempt: the same stalled body gets
+        // no answer at all inside the deadline window.
+        let mut exec = TcpStream::connect(addr).await.unwrap();
+        exec.write_all(
+            b"POST /v1/instances/inst-1/exec HTTP/1.1\r\nhost: mc2\r\ncontent-type: application/json\r\ncontent-length: 4096\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+        let quiet = tokio::time::timeout(Duration::from_millis(1000), exec.read(&mut buf)).await;
+        assert!(
+            quiet.is_err(),
+            "the exec route must not answer within the request deadline"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -339,9 +559,19 @@ pub(crate) mod testing {
     use crate::AppState;
     use std::sync::Arc;
 
-    /// Minimal NodeRuntime stub: exec returns a canned result; the rest are
-    /// unused by the REST handlers under test.
-    pub struct MockRuntime;
+    /// One `exec_with_output` call, captured for assertions.
+    #[derive(Debug, Clone)]
+    pub struct ExecCall {
+        pub argv: Vec<String>,
+        pub stdin: Vec<u8>,
+    }
+
+    /// Minimal NodeRuntime stub: exec returns a canned result (recording each
+    /// call); the rest are unused by the REST handlers under test.
+    #[derive(Default)]
+    pub struct MockRuntime {
+        pub exec_calls: tokio::sync::Mutex<Vec<ExecCall>>,
+    }
 
     #[async_trait::async_trait]
     impl mc2_runtime::NodeRuntime for MockRuntime {
@@ -357,7 +587,7 @@ pub(crate) mod testing {
         async fn status(&self, _id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
             unreachable!("not exercised")
         }
-        async fn list(&self) -> anyhow::Result<Vec<String>> {
+        async fn list_owned(&self, _install_id: &str) -> anyhow::Result<Vec<String>> {
             unreachable!("not exercised")
         }
         async fn exec_command(&self, _id: &str, _argv: &[String]) -> anyhow::Result<i32> {
@@ -366,13 +596,18 @@ pub(crate) mod testing {
         async fn exec_with_output(
             &self,
             _id: &str,
-            _argv: &[String],
-            _stdin: &[u8],
+            argv: &[String],
+            stdin: &[u8],
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            self.exec_calls.lock().await.push(ExecCall {
+                argv: argv.to_vec(),
+                stdin: stdin.to_vec(),
+            });
             Ok(mc2_runtime::ExecResult {
                 exit_code: 7,
-                stdout: "hello out".into(),
-                stderr: "hello err".into(),
+                stdout: b"hello out".to_vec(),
+                // Deliberately invalid UTF-8: it must survive the wire format.
+                stderr: vec![0xff, 0xfe],
             })
         }
     }
@@ -387,8 +622,22 @@ pub(crate) mod testing {
             volume_dir: None,
             runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
             limits: crate::ResourceLimits::default(),
+            http_limits: crate::HttpLimits::default(),
+            no_auth: false,
+            rest_port: 0,
+            allow_host_profile: false,
+            // Hermetic: no real host-port probing in REST tests.
+            port_probe: |_p| Ok(()),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
-        state.runtime = Arc::new(MockRuntime);
+        state.runtime = Arc::new(MockRuntime::default());
+        state
+    }
+
+    /// Test AppState for the `--no-auth` (open) case.
+    pub fn test_state_open(store: Arc<dyn mc2_store::Store>) -> AppState {
+        let mut state = test_state(store);
+        state.no_auth = true;
         state
     }
 }

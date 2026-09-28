@@ -60,5 +60,13 @@ pub struct InstanceRecord {
     pub spec_json: String,
     /// Healthcheck passed at least once since the last (re)create.
     pub healthy: bool,
+    /// Create-time config fingerprint of the sandbox the node confirmed
+    /// running for this instance (B3); `None` until then.
+    ///
+    /// The node compares it against the desired fingerprint when it adopts a
+    /// sandbox after a restart: a different value — or `None` while a sandbox
+    /// exists — forces a recreate. Internal bookkeeping, not part of the API.
+    #[serde(skip)]
+    pub applied_hash: Option<String>,
     pub updated_at: String,
 }

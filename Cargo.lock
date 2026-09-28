@@ -3032,6 +3032,7 @@ dependencies = [
 name = "mc2-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3059,6 +3060,7 @@ dependencies = [
  "microsandbox-network",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -3077,6 +3079,8 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "mc2-api",
  "mc2-metrics",
  "mc2-runtime",
@@ -3088,6 +3092,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -6554,6 +6559,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

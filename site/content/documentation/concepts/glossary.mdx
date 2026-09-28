@@ -40,9 +40,14 @@ specific meaning. This page defines the terms used across the documentation.
 - **Mediated network** — the only network `mode` in v1. Networking is set up
   by MC2 on the host (an L4 splice), rather than giving the guest direct
   access to a bridge.
-- **Network profile** — a service's egress posture via `network.profiles`:
-  `public` (default), `private` (no internet egress), `host`, or `none`
-  (no guest networking at all).
+- **Network profile** — a service's egress posture via `network.profiles`, a
+  closed set: `public` (default), `private` (no internet egress), `host`
+  (whole host loopback; only with the server flag `--allow-host-profile`), or
+  `none` (no guest networking at all, and then the only entry). Unknown values
+  are rejected, never treated as `public`.
+- **Port claim** — an `expose` port is claimed exclusively server-wide at
+  apply time and its L4 listener is held until the stack is removed. A second
+  stack claiming the same port is rejected with the owner named.
 - **Ingress** — hostname + TCP routes MC2 renders into a Traefik file catalog
   (`--ingress-config-dir`) that you run. See
   [Networking](/documentation/concepts/networking).
@@ -64,8 +69,10 @@ specific meaning. This page defines the terms used across the documentation.
 - **Local vs remote mode** — loopback API (token optional) vs any other host
   (https + token required, plaintext refused unless opted in). See
   [Identity & contexts](/documentation/concepts/identity-and-contexts).
-- **API token** — the operator REST bearer token (`mc2at_…`), printed once on
-  first bootstrap. Treat it like a root password.
+- **API token** — the operator REST bearer token (`mc2at_…`), shown once on
+  first bootstrap (stderr on a TTY, else `<data-dir>/bootstrap-token` at
+  0600). Treat it like a root password; recover with `mc2 server token
+  rotate`.
 
 ## Versioning
 

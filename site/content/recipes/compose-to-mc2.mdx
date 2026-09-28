@@ -98,6 +98,14 @@ volumes:
   anything outside the reference — `apiVersion`/`kind`/`metadata`, `replicas`,
   `resources`, `restartPolicy`, `health`, `mount`, and `env` all fail loudly.
 - **`env:` → `environment:`.** Use `environment:` (map or `KEY=VALUE` list).
+- **Names are lowercase and stricter.** Compose accepts `[a-zA-Z0-9._-]` in
+  service names; MC2 requires `[a-z0-9]([a-z0-9_-]*[a-z0-9])?` for stack,
+  service and network names — no uppercase, no `.`, no `--` (stack ≤ 40,
+  service/network ≤ 63). Volume names keep `.` but cap at 63 and may not
+  contain `--` or end with `-`. Rename `Web` → `web` and `api.v2` → `api-v2`;
+  invalid names are rejected with a suggestion. This keeps the derived sandbox
+  (`{stack}--{service}--{ordinal}`) and volume (`mc2-{stack}--{volume}`)
+  identities collision-free.
 - **Secrets are host-gated.** MC2 secrets live in a server-wide encrypted
   store and are never echoed; the guest sees a placeholder and the real value
   attaches only to connections to `allowHosts`. Compose secret files don't

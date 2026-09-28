@@ -21,6 +21,9 @@ pub struct ServerPlan {
     pub data_dir: PathBuf,
     pub bind: String,
     pub auth_enabled: bool,
+    /// Set when the operator accepted unauthenticated remote access
+    /// (`--no-auth` on a non-loopback bind).
+    pub allow_unauthenticated_remote: bool,
     pub public_hostname: Option<String>,
     pub tls_cert_resolver: String,
     pub ingress_dir: PathBuf,
@@ -56,12 +59,15 @@ pub fn render_server_command(p: &ServerPlan) -> String {
     parts.push(format!("  --bind {}", p.bind));
     if !p.auth_enabled {
         parts.push("  --no-auth".to_string());
+        if p.allow_unauthenticated_remote {
+            parts.push("  --allow-unauthenticated-remote".to_string());
+        }
     }
     parts.push(format!(
         "  --ingress-config-dir {}",
         sh_quote(&p.ingress_dir.to_string_lossy())
     ));
-    if let Some(ref host) = p.public_hostname {
+    if let Some(host) = &p.public_hostname {
         parts.push(format!("  --public-hostname {host}"));
         parts.push(format!(
             "  --public-tls-cert-resolver {}",
@@ -69,6 +75,30 @@ pub fn render_server_command(p: &ServerPlan) -> String {
         ));
     }
     parts.join(" \\\n")
+}
+
+/// Resolve the server wizard's auth answers into a runnable flag set.
+///
+/// * a public hostname always keeps auth on (never offer an open, published
+///   control plane);
+/// * a non-loopback bind needs the explicit escape hatch, else auth stays on.
+pub fn resolve_auth_plan(
+    bind: &str,
+    has_public_hostname: bool,
+    want_no_auth: bool,
+    hatch: bool,
+) -> (bool, bool) {
+    if !want_no_auth || has_public_hostname {
+        return (true, false);
+    }
+    if mc2_server::bind_is_loopback(bind) {
+        return (false, false);
+    }
+    if hatch {
+        (false, true)
+    } else {
+        (true, false)
+    }
 }
 
 /// Write the default Traefik static config next to the ingress dir (once;
@@ -117,9 +147,23 @@ providers:
 }
 
 /// Save a client context (upsert + current). Pure; used by tests.
+///
+/// An empty token (a `--no-auth` server) stores no `api_key`.
 pub fn apply_client(p: &ClientPlan) -> Result<()> {
     let mut cfg = context::load()?;
-    cfg.set_context(&p.name, &p.url, Some(&p.token));
+    let entry = cfg
+        .contexts
+        .entry(p.name.clone())
+        .or_insert_with(|| context::ContextEntry {
+            url: String::new(),
+            api_key: None,
+        });
+    entry.url = p.url.trim_end_matches('/').to_string();
+    entry.api_key = if p.token.is_empty() {
+        None
+    } else {
+        Some(p.token.clone())
+    };
     cfg.set_current(&p.name)?;
     context::save(&cfg)?;
     println!("context '{}' set ({}) and made current", p.name, p.url);
@@ -130,9 +174,11 @@ pub fn apply_client(p: &ClientPlan) -> Result<()> {
 async fn verify_connection(p: &ClientPlan) -> Result<String> {
     let base = p.url.trim_end_matches('/');
     let client = reqwest::Client::new();
-    let res = client
-        .get(format!("{base}/v1/status"))
-        .bearer_auth(&p.token)
+    let mut req = client.get(format!("{base}/v1/status"));
+    if !p.token.is_empty() {
+        req = req.bearer_auth(&p.token);
+    }
+    let res = req
         .send()
         .await
         .with_context(|| format!("GET {base}/v1/status"))?;
@@ -174,7 +220,6 @@ pub async fn run_server_wizard() -> Result<()> {
     let bind = prompt::input("Server bind address", DEFAULT_BIND, false)?;
     let data_dir_raw = prompt::input("Data directory", DEFAULT_DATA_DIR, false)?;
     let data_dir = mc2_server::expand_data_dir(&data_dir_raw);
-    let auth_enabled = prompt::confirm("Protect the API with an API key?", true)?;
 
     let public_hostname = prompt::input(
         "Public hostname for the control plane (Enter for local-only)",
@@ -194,6 +239,32 @@ pub async fn run_server_wizard() -> Result<()> {
     } else {
         DEFAULT_RESOLVER.to_string()
     };
+
+    // Auth: never offer to disable it when the control plane is published, and
+    // ask about the escape hatch before emitting a command that would refuse.
+    let want_no_auth = if public_hostname.is_some() {
+        println!("note: auth stays on — --no-auth is not allowed with a public hostname.");
+        false
+    } else {
+        !prompt::confirm("Protect the API with an API key?", true)?
+    };
+    let hatch = if want_no_auth && !mc2_server::bind_is_loopback(&bind) {
+        prompt::confirm(
+            "Bind is not loopback: allow unauthenticated remote access? \
+             (--allow-unauthenticated-remote)",
+            false,
+        )?
+    } else {
+        false
+    };
+    let (auth_enabled, allow_unauthenticated_remote) =
+        resolve_auth_plan(&bind, public_hostname.is_some(), want_no_auth, hatch);
+    if want_no_auth && auth_enabled {
+        println!(
+            "note: --no-auth needs a loopback bind or \
+             --allow-unauthenticated-remote; keeping auth on."
+        );
+    }
 
     let ingress_raw = prompt::input(
         "Ingress config dir (Traefik file catalog)",
@@ -217,6 +288,7 @@ pub async fn run_server_wizard() -> Result<()> {
         data_dir,
         bind,
         auth_enabled,
+        allow_unauthenticated_remote,
         public_hostname,
         tls_cert_resolver,
         ingress_dir,
@@ -227,13 +299,13 @@ pub async fn run_server_wizard() -> Result<()> {
     Ok(())
 }
 
-/// Client tree: gather URL + token, save the context, optionally verify.
+/// Client tree: gather URL + optional token, save the context, optionally verify.
 pub async fn run_client_wizard() -> Result<()> {
     prompt::ensure_tty()?;
 
     let name = prompt::input("Context name", "prod", false)?;
     let url = prompt::input("Control plane URL", "https://mc2.example.com", false)?;
-    let token = prompt::secret("API token (from the server's first bootstrap)")?;
+    let token = prompt::secret_optional("API token (Enter for a --no-auth server)")?;
     let verify = prompt::confirm("Verify the connection now?", true)?;
 
     let plan = ClientPlan { name, url, token };
@@ -259,8 +331,14 @@ fn print_server_plan(p: &ServerPlan) -> Result<()> {
     println!();
     println!("Then finish the setup:");
     println!();
-    println!("1. Start the server once to bootstrap. It prints the API token ONCE — save it.");
-    println!("   (The wizard never sees it; the client tree asks you for it later.)");
+    println!("1. Start the server once to bootstrap. It creates the API token then:");
+    println!("   - printed to the terminal (stderr) when that is a TTY, or");
+    println!("   - written to <data-dir>/bootstrap-token (mode 0600) when it is not.");
+    println!("   Save it; if you lose it, run `mc2 server token rotate --data-dir <dir>`.");
+    if !p.auth_enabled {
+        println!("   NOTE: `--no-auth` runs this start open (no bearer required). The token still");
+        println!("   exists and can be rotated; auth returns on the next normal start.");
+    }
     if p.write_traefik {
         let (path, wrote) = write_traefik_static(p)?;
         if wrote {
@@ -309,6 +387,7 @@ mod tests {
             data_dir: PathBuf::from("/srv/mc2"),
             bind: "127.0.0.1:7443".into(),
             auth_enabled: true,
+            allow_unauthenticated_remote: false,
             public_hostname: hostname.map(str::to_string),
             tls_cert_resolver: "le".into(),
             ingress_dir: PathBuf::from("/srv/mc2/ingress"),
@@ -338,8 +417,82 @@ mod tests {
         p.auth_enabled = false;
         let cmd = render_server_command(&p);
         assert!(cmd.contains("--no-auth"), "{cmd}");
+        assert!(!cmd.contains("--allow-unauthenticated-remote"), "{cmd}");
         assert!(!cmd.contains("--public-hostname"), "{cmd}");
         assert!(!cmd.contains("--public-tls-cert-resolver"), "{cmd}");
+    }
+
+    #[test]
+    fn server_command_non_loopback_no_auth_includes_hatch() {
+        let mut p = plan(None);
+        p.bind = "0.0.0.0:7443".into();
+        p.auth_enabled = false;
+        p.allow_unauthenticated_remote = true;
+        let cmd = render_server_command(&p);
+        assert!(cmd.contains("--no-auth"), "{cmd}");
+        assert!(cmd.contains("--allow-unauthenticated-remote"), "{cmd}");
+    }
+
+    #[test]
+    fn auth_plan_never_disables_auth_with_public_hostname() {
+        // Even with the hatch, a public hostname keeps auth on.
+        assert_eq!(
+            resolve_auth_plan("0.0.0.0:7443", true, true, true),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_auth_plan("127.0.0.1:7443", true, true, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn auth_plan_loopback_needs_no_hatch() {
+        assert_eq!(
+            resolve_auth_plan("127.0.0.1:7443", false, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_auth_plan("localhost:7443", false, true, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn auth_plan_non_loopback_needs_hatch() {
+        // No hatch → auth stays on (the server would refuse to start otherwise).
+        assert_eq!(
+            resolve_auth_plan("0.0.0.0:7443", false, true, false),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_auth_plan("0.0.0.0:7443", false, true, true),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn auth_plan_keeps_auth_on_when_requested() {
+        assert_eq!(
+            resolve_auth_plan("0.0.0.0:7443", false, false, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn apply_client_with_empty_token_stores_no_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        with_home(dir.path(), || {
+            let plan = ClientPlan {
+                name: "lab".into(),
+                url: "http://127.0.0.1:7443".into(),
+                token: String::new(),
+            };
+            apply_client(&plan).unwrap();
+            let cfg = context::load().unwrap();
+            assert_eq!(cfg.contexts["lab"].url, "http://127.0.0.1:7443");
+            assert!(cfg.contexts["lab"].api_key.is_none());
+        });
     }
 
     #[test]

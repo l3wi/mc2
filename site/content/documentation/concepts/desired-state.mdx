@@ -21,7 +21,11 @@ there is no multi-node scheduler — just one node and one loop.
 1. **Publish.** `mc2 up -f stack.yaml` validates the file (unknown keys are
    rejected), fills defaults, and persists the normalized document in SQLite.
    Applying is *idempotent* — the same file re-applied converges to the same
-   state.
+   state — and *atomic*: the document and every instance change it implies are
+   written in one transaction, so a rejected apply leaves the previous state
+   untouched. The document is also the **whole** desired state: a service you
+   removed from the file is torn down by the next `up`, and a lower `scale`
+   deletes the extra replicas.
 2. **Schedule.** The scheduler turns each service into concrete instances on
    the local node, resolving per-replica ports, placement (`nodeName` /
    `nodeSelector`), and `depends_on` ordering.
@@ -32,6 +36,33 @@ there is no multi-node scheduler — just one node and one loop.
    stopped replicas.
 4. **Report.** `mc2 ps` reads live phase state; `mc2 status` summarizes
    health and counts.
+
+## Restarts and sandbox ownership
+
+The server is also the node, so a restart does not lose track of the
+microVMs it started. Every sandbox it creates carries this install's id
+(`mc2.install`), and the first reconcile pass lists the sandboxes with that
+label: sandboxes that match the current desired state are adopted, ones whose
+applied configuration no longer matches are recreated, and labelled sandboxes
+no stack wants any more are removed. Sandboxes without the install label belong
+to something else and are never touched. Ownership of a sandbox is dropped only
+after its removal succeeded, so a transient failure is retried on the next pass
+instead of orphaning a VM.
+
+The config hash is recorded per instance only after the sandbox was confirmed
+running with it. That is what makes the adoption decision trustworthy: after a
+crash between `mc2 up` and the next pass, the old VM has the old hash, so it is
+recreated rather than silently kept as if it had the new configuration.
+
+Two failure modes are deliberate:
+
+- **One broken instance does not stop the node.** If an instance's desired
+  state cannot be resolved (a secret referenced but not set, an unreadable
+  stored spec), that instance is reported `Failed` with the reason and the rest
+  of the node keeps reconciling. Its existing sandbox is kept, not collected.
+- **A slow pass unbinds nothing.** Placement changes only when you apply,
+  remove a stack, or the store changes; there is no heartbeat timeout that can
+  free a workload because reconcile took a while.
 
 ## In practice
 
@@ -57,6 +88,9 @@ mc2 down web-stack     # instances + definition removed
 ## Key behaviors
 
 - **Idempotent.** Re-applying the same file is a no-op if already converged.
+- **Whole-document.** Removals are part of the desired state: dropping a
+  service, or lowering `scale`, removes those instances on the next `up`. An
+  apply that fails validation or allocation changes nothing at all.
 - **No drift.** The loop owns instance lifecycle; a crashed replica is
   recreated according to `restart` — not left dead.
 - **Ordering at startup only.** `depends_on` gates *when* a dependent

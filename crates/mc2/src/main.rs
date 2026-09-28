@@ -22,7 +22,8 @@ mod table;
 
 use cli::{
     Cli, Commands, CompletionsArgs, ContextCmd, ContextCommands, DoctorArgs, NodeCmd, NodeCommands,
-    SecretCmd, SecretCommands, SetupCmd, SshCmd, SshCommands, VolumeCmd, VolumeCommands,
+    SecretCmd, SecretCommands, ServerCommands, ServerSecretsCmd, ServerSecretsCommands,
+    ServerTokenCmd, ServerTokenCommands, SetupCmd, SshCmd, SshCommands, VolumeCmd, VolumeCommands,
 };
 
 fn init_tracing() {
@@ -58,7 +59,18 @@ async fn main() -> Result<()> {
     };
 
     match command {
-        Commands::Server(args) => mc2_server::run(*args).await?,
+        Commands::Server(cmd) => {
+            let cmd = *cmd;
+            match cmd.command {
+                Some(ServerCommands::Token(ServerTokenCmd {
+                    command: ServerTokenCommands::Rotate(args),
+                })) => cmd::server::token_rotate(args).await?,
+                Some(ServerCommands::Secrets(ServerSecretsCmd {
+                    command: ServerSecretsCommands::Purge(args),
+                })) => cmd::server::secrets_purge(args).await?,
+                None => mc2_server::run(cmd.args).await?,
+            }
+        }
 
         Commands::Up(args) => {
             let conn = resolve()?;

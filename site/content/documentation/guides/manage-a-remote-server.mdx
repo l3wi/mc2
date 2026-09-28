@@ -30,7 +30,8 @@ mc2 setup client         # on the laptop
 API key on/off, public hostname, cert resolver, ingress dir. It writes a
 ready-to-run default `traefik.static.yml` once (never overwrites), prints the
 runnable `mc2 server …` command, and a numbered finish-setup checklist.
-Start that command and save the one-time API token.
+Start that command and save the one-time API token (stderr on a TTY, else
+`<data-dir>/bootstrap-token` at 0600).
 
 **On the laptop** (`mc2 setup client`): context name, control-plane URL, and
 the token. It saves and activates the context in `~/.mc2/config.toml` (0600)

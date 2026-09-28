@@ -11,6 +11,7 @@ capable host; CI covers the apply → desired-set contract without a VM
 volumes:
   data:
     kind: dir
+    size: 1GiB        # optional; default 10 GiB
 
 services:
   keep:
@@ -24,19 +25,29 @@ Fields:
 
 - `volumes` (top level) — declares the volumes available to this stack. Every
   service mount must reference a declared name. `kind: dir` is the only kind
-  supported in v1 (directory-backed named volumes; disk images, quotas, and
-  snapshots are not yet available).
+  supported in v1 (directory-backed volumes; disk images and snapshots are not
+  yet available).
+- `volumes.<name>.size` — the volume's quota (compose byte sizes: `1GiB`,
+  `512m`, or bytes), default 10 GiB. Raise it and re-apply to resize: the VM
+  restarts and the data is kept. A `size` below the directory's current usage
+  is rejected at apply.
 - `services.<svc>.volumes[].name` — a declared volume name.
 - `services.<svc>.volumes[].target` — absolute guest path; unique per service.
 
 ## Node-local behavior
 
-Volumes are node-local: the server creates them under its named-volume root
-(default `~/.microsandbox/volumes`, override with `mc2 server --volume-dir`).
-MC2 resolves each volume to a namespaced identity (`mc2-<stack>--<volume>`) at
-sandbox create time, so user-facing YAML names stay unchanged. The server
-canonicalizes `--volume-dir` because the underlying mount refuses to follow
-symlinks (e.g. macOS `/tmp` → `/private/tmp`).
+Volumes are node-local: MC2 owns a plain directory per volume under its volume
+root (default `~/.mc2/volumes`, override with `mc2 server --volume-dir`) and
+mounts `mc2-<stack>--<volume>` into the VM as a bind mount, so user-facing YAML
+names stay unchanged. Every VM start passes an explicit write quota of
+`size − current usage`, which makes the declared size an absolute cap that
+survives restarts. The volume root is created and canonicalized because the
+underlying mount refuses to follow symlinks (e.g. macOS `/tmp` →
+`/private/tmp`).
+
+When the volume (or the VM's root disk) fills, the guest sees
+`No space left on device`; `mc2 ps` shows the condition in `NOTES` and
+`mc2 exec` prints the exact `stack.yaml` change to make.
 
 Because the data lives on one node:
 
@@ -49,9 +60,9 @@ Because the data lives on one node:
 ## Retention and backup
 
 Volumes are retained when sandboxes, services, or stacks are removed — the
-data stays on disk. MC2 provides no volume deletion command yet; removing data
-is an operator action on the node. Back up the named-volume root like any
-other durable data directory.
+data stays on disk (except `mc2 down --volumes`, which deletes the stack's
+volume directories). Back up the volume root like any other durable data
+directory.
 
 ## Concurrency
 
@@ -64,7 +75,7 @@ coordination is the application's responsibility.
 
 Start the server using the
 [quickstart](../../site/content/documentation/quickstart.mdx). Volumes land
-under the default named-volume root (`~/.microsandbox/volumes`):
+under the default volume root (`~/.mc2/volumes`):
 
 ```bash
 mc2 up -f examples/06-persistent-volumes/stack.yaml
@@ -86,7 +97,7 @@ mc2 exec smoke-volumes/keep/0 cat /data/marker
 mc2 ps
 
 # 4. Volume data remains on disk after stack removal.
-ls ~/.microsandbox/volumes/mc2-smoke-volumes--data/
+ls ~/.mc2/volumes/mc2-smoke-volumes--data/
 ```
 
 `GET /v1/instances` shows the instance bound to its node while the node is
@@ -94,5 +105,5 @@ NotReady instead of moving.
 
 ## Future work
 
-Deletion, migration, snapshots, quotas, and remote storage are tracked under
+Migration, snapshots, and remote storage are tracked under
 [90-advanced](../90-advanced/README.md).

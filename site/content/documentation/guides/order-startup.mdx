@@ -58,9 +58,12 @@ reports healthy, `web` converges to `Running`.
 
 ## Healthcheck keys
 
-`interval`, `timeout`, `retries`, `start_period`, and `disable`. `retries`
-consecutive failures past `start_period` mark the instance unhealthy — with
-`restart` set it is recreated, otherwise it reports `Failed`.
+`interval`, `timeout` (default `30s`; `0` is rejected), `retries`,
+`start_period`, and `disable`. `retries` consecutive failures past
+`start_period` mark the instance unhealthy — with `restart` set it is
+recreated, otherwise it reports `Failed`. Failures inside `start_period` do not
+count toward `retries`, and every probe is bounded by `timeout` in a task of its
+own, so a hung probe never blocks reconcile.
 
 ## Per-replica ports
 

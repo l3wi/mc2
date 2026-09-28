@@ -15,10 +15,7 @@ pub struct SecretBody {
 }
 
 /// List secret names only — never values.
-pub async fn list_secrets(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<Vec<SecretMeta>> {
+pub async fn list_secrets(State(state): State<AppState>) -> ApiResult<Vec<SecretMeta>> {
     state
         .store
         .list_secret_meta()
@@ -30,7 +27,6 @@ pub async fn list_secrets(
 /// Create or replace a secret. Body is never returned.
 pub async fn put_secret(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
     Json(body): Json<SecretBody>,
 ) -> ApiResult<SecretMeta> {
@@ -50,7 +46,6 @@ pub async fn put_secret(
 
 pub async fn delete_secret(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     match state.store.delete_secret(&name).await {

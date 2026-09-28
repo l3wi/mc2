@@ -17,11 +17,16 @@ thiserror = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 clap = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
 tracing = { workspace = true }
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+# REST serve loop: header-read deadline + graceful shutdown on hyper 1.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "server-graceful", "service"] }
+# TCP keepalive on accepted SSH sockets.
+socket2 = "0.6"
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = "0.3"

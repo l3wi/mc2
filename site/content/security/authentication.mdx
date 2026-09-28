@@ -11,9 +11,9 @@ by default, everything else needs https and a token.
 
 ## The operator API token
 
-Auth is **on by default**. On first bootstrap the server prints a single
-**API token** — an operator REST bearer token, shown as `mc2at_…` — once.
-Every operator request must present it:
+Auth is **on by default**. The server creates a single **API token** — an
+operator REST bearer token, shown as `mc2at_…` — on first bootstrap and shows
+it once (see below). Every operator request must present it:
 
 ```bash
 # After `mc2 setup client`, the context already has the token.
@@ -25,31 +25,60 @@ The token is the master key to the control plane: anyone holding it can
 manage stacks, read and write secrets, and exec into sandboxes. Treat it like
 a root password.
 
-## Bootstrap: the token prints once
+## Bootstrap: the token is shown once
 
-Run the server without `--no-auth` and save the printed token on first
-bootstrap — it is not printed again.
+Run `mc2 server` and save the token it produces on first bootstrap.
 
 ```bash
 mc2 server
-# ← save the printed API token (mc2at_…) now
 ```
 
-<Callout type="warning" title="Back up the token with the data dir">
-  The token lives under the data dir alongside state and the secret-store key
-  material. Back up the data dir — and lose it and you lose control of the
-  server's identity.
-</Callout>
+- **Interactive terminal:** the token is printed to stderr once.
+- **No TTY** (systemd, a container, `--init-only` in a script): nothing is
+  printed. The token is written to `<data-dir>/bootstrap-token` with mode
+  **0600**, and only the path is logged — token values never reach journald or
+  container logs. Read it, then delete the file.
 
-## `--no-auth` is lab-only
+The token is not shown again. It is stored only as a SHA-256 hash in the data
+dir's SQLite database.
 
-`--no-auth` starts the server with **no API token at all** — any caller who
-can reach the API is the operator. It exists for open lab installs on
-loopback:
+### Lost the token?
+
+Rotate it — this works whether or not the server is running (tokens are
+checked against the store per request):
 
 ```bash
-mc2 server --no-auth
+mc2 server token rotate --data-dir ~/.mc2
 ```
+
+It prints a fresh `mc2at_…` once. The previous token stops working
+immediately; update your contexts (`mc2 context set <name> --api <url>
+--token <new>`).
+
+<Callout type="warning" title="Back up the data dir, not the token file">
+  The token hash lives under the data dir alongside state and the secret-store
+  key material. Back the data dir up; if you lose access to the token, rotate
+  it rather than restoring an old copy.
+</Callout>
+
+## `--no-auth` is lab-only and per-start
+
+`--no-auth` makes **this run** accept unauthenticated API calls. The token
+still exists in the store — the process just skips the check. It is not
+persisted, and auth comes back on the next normal start.
+
+```bash
+# Loopback: fine for a disposable lab.
+mc2 server --no-auth
+
+# Refused: a routable bind would be an open control plane.
+mc2 server --no-auth --bind 0.0.0.0:7443
+# …unless you confirm it explicitly (warns on every start):
+mc2 server --no-auth --bind 0.0.0.0:7443 --allow-unauthenticated-remote
+```
+
+`--no-auth` with `--public-hostname` is always refused — there is no escape
+hatch for publishing an open control plane.
 
 <Callout type="danger" title="Never --no-auth on anything reachable">
   Outside a disposable loopback lab, `--no-auth` removes the only credential

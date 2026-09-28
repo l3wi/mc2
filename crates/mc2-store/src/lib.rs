@@ -42,7 +42,19 @@ pub struct SecretBlob {
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::time::Duration;
+
+/// Settings key holding the persisted local-node id.
+///
+/// The embedded node is a singleton: its id is generated once and reused for
+/// every later start, so `--node-name` / a hostname change only renames the
+/// node and never strands placements (B8).
+pub const SETTING_LOCAL_NODE_ID: &str = "local_node_id";
+
+/// Settings key holding this install's random id.
+///
+/// Every sandbox is labelled with it (`mc2.install`), so the node can recover
+/// ownership of its VMs after a restart and never touch a foreign workload (B2).
+pub const SETTING_INSTALL_ID: &str = "install_id";
 
 /// Errors from the store layer.
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +91,65 @@ pub struct ClusterCounts {
     pub instances: u32,
 }
 
+/// The complete desired instance set for one stack, produced by
+/// `mc2_server::apply::plan_stack` and written atomically by
+/// [`Store::commit_stack_plan`].
+///
+/// The plan is the *whole* desired state, not a delta: after a commit the
+/// stack owns exactly `instances` (plus the stack row). Any stored instance of
+/// the stack whose `(service, ordinal)` is not planned — a service dropped from
+/// the YAML, or an ordinal past a scale-down — is deleted by the commit, so
+/// removals need no special case in the plan.
+#[derive(Debug, Clone)]
+pub struct StackPlan {
+    pub stack: String,
+    pub labels_json: String,
+    pub raw_yaml: String,
+    /// Desired instances, ordered by `(service, ordinal)`.
+    pub instances: Vec<PlannedInstance>,
+}
+
+/// One desired instance in a [`StackPlan`]. Whether it is created or updated is
+/// decided by the commit: an existing row for `(stack, service, ordinal)` keeps
+/// its identity, placement and observed state and only gets the new spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedInstance {
+    pub service: String,
+    pub ordinal: u32,
+    pub spec_json: String,
+}
+
+impl StackPlan {
+    /// A plan for `stack` built from per-service replica specs
+    /// (`(service, spec_json per ordinal)`).
+    ///
+    /// Replacing a stack that already owns instances also removes the ones the
+    /// plan does not mention — see [`Store::commit_stack_plan`].
+    pub fn replicas<'a>(
+        stack: &str,
+        labels_json: &str,
+        raw_yaml: &str,
+        services: impl IntoIterator<Item = (&'a str, Vec<String>)>,
+    ) -> Self {
+        let mut instances = Vec::new();
+        for (service, specs) in services {
+            for (ordinal, spec_json) in specs.into_iter().enumerate() {
+                instances.push(PlannedInstance {
+                    service: service.to_string(),
+                    ordinal: ordinal as u32,
+                    spec_json,
+                });
+            }
+        }
+        Self {
+            stack: stack.to_string(),
+            labels_json: labels_json.to_string(),
+            raw_yaml: raw_yaml.to_string(),
+            instances,
+        }
+    }
+}
+
 /// Persistence surface used by the control plane.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -86,12 +157,15 @@ pub trait Store: Send + Sync {
 
     async fn init_cluster(&self, api_token_hash: &str) -> Result<ClusterMeta, StoreError>;
 
-    /// Operator REST: if no API token was configured (empty hash), returns true
-    /// for any caller (including missing bearer). Otherwise checks the bearer.
+    /// Operator REST: verify a plaintext bearer token against the stored hash.
+    ///
+    /// Returns false when the cluster is uninitialized or the token is empty;
+    /// an unauthenticated start is a server-process decision (`--no-auth`), not
+    /// a store one.
     async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError>;
 
-    /// True when the cluster requires an operator API bearer token.
-    async fn api_auth_required(&self) -> Result<bool, StoreError>;
+    /// Replace the stored operator API token hash (`mc2 server token rotate`).
+    async fn replace_api_token_hash(&self, api_token_hash: &str) -> Result<(), StoreError>;
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError>;
 
@@ -101,46 +175,41 @@ pub trait Store: Send + Sync {
     /// Upsert a server-level setting value.
     async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError>;
 
+    /// Register/refresh **the** local node (singleton).
+    ///
+    /// The id is generated once and persisted under
+    /// [`SETTING_LOCAL_NODE_ID`], so a later start — including one with a
+    /// different `--node-name` or hostname — reuses the same id and keeps every
+    /// placement. Only the display name and capacity fields change.
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError>;
     async fn touch_node(&self, node_id: &str, hb: NodeHeartbeat) -> Result<NodeRecord, StoreError>;
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError>;
     async fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError>;
-    async fn mark_stale_nodes(&self, grace: Duration) -> Result<u32, StoreError>;
 
     // --- stacks / instances (Phase 3) ---
-
-    async fn upsert_stack(
-        &self,
-        name: &str,
-        labels_json: &str,
-        raw_yaml: &str,
-    ) -> Result<StackRecord, StoreError>;
 
     async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError>;
 
     async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError>;
 
-    /// Delete a stack and its instances (cascades ssh/network rows). Returns
-    /// false when the stack did not exist.
+    /// Publish `plan` as this stack's desired state, **all or nothing**.
+    ///
+    /// One transaction: the stack row (labels, `raw_yaml`, timestamps) plus every
+    /// instance create/update/delete. A failure at any point leaves the previous
+    /// stack and instance rows exactly as they were.
+    ///
+    /// Instances are matched by `(stack, service, ordinal)`: an existing row is
+    /// updated **in place** (only `spec_json` and `updated_at` change — node
+    /// binding, runtime id, observed phase/message, health and the applied
+    /// config hash are preserved so the node decides on a recreate); anything
+    /// else the stack owns is deleted (ssh/network rows cascade).
+    ///
+    /// Returns the stack's instances ordered by `(service, ordinal)`.
+    async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError>;
+
+    /// Delete a stack and its instances (cascades ssh/network rows) in one
+    /// transaction. Returns false when the stack did not exist.
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError>;
-
-    /// Ensure instance rows 0..replicas-1 exist for (stack, service); remove higher ordinals.
-    async fn reconcile_service_replicas(
-        &self,
-        stack: &str,
-        service: &str,
-        replicas: u32,
-        spec_json: &str,
-    ) -> Result<Vec<InstanceRecord>, StoreError>;
-
-    /// Same as [`Store::reconcile_service_replicas`] but with a per-ordinal spec
-    /// (index = ordinal). Required for `scale > 1` with per-replica published ports.
-    async fn reconcile_service_replicas_multi(
-        &self,
-        stack: &str,
-        service: &str,
-        spec_jsons: &[String],
-    ) -> Result<Vec<InstanceRecord>, StoreError>;
 
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError>;
 
@@ -157,9 +226,6 @@ pub trait Store: Send + Sync {
         node_id: &str,
     ) -> Result<InstanceRecord, StoreError>;
 
-    /// Clear placement so the instance can be rescheduled (Pending, no node/runtime).
-    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError>;
-
     async fn update_instance_status(
         &self,
         instance_id: &str,
@@ -167,6 +233,24 @@ pub trait Store: Send + Sync {
         runtime_id: Option<&str>,
         message: Option<&str>,
     ) -> Result<InstanceRecord, StoreError>;
+
+    /// Persist the create-time config hash the running sandbox was confirmed
+    /// with (B3). `None` clears it (no confirmed sandbox). Missing instance is
+    /// [`StoreError::NotFound`].
+    async fn set_instance_applied_hash(
+        &self,
+        instance_id: &str,
+        applied_hash: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    /// The persisted applied config hash for an instance, if any.
+    ///
+    /// `None` also covers a missing instance: the caller treats an absent row as
+    /// "nothing adopted" either way.
+    async fn get_instance_applied_hash(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<String>, StoreError>;
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError>;
 

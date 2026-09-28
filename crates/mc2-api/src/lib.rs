@@ -4,12 +4,16 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod disk;
+pub mod exec;
 pub mod stack;
 pub use stack::{
     default_network_fqdn, is_loopback_bind, make_ingress_route_id, network_fqdn,
-    normalize_ingress_path, parse_stack_yaml, split_command_string, DependsOnSpec, ExposeSpec,
-    HealthcheckSpec, IngressPath, IngressRule, IngressSpec, IngressTlsSpec, NetworkSpec, PortSpec,
-    SecretRef, ServiceSpec, SshSpec, StackDocument, StackNetworkSpec, VolumeMount, VolumeSpec,
+    normalize_ingress_path, parse_stack_yaml, route_key, split_command_string, validate_hostname,
+    validate_ingress_path, validate_traefik_ident, DependsOnSpec, ExposeSpec, HealthcheckSpec,
+    IngressPath, IngressRule, IngressSpec, IngressTlsSpec, NetworkSpec, PortSpec, SecretRef,
+    ServiceSpec, SshSpec, StackDocument, StackNetworkSpec, StorageOptSpec, VolumeMount, VolumeSpec,
+    DEFAULT_ROOT_DISK_MIB, DEFAULT_VOLUME_SIZE_MIB, MAX_DISK_SIZE_MIB,
 };
 
 /// Stack / API schema version string used in YAML `apiVersion`.
@@ -115,11 +119,18 @@ pub struct VolumeView {
     pub volume: String,
     /// Absolute path under the node's volume root.
     pub path: String,
-    /// On-disk size of the volume directory, in MiB (measured best-effort).
-    pub size_mib: u64,
+    /// Declared size limit in MiB (`volumes.<name>.size`); `None` when the
+    /// owning stack is gone or no longer declares the volume.
+    #[serde(default)]
+    pub limit_mib: Option<u64>,
+    /// On-disk usage of the volume directory, in MiB (measured best-effort).
+    pub used_mib: u64,
 }
 
 /// Operator-visible node (no credentials).
+///
+/// The embedded node is a singleton: it is Ready for as long as the server
+/// process runs, so there is no heartbeat-derived staleness to expose (B8).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeView {
     pub id: String,
@@ -128,7 +139,6 @@ pub struct NodeView {
     pub cpus: u32,
     pub memory_mib: u64,
     pub status: String,
-    pub last_heartbeat: Option<String>,
     pub labels: serde_json::Value,
     pub created_at: String,
 }

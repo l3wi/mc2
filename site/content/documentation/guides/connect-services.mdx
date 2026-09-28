@@ -76,8 +76,9 @@ Another stack's service with `networks: [shared]` can then reach
 
 - **Default-allow within a shared network** — Docker-style.
 - **Same-node in v1.** DNS and L4 splices are node-local.
-- **Unique server-wide ports.** If another stack already bound the same
-  exposed port, the new splice reports a `Failed` edge.
+- **Exclusive server-wide ports.** An `expose` port another stack already
+  claims is rejected at `mc2 up` (400, naming the owner); the claim's listener
+  is held from apply until the stack is removed.
 
 ## Next
 

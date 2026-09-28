@@ -18,7 +18,14 @@ mc2 doctor
 | Instance reports `Failed` immediately | No hypervisor, or the sandbox could not boot | `mc2 doctor`; ensure KVM/HVF is available and your user can open `/dev/kvm`. |
 | `mc2 up` returns `400` with `unknown field …` | Non-canonical key (e.g. k8s-style `apiVersion`, `replicas`, `env:`) | Remove the key; see [Stack YAML](/references/stack/overview). |
 | Host port already in use | Cross-service conflict | Published host ports are effectively unique server-wide; change the port or remove the conflicting service. |
-| `Failed` network edge | Another stack/network already bound the same exposed port | Exposed guest ports are unique server-wide; rename or drop one claim. |
+| `mc2 up` returns `400` naming another stack for an exposed port | That stack already claims the `expose` port — ports are exclusive server-wide | Use the suggested port and update the client's connection string; see [Ports & expose](/references/stack/ports-expose). |
+| `mc2 up` returns `400` `already in use by another process` for an exposed port | A host process listens on that loopback port | Stop it, or expose a different port (the listener is held for the claim's lifetime). |
+| `mc2 up` returns `400` `privileged` for an exposed port (Linux) | The port is below `net.ipv4.ip_unprivileged_port_start` | Grant `CAP_NET_BIND_SERVICE` (`setcap`, or systemd `AmbientCapabilities`), lower the threshold, or pick a port above 1023. |
+| Writes inside the VM fail with `No space left on device` | The service filled its root disk, or a volume hit its `size` quota | `mc2 exec <ref> -- df -h` to see which. Raise `storage_opt.size` (root disk; the VM is recreated and files outside volumes are lost) or the volume's `size` (data is kept), then `mc2 up -f stack.yaml`. `mc2 ps` shows the same condition in `NOTES`. |
+| `mc2 up` returns `400` `volume "data" already holds …; size: … is smaller` | The declared volume `size` is below what the directory already holds | Free space (`mc2 exec <ref> -- du -sh /data/*`), or set a `size` at least as large as the current usage. |
+| `mc2 up` returns `400` `disk reservation would reach …` | The stacks' declared volume sizes plus root disks × replicas exceed `--limit-disk-mib` | Raise `--limit-disk-mib`, or lower `volumes.<name>.size` / `services.<name>.storage_opt.size` / `scale`. |
+| `mc2 up` returns `400` `disk reservation would reach …` for a stack with no `size` fields | Defaults count too: 10 GiB per volume and 4 GiB per replica | Make the budget cover the defaults, or declare smaller sizes explicitly. |
+| `Failed` with `no listener on 127.0.0.1:P` | The port claim could not bind, so the VM was failed closed (its egress rule is create-time) | Resolve the port conflict and re-apply; `mc2 network` shows the claim owners. |
 | Remote `http://` refused | Remote mode requires https + token | Use `https://`, or explicitly opt in with `--allow-insecure-http`. |
 | `mc2 status` shows the wrong mode | Context or env points elsewhere | Check `mc2 context ls`; resolution is flags > env > context > current > loopback. |
 

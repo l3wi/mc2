@@ -22,15 +22,17 @@ ports:
 ```
 
 Long form: `{ target: 3001, published: 5000, protocol: tcp, hostname: "mcp.example.com" }`.
-`published: 0` / omitted → auto host port, resolved once at apply and persisted
-(the port is stable across restarts and re-applies).
+Omit `published` (or use the target-only short form above) → auto host port,
+resolved once at apply and persisted (the port is stable across restarts and
+re-applies); an explicit `published: 0` in the long form is rejected, so leave
+the key out to get the server's allocation.
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `published` | no | auto | Host port. `0`/absent → server allocates. |
+| `published` | no | auto | Host port. **Omit** for the server to allocate (`0` is rejected in the long form). |
 | `target` | yes | — | Port inside the guest. |
 | `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
-| `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). |
+| `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). Must be an exact lowercase RFC 1123 hostname — no port, wildcard or trailing dot. |
 
 A published port is the north-south gateway; to reach it over the network you
 route it through `ingress` (see [Networks & ingress](./networks-ingress)).
@@ -45,8 +47,12 @@ distinct host port:
 - a target-only (`"3001"` / hostname-sugar) port gets a distinct auto-allocated
   port per replica.
 
-Allocations are stable across re-applies. Ingress routes for a scaled service
-target replica 0's port.
+Allocations are stable across re-applies. Moving a fixed `published` base is
+fine — the same apply releases the stack's previous block — but `mc2 up` is
+refused (`400`) if two entries would need the same host port, if the port is
+already an `expose` claim or another stack's publish, or if `published +
+ordinal` would exceed `65535`. Ingress routes for a scaled service target
+replica 0's port.
 
 <Callout type="note" title="Auto ports persist">
   An auto host port is resolved once at apply and persisted — the same port
@@ -73,12 +79,19 @@ expose:
 
 Reachable by every other service that shares a network (same or different
 stack) as `<service>.<network>.svc.mc2:<port>` (default-allow, round-robin
-across Ready replicas). Same-node only in v1. See
-[Networking](/documentation/concepts/networking).
+across Ready replicas). A service needs no `expose` of its own to reach peers,
+and replicas of a service can reach their own service. Same-node only in v1.
+See [Networking](/documentation/concepts/networking).
 
-<Callout type="warning" title="Exposed ports are effectively unique server-wide">
-  Each stack validates uniqueness at parse time, but the L4 splices all live on
-  the shared host loopback, so a port already bound by another stack or network
-  makes the later splice report `Failed` (unlike Docker, same-port isolation
-  across networks isn't possible).
+<Callout type="warning" title="Exposed ports are exclusive server-wide, claimed at apply">
+  A guest resolves every name to the one gateway IP and msb rewrites
+  `gateway:P` to host `127.0.0.1:P` with no remap, so the port alone identifies
+  the shared splice. `mc2 up` therefore rejects an `expose` port another stack
+  already claims (`400`, naming the owner and suggesting another port), a port
+  MC2 already takes — the REST bind, any SSH listener, any published `ports:`
+  host port, or `53` — and a loopback port a host process already listens on.
+  MC2 then holds the listener from apply until the stack is removed (a client
+  sees accept-then-close while no backend is Ready), and refuses to create a
+  VM whose allowed port has no listener (fail closed). Ports below 1024 need
+  `CAP_NET_BIND_SERVICE` on Linux. `mc2 network` prints the owner of each claim.
 </Callout>

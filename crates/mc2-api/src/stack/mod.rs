@@ -10,8 +10,10 @@ pub use decode::split_command_string;
 pub use schema::{
     DependsOnSpec, ExposeSpec, HealthcheckSpec, IngressPath, IngressRule, IngressSpec,
     IngressTcpRoute, IngressTlsSpec, NetworkSpec, PortSpec, SecretRef, ServiceSpec, SshSpec,
-    StackDocument, StackNetworkSpec, VolumeMount, VolumeSpec,
+    StackDocument, StackNetworkSpec, StorageOptSpec, VolumeMount, VolumeSpec,
+    DEFAULT_ROOT_DISK_MIB, DEFAULT_VOLUME_SIZE_MIB, MAX_DISK_SIZE_MIB,
 };
+pub use validate::{validate_hostname, validate_ingress_path, validate_traefik_ident};
 
 /// Parse and validate a stack YAML document (canonical compose-style schema).
 pub fn parse_stack_yaml(yaml: &str) -> Result<StackDocument, String> {
@@ -47,6 +49,21 @@ pub fn normalize_ingress_path(path: &str) -> String {
     } else {
         format!("/{p}")
     }
+}
+
+/// Stable Traefik router/service key for a route id: ASCII alphanumerics, `-`
+/// and `_` are kept, every other character becomes `-`. Two route ids that
+/// normalize to the same key would collide in the Traefik catalog.
+pub fn route_key(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Stable Ingress route id (stack + host + path + service + guest port).
@@ -85,6 +102,7 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -183,6 +201,48 @@ services:
         assert_eq!(ports[1].target, 3000);
         assert_eq!(ports[2].published, 5000);
         assert_eq!(ports[2].protocol, "tcp");
+    }
+
+    #[test]
+    fn rejects_non_positive_or_oversized_cpus() {
+        for bad in ["0", "-1", ".nan", ".inf", "1000"] {
+            let yaml =
+                format!("name: demo\nservices:\n  web:\n    image: alpine\n    cpus: {bad}\n");
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("cpus"), "{bad:?}: {err}");
+        }
+        // The boundary and the fractional values the runtime can honour parse.
+        for ok in ["1", "0.5", "255"] {
+            let yaml =
+                format!("name: demo\nservices:\n  web:\n    image: alpine\n    cpus: {ok}\n");
+            parse_stack_yaml(&yaml).unwrap_or_else(|e| panic!("cpus {ok:?} must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn long_form_port_omitting_published_is_auto() {
+        let yaml =
+            "name: demo\nservices:\n  web:\n    image: alpine\n    ports:\n      - target: 80\n";
+        let doc = parse_stack_yaml(yaml).unwrap();
+        assert_eq!(doc.services["web"].ports[0].published, 0);
+        assert_eq!(doc.services["web"].ports[0].target, 80);
+    }
+
+    #[test]
+    fn rejects_unknown_long_form_port_keys() {
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    ports:\n      - target: 80\n        publised: 8080\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(
+            err.contains("publised"),
+            "must name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_zero_published_in_long_form() {
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    ports:\n      - target: 80\n        published: 0\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("published"), "{err}");
     }
 
     #[test]
@@ -371,6 +431,7 @@ services:
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -571,8 +632,133 @@ services:
             .clone()
             .unwrap();
         assert_eq!(h.retries, 3);
-        assert_eq!(h.timeout_seconds, 0);
+        // Compose default: an omitted timeout is 30s, never "no timeout".
+        assert_eq!(h.timeout_seconds, 30);
         assert_eq!(h.start_period_seconds, 0);
+    }
+
+    /// B6a: every compose healthcheck form must survive
+    /// YAML → spec → stored JSON → spec (the node reads the stored spec).
+    #[test]
+    fn healthcheck_forms_round_trip_through_json() {
+        let yaml = r#"
+name: x
+services:
+  shell_list:
+    image: busybox
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/"]
+      timeout: 100ms
+  shell_string:
+    image: busybox
+    healthcheck:
+      test: "curl -f http://localhost/"
+      start_period: 1500ms
+  cmd:
+    image: busybox
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+  none:
+    image: busybox
+    healthcheck:
+      test: ["NONE"]
+  disabled:
+    image: busybox
+    healthcheck:
+      disable: true
+  empty:
+    image: busybox
+    healthcheck: {}
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        let sh = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "curl -f http://localhost/".to_string(),
+        ];
+        let shell_list = doc.services["shell_list"].healthcheck.clone().unwrap();
+        // CMD-SHELL (and the bare string form) must actually reach a shell.
+        assert_eq!(shell_list.test, Some(sh.clone()));
+        assert_eq!(
+            doc.services["shell_string"]
+                .healthcheck
+                .clone()
+                .unwrap()
+                .test,
+            Some(sh)
+        );
+        // Sub-second durations round UP to the next second, never down to 0.
+        assert_eq!(shell_list.timeout_seconds, 1);
+        assert_eq!(
+            doc.services["shell_string"]
+                .healthcheck
+                .clone()
+                .unwrap()
+                .start_period_seconds,
+            2
+        );
+        // `CMD` is a prefix, not an argv element.
+        assert_eq!(
+            doc.services["cmd"].healthcheck.clone().unwrap().test,
+            Some(vec![
+                "curl".to_string(),
+                "-f".to_string(),
+                "http://localhost/".to_string()
+            ])
+        );
+        // `NONE` disables the probe, exactly like `disable: true`.
+        assert_eq!(doc.services["none"].healthcheck.clone().unwrap().test, None);
+        assert!(
+            doc.services["disabled"]
+                .healthcheck
+                .clone()
+                .unwrap()
+                .disable
+        );
+
+        for name in [
+            "shell_list",
+            "shell_string",
+            "cmd",
+            "none",
+            "disabled",
+            "empty",
+        ] {
+            let json = serde_json::to_string(&doc.services[name]).unwrap();
+            let back: ServiceSpec = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{name}: stored spec unreadable: {e}"));
+            assert_eq!(serde_json::to_string(&back).unwrap(), json, "{name}");
+        }
+
+        // Defaults for an empty map (compose's own defaults).
+        let empty = doc.services["empty"].healthcheck.clone().unwrap();
+        assert_eq!(empty.test, None);
+        assert!(!empty.disable);
+        assert_eq!(empty.interval_seconds, 30);
+        assert_eq!(empty.timeout_seconds, 30);
+        assert_eq!(empty.retries, 3);
+        assert_eq!(empty.start_period_seconds, 0);
+    }
+
+    /// B6a: a probe must always have a finite deadline, so an explicit `0`
+    /// timeout is rejected instead of meaning "wait forever".
+    #[test]
+    fn healthcheck_zero_timeout_is_rejected() {
+        for value in ["0", "0s", "0ms"] {
+            let yaml = format!(
+                r#"
+name: x
+services:
+  web:
+    image: busybox
+    healthcheck:
+      test: ["true"]
+      timeout: {value}
+"#
+            );
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("timeout"), "{value}: {err}");
+        }
     }
 
     #[test]
@@ -684,5 +870,351 @@ services:
         assert!(!doc.services["b"].ssh.as_ref().unwrap().enabled);
         let c = doc.services["c"].ssh.as_ref().unwrap();
         assert_eq!(c.port, 2222);
+    }
+
+    // ---- A2: name grammar -------------------------------------------------
+
+    #[test]
+    fn rejects_invalid_stack_names() {
+        for bad in ["My Stack", "Shop", "api.v2", "a--b", "-a", "a-", "a b"] {
+            let yaml = format!("name: \"{bad}\"\nservices:\n  web:\n    image: alpine\n");
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("invalid stack name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_service_names() {
+        for bad in ["Shop", "api.v2", "a--b", "-a", "a-"] {
+            let yaml = format!("name: demo\nservices:\n  \"{bad}\":\n    image: alpine\n");
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("invalid service name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_network_names() {
+        let yaml = "name: demo\nnetworks:\n  \"Bad.Net\":\n    mode: mediated\nservices:\n  web:\n    image: alpine\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("invalid network name"), "{err}");
+
+        // Membership entries use the same grammar as declarations.
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    networks: [\"Bad\"]\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("service web: network name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_overlong_names() {
+        let stack = "a".repeat(41);
+        let yaml = format!("name: {stack}\nservices:\n  web:\n    image: alpine\n");
+        assert!(
+            parse_stack_yaml(&yaml)
+                .unwrap_err()
+                .contains("maximum is 40"),
+            "stack cap"
+        );
+
+        let svc = "b".repeat(64);
+        let yaml = format!("name: demo\nservices:\n  {svc}:\n    image: alpine\n");
+        assert!(
+            parse_stack_yaml(&yaml)
+                .unwrap_err()
+                .contains("maximum is 63"),
+            "service cap"
+        );
+
+        let net = "c".repeat(64);
+        let yaml = format!("name: demo\nnetworks:\n  {net}:\n    mode: mediated\nservices:\n  web:\n    image: alpine\n");
+        assert!(
+            parse_stack_yaml(&yaml)
+                .unwrap_err()
+                .contains("maximum is 63"),
+            "network cap"
+        );
+    }
+
+    #[test]
+    fn accepts_max_length_names() {
+        let stack = "a".repeat(40);
+        let svc = "b".repeat(63);
+        let yaml = format!("name: {stack}\nservices:\n  {svc}:\n    image: alpine\n");
+        let doc = parse_stack_yaml(&yaml).unwrap();
+        assert_eq!(doc.name.len(), 40);
+        assert_eq!(doc.services.keys().next().unwrap().len(), 63);
+    }
+
+    #[test]
+    fn invalid_names_suggest_a_valid_alternative() {
+        let err =
+            parse_stack_yaml("name: Shop\nservices:\n  web:\n    image: alpine\n").unwrap_err();
+        assert!(err.contains("suggested: \"shop\""), "{err}");
+
+        let err =
+            parse_stack_yaml("name: api.v2\nservices:\n  web:\n    image: alpine\n").unwrap_err();
+        assert!(err.contains("suggested: \"api-v2\""), "{err}");
+    }
+
+    #[test]
+    fn underscores_are_allowed_in_lowercase_names() {
+        let yaml = "name: my_stack\nservices:\n  my_service:\n    image: alpine\n    networks: [team_net]\n";
+        assert!(parse_stack_yaml(yaml).is_ok());
+    }
+
+    // ---- A4: ingress hardening -------------------------------------------
+
+    #[test]
+    fn rejects_ingress_host_injection_payloads() {
+        for bad in [
+            "evil.local\\nevil",
+            "*.demo.local",
+            "demo.local.",
+            "Evil.Local",
+        ] {
+            let yaml = format!(
+                "name: demo\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:8000\"]\n\
+                 ingress:\n  rules:\n    - host: \"{bad}\"\n      paths:\n\
+                 \x20       - path: /\n          service: web\n          port: 8000\n"
+            );
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("hostname"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_ingress_traefik_ident_injection_payloads() {
+        let resolver = "name: demo\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:8000\"]\n\
+             ingress:\n  tls:\n    enabled: true\n    certResolver: \"le\\nevil: x\"\n  rules:\n\
+             \x20   - host: demo.local\n      paths:\n        - path: /\n          service: web\n          port: 8000\n";
+        let err = parse_stack_yaml(resolver).unwrap_err();
+        assert!(err.contains("certResolver"), "{err}");
+
+        let tcp = "name: demo\nservices:\n  web:\n    image: alpine\n    ssh:\n      enabled: true\n      port: 2222\n\
+             ingress:\n  tcp:\n    - name: \"web\\nrouter\"\n      entryPoint: ssh\n      service: web\n";
+        let err = parse_stack_yaml(tcp).unwrap_err();
+        assert!(err.contains("ingress.tcp[0].name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_ingress_paths() {
+        for bad in ["api", "/a b", "/a`b", "/a\"b", "/a\\b", ""] {
+            let yaml = format!(
+                "name: demo\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:8000\"]\n\
+                 ingress:\n  rules:\n    - host: demo.local\n      paths:\n\
+                 \x20       - path: '{bad}'\n          service: web\n          port: 8000\n"
+            );
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("path"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_ports_hostname_sugar() {
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    ports:\n      - \"Bad.Example.com:3000\"\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("hostname"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_ingress_routers() {
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:8000\"]\n\
+             ingress:\n  rules:\n    - host: demo.local\n      paths:\n        - path: /\n          service: web\n          port: 8000\n\
+             \x20   - host: demo.local\n      paths:\n        - path: /\n          service: web\n          port: 8000\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("duplicate ingress router"), "{err}");
+    }
+
+    // ---- A7: closed profile set ------------------------------------------
+
+    #[test]
+    fn rejects_unknown_network_profiles() {
+        for bad in ["privte", "local", "any", "PUBLIC", ""] {
+            let yaml = format!(
+                "name: demo\nservices:\n  web:\n    image: alpine\n    network:\n      profiles: [\"{bad}\"]\n"
+            );
+            let err = parse_stack_yaml(&yaml).unwrap_err();
+            assert!(err.contains("network.profiles"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_none_with_other_profiles_and_duplicates() {
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    network:\n      profiles: [none, public]\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("only entry"), "{err}");
+
+        let yaml = "name: demo\nservices:\n  web:\n    image: alpine\n    network:\n      profiles: [public, public]\n";
+        let err = parse_stack_yaml(yaml).unwrap_err();
+        assert!(err.contains("duplicate network.profiles"), "{err}");
+    }
+
+    #[test]
+    fn accepts_the_closed_profile_set() {
+        for p in ["public", "private", "host", "none"] {
+            let yaml = format!(
+                "name: demo\nservices:\n  web:\n    image: alpine\n    network:\n      profiles: [{p}]\n"
+            );
+            parse_stack_yaml(&yaml).unwrap_or_else(|e| panic!("{p} must be accepted: {e}"));
+        }
+        // Empty list keeps its default (public at runtime).
+        let doc = parse_stack_yaml("name: demo\nservices:\n  web:\n    image: alpine\n").unwrap();
+        assert!(doc.services["web"].network.profiles.is_empty());
+    }
+
+    // ---- A9: disk sizes --------------------------------------------------
+
+    #[test]
+    fn volume_size_parses_and_json_roundtrips() {
+        let doc = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir\n    size: 10GiB",
+            "      - name: data\n        target: /data",
+        ))
+        .unwrap();
+        assert_eq!(doc.volumes["data"].size_mib, 10 * 1024);
+
+        // Stored-document JSON round-trip is lossless (bytes form on the wire).
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.contains("\"size\":10737418240"), "{json}");
+        let back: StackDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.volumes["data"].size_mib, 10 * 1024);
+        assert_eq!(back.name, doc.name);
+    }
+
+    #[test]
+    fn omitted_sizes_get_the_documented_defaults() {
+        let doc = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir",
+            "      - name: data\n        target: /data",
+        ))
+        .unwrap();
+        assert_eq!(doc.volumes["data"].size_mib, 10 * 1024, "volume default");
+        let svc = &doc.services["web"];
+        assert!(svc.storage_opt.is_none());
+        assert_eq!(svc.root_disk_mib(), 4 * 1024, "root-disk default");
+        // Mounts default to the volume default until apply copies the volume's size.
+        assert_eq!(svc.volumes[0].size_mib, 10 * 1024);
+    }
+
+    #[test]
+    fn storage_opt_size_parses_serializes_and_has_a_default() {
+        let yaml = r#"
+name: demo
+services:
+  web:
+    image: alpine:3.20
+    storage_opt:
+      size: 8GiB
+"#;
+        let doc = parse_stack_yaml(yaml).unwrap();
+        let svc = &doc.services["web"];
+        assert_eq!(svc.storage_opt.as_ref().unwrap().size_mib, 8 * 1024);
+        assert_eq!(svc.root_disk_mib(), 8 * 1024);
+
+        let json = serde_json::to_string(svc).unwrap();
+        assert!(json.contains("\"size\":8589934592"), "{json}");
+        let back: ServiceSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.root_disk_mib(), 8 * 1024);
+
+        // A `storage_opt` block without `size` uses the 4 GiB default.
+        let doc = parse_stack_yaml(
+            "name: demo\nservices:\n  web:\n    image: alpine\n    storage_opt: {}\n",
+        )
+        .unwrap();
+        assert_eq!(doc.services["web"].root_disk_mib(), 4 * 1024);
+    }
+
+    #[test]
+    fn size_units_are_parsed_like_mem_limit() {
+        for (raw, mib) in [
+            ("512m", 512),
+            ("1g", 1024),
+            ("1.5g", 1536),
+            ("2gb", 2048),
+            ("10GiB", 10 * 1024),
+            ("512MiB", 512),
+            ("1t", 1024 * 1024),
+            ("1048576", 1),
+        ] {
+            let yaml = format!(
+                "name: demo\nservices:\n  web:\n    image: alpine\n    storage_opt:\n      size: \"{raw}\"\n"
+            );
+            let doc = parse_stack_yaml(&yaml).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(doc.services["web"].root_disk_mib(), mib, "{raw}");
+        }
+    }
+
+    #[test]
+    fn zero_and_oversized_sizes_are_rejected() {
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir\n    size: 0",
+            "      - name: data\n        target: /data",
+        ))
+        .unwrap_err();
+        assert!(err.contains("size must be greater than 0"), "{err}");
+
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir\n    size: 2TiB",
+            "      - name: data\n        target: /data",
+        ))
+        .unwrap_err();
+        assert!(err.contains("maximum of"), "{err}");
+
+        let err = parse_stack_yaml(
+            "name: demo\nservices:\n  web:\n    image: alpine\n    storage_opt:\n      size: 0\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("storage_opt.size"), "{err}");
+        assert!(err.contains("greater than 0"), "{err}");
+
+        // A malformed unit is a parse error, not a silent default.
+        let err = parse_stack_yaml(
+            "name: demo\nservices:\n  web:\n    image: alpine\n    storage_opt:\n      size: 10qb\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("unsupported size unit"), "{err}");
+    }
+
+    #[test]
+    fn mount_size_is_not_a_user_facing_yaml_key() {
+        // The propagated mount size is an internal field; the declared size
+        // lives on the volume. `deny_unknown_fields` keeps the mount strict.
+        let err = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir",
+            "      - name: data\n        target: /data\n        size: 1GiB",
+        ))
+        .unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn with_volume_sizes_propagates_the_declared_size() {
+        let doc = parse_stack_yaml(&volume_stack(
+            "  data:\n    kind: dir\n    size: 20GiB",
+            "      - name: data\n        target: /data",
+        ))
+        .unwrap();
+        let mut spec = doc.services["web"].clone();
+        spec.with_volume_sizes(&doc.volumes);
+        assert_eq!(spec.volumes[0].size_mib, 20 * 1024);
+        assert_eq!(spec.volumes[0].name, "data");
+        assert_eq!(spec.volumes[0].mount, "/data");
+    }
+
+    #[test]
+    fn stored_spec_with_resolved_ports_round_trips() {
+        // The server stores specs as JSON after resolving host ports; every
+        // optional key serializes as `null` and must read back.
+        let doc = parse_stack_yaml(
+            "name: s\nservices:\n  web:\n    image: alpine\n    ports:\n      - \"3001\"\n      - \"app.example.com:3002\"\n",
+        )
+        .unwrap();
+        let mut spec = doc.services["web"].clone();
+        spec.ports[0].published = 10000;
+        spec.ports[1].published = 10001;
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ServiceSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ports[0].published, 10000);
+        assert_eq!(back.ports[0].hostname, None);
+        assert_eq!(back.ports[1].hostname.as_deref(), Some("app.example.com"));
     }
 }

@@ -9,10 +9,7 @@ use serde_json::json;
 
 /// Desired Ingress routes derived from stack YAML + instance placement (D7).
 /// Ready/file status is agent-local (`catalog.json` under `--ingress-config-dir`).
-pub async fn list_ingress(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<serde_json::Value> {
+pub async fn list_ingress(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
     let stacks = state.store.list_stacks().await.map_err(ApiError::store)?;
     let instances = state
         .store

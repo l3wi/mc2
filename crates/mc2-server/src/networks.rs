@@ -10,12 +10,25 @@ use anyhow::{Context, Result};
 use mc2_api::ServiceSpec;
 use mc2_store::{InstanceRecord, Store};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// `GET /v1/networks` response.
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworksView {
     pub networks: Vec<NetworkView>,
+    /// Every claimed `expose` port and its owning stack/service. Claims are
+    /// exclusive server-wide, so this is the authoritative owner map.
+    pub exposed_ports: Vec<NetworkPortClaimView>,
+}
+
+/// One claimed east–west port (`expose`) and its owner.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPortClaimView {
+    pub port: u16,
+    pub stack: String,
+    pub service: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,8 +82,13 @@ fn instance_networks(stack: &str, spec: &ServiceSpec) -> BTreeSet<String> {
 
 /// Resolve network desired state for one instance given the node's instance set.
 ///
-/// Generates a default-allow mesh: an edge to every peer service (any stack)
-/// that shares a network, for every guest port that peer exposes.
+/// Generates a default-allow mesh: an edge to the **owner** of every exposed
+/// port on a network this instance shares, plus an edge to its own service's
+/// exposed ports (replicas of one service reach each other). Exposed ports are
+/// exclusive server-wide (enforced at apply), so a port has exactly one owner
+/// and its guest `gateway:P` → host `127.0.0.1:P` splice cannot be shared with
+/// another stack. Output is sorted (`BTreeMap`/`BTreeSet`) so the plan — and the
+/// recreate hash derived from it — is independent of store iteration order.
 pub fn build_network_desired(
     inst: &InstanceRecord,
     spec: &ServiceSpec,
@@ -88,99 +106,55 @@ pub fn build_network_desired(
 
     let my_networks = instance_networks(&inst.stack, spec);
 
-    // Index peers by service → instances (prefer lowest ordinal ready).
-    let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
-    for p in peers {
-        by_service.entry(p.service.clone()).or_default().push(p);
+    #[derive(Default)]
+    struct Owner {
+        ports: BTreeSet<u16>,
+        networks: BTreeSet<String>,
     }
-    for list in by_service.values_mut() {
-        list.sort_by_key(|i| i.ordinal);
+
+    // Index every exposed port by its owning `(stack, service)`.
+    let mut owners: BTreeMap<(String, String), Owner> = BTreeMap::new();
+    for p in peers {
+        let Ok(pspec) = serde_json::from_str::<ServiceSpec>(&p.spec_json) else {
+            continue;
+        };
+        if pspec.expose.is_empty() {
+            continue;
+        }
+        let owner = owners
+            .entry((p.stack.clone(), p.service.clone()))
+            .or_default();
+        for e in &pspec.expose {
+            owner.ports.insert(e.port);
+        }
+        owner.networks.extend(instance_networks(&p.stack, &pspec));
     }
 
     let mut allows = Vec::new();
-    for (service, list) in by_service {
-        if service == inst.service {
-            continue; // no self-edges
+    for ((owner_stack, owner_service), owner) in &owners {
+        let is_self = owner_stack == &inst.stack && owner_service == &inst.service;
+        if !is_self && my_networks.is_disjoint(&owner.networks) {
+            continue; // no shared network → not reachable
         }
-        // Shared networks across this peer service's instances.
-        let shared: Vec<(String, String)> = list
-            .iter()
-            .filter_map(|p| {
-                let Ok(pspec) = serde_json::from_str::<ServiceSpec>(&p.spec_json) else {
-                    return None;
-                };
-                let theirs = instance_networks(&p.stack, &pspec);
-                let common: Vec<&String> = my_networks.intersection(&theirs).collect();
-                if common.is_empty() {
-                    return None;
-                }
-                // Same stack → default network (back-compat DNS). Cross-stack →
-                // a shared named network.
-                let net = if p.stack == inst.stack {
-                    inst.stack.clone()
-                } else {
-                    common
-                        .iter()
-                        .find(|n| ***n != inst.stack)
-                        .map(|n| (*n).clone())
-                        .unwrap_or_else(|| inst.stack.clone())
-                };
-                Some((p.id.clone(), net))
-            })
-            .collect();
-        if shared.is_empty() {
-            continue;
-        }
-
-        // Reachable ports: union of expose ports across the service's instances.
-        let mut ports: BTreeSet<u16> = BTreeSet::new();
-        for p in &list {
-            if let Ok(pspec) = serde_json::from_str::<ServiceSpec>(&p.spec_json) {
-                for e in &pspec.expose {
-                    ports.insert(e.port);
-                }
-            }
-        }
-        if ports.is_empty() {
-            continue;
-        }
-
-        // Backend: lowest ordinal that is bound and not Failed/Stopped.
-        let backend = list
-            .iter()
-            .copied()
-            .find(|i| {
-                i.node_id.is_some()
-                    && i.phase != "Failed"
-                    && i.phase != "Stopped"
-                    && i.phase != "Pending"
-            })
-            .or_else(|| list.first().copied());
-
-        let (backend_instance_id, backend_node_id, backend_ordinal, backend_local) = match backend {
-            Some(b) => {
-                let nid = b.node_id.clone().unwrap_or_default();
-                let local = match (&inst.node_id, &b.node_id) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => false,
-                };
-                (b.id.clone(), nid, b.ordinal, local)
-            }
-            None => (String::new(), String::new(), 0, false),
+        // Same stack keeps the default `<stack>` DNS name (back-compat DNS);
+        // a cross-stack peer is reached through a shared named network.
+        let net = if owner_stack == &inst.stack {
+            inst.stack.clone()
+        } else {
+            owner
+                .networks
+                .intersection(&my_networks)
+                .find(|n| **n != inst.stack)
+                .cloned()
+                .unwrap_or_else(|| inst.stack.clone())
         };
-
-        let net = shared[0].1.clone();
-        for port in ports {
+        for port in &owner.ports {
             allows.push(NetworkAllowDesired {
-                to_service: service.clone(),
-                port,
+                to_service: owner_service.clone(),
+                port: *port,
                 protocol: "tcp".into(),
-                fqdn: mc2_api::network_fqdn(&net, &service),
-                short_name: service.clone(),
-                backend_instance_id: backend_instance_id.clone(),
-                backend_node_id: backend_node_id.clone(),
-                backend_local,
-                backend_ordinal,
+                fqdn: mc2_api::network_fqdn(&net, owner_service),
+                short_name: owner_service.clone(),
             });
         }
     }
@@ -191,10 +165,17 @@ pub fn build_network_desired(
 /// Aggregate the desired set into per-network views.
 pub async fn build_networks_view(store: &dyn Store) -> Result<NetworksView> {
     let mut acc: BTreeMap<String, NetworkAcc> = BTreeMap::new();
+    // port → owning (stack, service); BTreeMap keeps the claims sorted.
+    let mut claims: BTreeMap<u16, (String, String)> = BTreeMap::new();
     for inst in store.list_instances().await.context("list instances")? {
         let Ok(spec) = serde_json::from_str::<ServiceSpec>(&inst.spec_json) else {
             continue;
         };
+        for e in &spec.expose {
+            claims
+                .entry(e.port)
+                .or_insert_with(|| (inst.stack.clone(), inst.service.clone()));
+        }
         let expose_ports: Vec<u16> = spec.expose.iter().map(|e| e.port).collect();
         let ports: Vec<NetworkPortView> = spec
             .ports
@@ -232,6 +213,14 @@ pub async fn build_networks_view(store: &dyn Store) -> Result<NetworksView> {
                 instances: a.instances,
             })
             .collect(),
+        exposed_ports: claims
+            .into_iter()
+            .map(|(port, (stack, service))| NetworkPortClaimView {
+                port,
+                stack,
+                service,
+            })
+            .collect(),
     })
 }
 
@@ -258,7 +247,7 @@ fn network_instance_view(
 mod tests {
     use super::*;
     use mc2_api::{ExposeSpec, NetworkSpec, PortSpec, ServiceSpec};
-    use mc2_store::MemoryStore;
+    use mc2_store::{MemoryStore, StackPlan};
 
     fn spec_json(networks: &[&str], expose: &[u16], ports: &[(u16, u16)]) -> String {
         let s = ServiceSpec {
@@ -286,6 +275,7 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            storage_opt: None,
             expose: expose
                 .iter()
                 .map(|&p| ExposeSpec {
@@ -308,29 +298,30 @@ mod tests {
     async fn aggregates_default_and_named_networks() {
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("shop", "{}", "yaml").await.unwrap();
-        store.upsert_stack("billing", "{}", "yaml").await.unwrap();
-
         // shop/db on named `backend` (no publish); shop/web on `backend` + a port.
         store
-            .reconcile_service_replicas_multi(
+            .commit_stack_plan(&StackPlan::replicas(
                 "shop",
-                "db",
-                &[spec_json(&["backend"], &[5432], &[])],
-            )
-            .await
-            .unwrap();
-        store
-            .reconcile_service_replicas_multi(
-                "shop",
-                "web",
-                &[spec_json(&["backend"], &[8080], &[(18080, 8000)])],
-            )
+                "{}",
+                "yaml",
+                vec![
+                    ("db", vec![spec_json(&["backend"], &[5432], &[])]),
+                    (
+                        "web",
+                        vec![spec_json(&["backend"], &[8080], &[(18080, 8000)])],
+                    ),
+                ],
+            ))
             .await
             .unwrap();
         // billing/worker: no named networks → default only.
         store
-            .reconcile_service_replicas_multi("billing", "worker", &[spec_json(&[], &[], &[])])
+            .commit_stack_plan(&StackPlan::replicas(
+                "billing",
+                "{}",
+                "yaml",
+                vec![("worker", vec![spec_json(&[], &[], &[])])],
+            ))
             .await
             .unwrap();
 
@@ -366,6 +357,14 @@ mod tests {
         let billing_default = find(&view, "billing");
         assert_eq!(billing_default.kind, "default");
         assert_eq!(billing_default.instances.len(), 1);
+
+        // Every claimed port names its owner, sorted.
+        let claims: Vec<(u16, &str, &str)> = view
+            .exposed_ports
+            .iter()
+            .map(|c| (c.port, c.stack.as_str(), c.service.as_str()))
+            .collect();
+        assert_eq!(claims, vec![(5432, "shop", "db"), (8080, "shop", "web")]);
     }
 }
 
@@ -393,6 +392,7 @@ mod desired_tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -428,6 +428,7 @@ mod desired_tests {
             message: None,
             spec_json: serde_json::to_string(spec).unwrap(),
             healthy: false,
+            applied_hash: None,
             updated_at: "".into(),
         }
     }
@@ -468,7 +469,6 @@ mod desired_tests {
             edges,
             vec![("db".to_string(), 5432), ("redis".to_string(), 6379)]
         );
-        assert!(plan.allows.iter().all(|a| a.backend_local));
         let db_edge = plan.allows.iter().find(|a| a.to_service == "db").unwrap();
         let redis_edge = plan
             .allows
@@ -479,53 +479,105 @@ mod desired_tests {
         assert_eq!(redis_edge.fqdn, "redis.shop.svc.mc2");
     }
 
+    /// B7: a service *without* `expose` still gets an egress edge (and DNS) for
+    /// every peer port on its networks — being a pure consumer is not a reason
+    /// to be isolated.
     #[test]
-    fn plan_skips_self_and_portless_peers() {
-        let web = bare_spec();
+    fn plan_gives_a_portless_consumer_its_peer_edges() {
         let worker = bare_spec(); // no expose
-        let web_inst = inst("i-web", "web", Some("n1"), "Running", &web);
+        let mut db = bare_spec();
+        db.expose = vec![ExposeSpec {
+            port: 5432,
+            protocol: "tcp".into(),
+            name: None,
+        }];
         let worker_inst = inst("i-worker", "worker", Some("n1"), "Running", &worker);
+        let db_inst = inst("i-db", "db", Some("n1"), "Running", &db);
 
-        let plan = build_network_desired(&web_inst, &web, &[web_inst.clone(), worker_inst.clone()]);
-        // No self edge, no edge to a service that exposes nothing.
-        assert!(plan.allows.is_empty(), "{:?}", plan.allows);
+        let plan = build_network_desired(
+            &worker_inst,
+            &worker,
+            &[worker_inst.clone(), db_inst.clone()],
+        );
+        assert!(plan.exposes.is_empty());
+        assert_eq!(plan.allows.len(), 1, "{:?}", plan.allows);
+        assert_eq!(plan.allows[0].to_service, "db");
+        assert_eq!(plan.allows[0].port, 5432);
+        assert_eq!(plan.allows[0].fqdn, "db.shop.svc.mc2");
     }
 
+    /// B7: replicas of one service can reach their own service's ports (the
+    /// shared splice round-robins across them).
     #[test]
-    fn plan_marks_cross_node_when_peer_remote() {
-        let web = bare_spec();
+    fn plan_includes_same_service_replicas() {
         let mut db = bare_spec();
+        db.scale = 2;
         db.expose = vec![ExposeSpec {
             port: 5432,
             protocol: "tcp".into(),
             name: None,
         }];
-        let web_inst = inst("i-web", "web", Some("n1"), "Running", &web);
-        let db_remote = inst("i-db", "db", Some("n2"), "Running", &db);
-
-        let plan = build_network_desired(&web_inst, &web, &[db_remote]);
-        assert_eq!(plan.allows.len(), 1);
-        assert_eq!(plan.allows[0].backend_instance_id, "i-db");
-        assert!(!plan.allows[0].backend_local, "backend on a different node");
-    }
-
-    #[test]
-    fn plan_prefers_lowest_ordinal_backend() {
-        let web = bare_spec();
-        let mut db = bare_spec();
-        db.expose = vec![ExposeSpec {
-            port: 5432,
-            protocol: "tcp".into(),
-            name: None,
-        }];
-        let web_inst = inst("i-web", "web", Some("n1"), "Running", &web);
-        let db0 = inst("i-db-0", "db", Some("n1"), "Scheduled", &db);
+        let db0 = inst("i-db-0", "db", Some("n1"), "Running", &db);
         let db1 = inst("i-db-1", "db", Some("n1"), "Running", &db);
 
-        let plan = build_network_desired(&web_inst, &web, &[db0, db1]);
-        assert_eq!(plan.allows.len(), 1);
-        assert_eq!(plan.allows[0].backend_instance_id, "i-db-0");
-        assert!(plan.allows[0].backend_local);
+        let plan = build_network_desired(&db0, &db, &[db0.clone(), db1]);
+        assert_eq!(plan.allows.len(), 1, "{:?}", plan.allows);
+        assert_eq!(plan.allows[0].to_service, "db");
+        assert_eq!(plan.allows[0].port, 5432);
+        assert_eq!(plan.allows[0].fqdn, "db.shop.svc.mc2");
+    }
+
+    /// B1: the plan (and therefore the recreate hash) must not depend on the
+    /// order peers happen to arrive in.
+    #[test]
+    fn plan_is_order_invariant() {
+        let mut web = bare_spec();
+        web.scale = 2;
+        web.expose = vec![ExposeSpec {
+            port: 8080,
+            protocol: "tcp".into(),
+            name: None,
+        }];
+        let mut db = bare_spec();
+        db.expose = vec![ExposeSpec {
+            port: 5432,
+            protocol: "tcp".into(),
+            name: None,
+        }];
+        let mut redis = bare_spec();
+        redis.expose = vec![ExposeSpec {
+            port: 6379,
+            protocol: "tcp".into(),
+            name: None,
+        }];
+
+        let peers = vec![
+            inst("i-web-1", "web", Some("n1"), "Running", &web),
+            inst("i-db", "db", Some("n1"), "Running", &db),
+            inst("i-redis", "redis", Some("n1"), "Running", &redis),
+            inst("i-web-0", "web", Some("n1"), "Running", &web),
+        ];
+        let reversed: Vec<_> = peers.iter().rev().cloned().collect();
+
+        let web_inst = peers[0].clone();
+        let a = build_network_desired(&web_inst, &web, &peers);
+        let b = build_network_desired(&web_inst, &web, &reversed);
+        let edges = |p: &mc2_runtime::DesiredNetwork| -> Vec<(String, u16)> {
+            p.allows
+                .iter()
+                .map(|x| (x.to_service.clone(), x.port))
+                .collect()
+        };
+        assert_eq!(edges(&a), edges(&b));
+        // Own service + both peers, sorted by owner.
+        assert_eq!(
+            edges(&a),
+            vec![
+                ("db".to_string(), 5432),
+                ("redis".to_string(), 6379),
+                ("web".to_string(), 8080),
+            ]
+        );
     }
 
     #[test]
@@ -546,7 +598,7 @@ mod desired_tests {
         let plan = build_network_desired(&web_inst, &web, std::slice::from_ref(&db_inst));
         assert_eq!(plan.allows.len(), 1);
         assert_eq!(plan.allows[0].fqdn, "db.backend.svc.mc2");
-        assert_eq!(plan.allows[0].backend_instance_id, "b-db");
+        assert_eq!(plan.allows[0].to_service, "db");
 
         // A peer that shares no network is not reachable (cross-stack isolation).
         let mut other = bare_spec();

@@ -285,6 +285,10 @@ pub(crate) async fn ssh_instance_show(args: SshInstanceArgs, conn: &Conn) -> Res
 }
 
 pub(crate) async fn ssh_instance_open(args: SshOpenArgs, conn: &Conn) -> Result<()> {
+    // Surface an active disk condition before opening a session into the VM.
+    if let Some(record) = crate::cmd::observe::fetch_instance(conn, &args.id).await {
+        crate::cmd::observe::eprint_disk_conditions(&record);
+    }
     let url = format!(
         "{}/v1/instances/{}/ssh",
         conn.url.trim_end_matches('/'),

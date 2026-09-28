@@ -21,6 +21,15 @@ async fn status_requires_valid_bearer() {
     let (unauth, _) = cluster.get_json("/v1/status", None).await.unwrap();
     assert_eq!(unauth, StatusCode::UNAUTHORIZED);
 
+    // A5: `/v1/volumes` is behind the same middleware (it used to be open).
+    let (volumes_unauth, _) = cluster.get_json("/v1/volumes", None).await.unwrap();
+    assert_eq!(volumes_unauth, StatusCode::UNAUTHORIZED);
+    let (volumes_ok, _) = cluster
+        .get_json("/v1/volumes", Some(&cluster.api_token))
+        .await
+        .unwrap();
+    assert_eq!(volumes_ok, StatusCode::OK);
+
     let (bad, _) = cluster
         .get_json("/v1/status", Some("definitely-not-the-token"))
         .await

@@ -42,14 +42,16 @@ async fn apply_schedules_and_reports_running() {
 
     // Desired set resolves for the local node (what the node loop would run).
     let key = SecretsKey::load_file(&cluster.data_dir.join("secrets.key")).unwrap();
-    let (desired, routes) = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
+    let set = build_desired_set(cluster.store.clone(), &key, &cluster.local_node_id)
         .await
         .expect("build desired set");
-    assert_eq!(desired.len(), 2);
-    assert!(routes.is_empty());
+    assert_eq!(set.sandboxes.len(), 2);
+    assert!(set.failures.is_empty());
+    assert!(set.ingress_routes.is_empty());
+    let desired = set.sandboxes;
     let mut names: Vec<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
     names.sort();
-    assert_eq!(names, vec!["demo-web-0", "demo-web-1"]);
+    assert_eq!(names, vec!["demo--web--0", "demo--web--1"]);
 
     // Simulate the node loop's store writes after SDK reconcile.
     for d in &desired {

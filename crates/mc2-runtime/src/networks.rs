@@ -15,6 +15,14 @@ pub struct NetworkExposeDesired {
     pub protocol: String,
 }
 
+/// One east–west reachability edge in a sandbox's create-time plan.
+///
+/// `to_service` is the **owner** of the exposed port (the service that declares
+/// it), which may be the instance's own service (replicas of one service reach
+/// each other) or a peer on a shared network. Exposed ports are exclusive
+/// server-wide, so the port alone identifies the shared splice that serves it.
+/// Backend identity/placement is deliberately not part of the plan: it churns
+/// without changing the create-time policy (see `desired_recreate_hash`).
 #[derive(Debug, Clone)]
 pub struct NetworkAllowDesired {
     pub to_service: String,
@@ -22,10 +30,6 @@ pub struct NetworkAllowDesired {
     pub protocol: String,
     pub fqdn: String,
     pub short_name: String,
-    pub backend_instance_id: String,
-    pub backend_node_id: String,
-    pub backend_local: bool,
-    pub backend_ordinal: u32,
 }
 
 /// Observed network state for one instance (reported to the store).
@@ -87,9 +91,9 @@ impl NetworkPhase {
 
 /// Guest ports that need narrow Host egress allows at create time.
 ///
-/// Includes all mesh edge ports (even if backend is not yet local) so a later
-/// co-location does not require sandbox recreate. Cross-node remains failed at
-/// the splice layer.
+/// Sorted and de-duplicated: the create-time policy is a set of ports (the
+/// guest's `gateway:P` maps to host `127.0.0.1:P`, so the port — not the peer
+/// name — is the identity).
 pub fn network_host_allow_ports(network: &DesiredNetwork) -> Vec<u16> {
     let mut ports: Vec<u16> = network.allows.iter().map(|a| a.port).collect();
     ports.sort_unstable();

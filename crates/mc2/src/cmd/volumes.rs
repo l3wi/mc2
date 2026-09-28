@@ -28,10 +28,20 @@ pub(crate) async fn volume_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         return Ok(());
     }
     let mut t = crate::table::Table::new()
-        .header(["STACK", "VOLUME", "SIZE", "PATH"])
-        .right_align([2]);
+        .header(["STACK", "VOLUME", "SIZE", "USED", "PATH"])
+        .right_align([2, 3]);
     for v in views {
-        t = t.row([v.stack, v.volume, format!("{} MiB", v.size_mib), v.path]);
+        let limit = v
+            .limit_mib
+            .map(mc2_api::disk::fmt_size)
+            .unwrap_or_else(|| "-".into());
+        t = t.row([
+            v.stack,
+            v.volume,
+            limit,
+            mc2_api::disk::fmt_size(v.used_mib),
+            v.path,
+        ]);
     }
     print!("{}", t.render());
     Ok(())

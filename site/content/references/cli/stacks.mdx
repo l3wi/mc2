@@ -20,9 +20,18 @@ and converges instances toward it.
 
 - **Idempotent.** Re-applying the same (or a newer) file converges replicas
   toward the declared state; it does not create duplicates.
+- **All-or-nothing.** An apply either publishes the whole file or nothing at
+  all. A port conflict, a capacity or disk-limit overrun, a validation error
+  or a store failure leaves the previously applied stack exactly as it was —
+  there is no half-applied state.
+- **The file is the whole desired state.** A service you deleted from the YAML
+  is torn down on the next `up`, and a lower `scale` deletes the replicas
+  above the new count. Replicas that remain keep their identity, host ports and
+  placement. `up` never deletes named volumes — that is `down`'s job.
 - **`name` is optional.** If the stack file omits `name:`, it is filled in
-  from the file path (sanitized); a file literally named `stack.yaml` takes
-  its parent directory's name.
+  from the file path, sanitized to the stack-name grammar (lowercased,
+  `.`/spaces → `-`, `--` collapsed, ≤ 40 characters); a file literally named
+  `stack.yaml` takes its parent directory's name.
 - **The parser is canonical.** The old k8s-style `apiVersion`/`kind`/
   `metadata` wrapper and keys like `replicas`/`resources` are **rejected**, not
   filled in. See [Stack overview](/references/stack/overview).

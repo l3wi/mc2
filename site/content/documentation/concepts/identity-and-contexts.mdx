@@ -39,8 +39,8 @@ each context with its mode; `mc2 status` reports which mode is active.
 
 ## Local vs remote
 
-- **Local** — loopback API (`127.0.0.1` / `localhost` / `::1`); a token is
-  optional (`--no-auth` lab installs).
+- **Local** — loopback API (`127.0.0.1` / `localhost` / `::1`); the CLI can
+  omit a token, and a server started with `--no-auth` accepts it.
 - **Remote** — any other host; requires **https + an API key**. Plaintext
   `http://` is refused unless you opt in with `--allow-insecure-http` /
   `MC2_ALLOW_INSECURE_HTTP=1`.
@@ -54,11 +54,13 @@ Use the wizard on each machine (`mc2 setup` never starts the server or Traefik):
 
 1. **On the server:** `mc2 setup server`. Accept the defaults or override
    them (bind, data dir, auth, public hostname, Traefik). Start the printed
-   `mc2 server …` command and save the one-time API token. With a public
-   hostname, the control plane itself appears in the Traefik catalog
-   (`https://mc2.example.com`).
-2. **On the client:** `mc2 setup client`. Paste the URL and token; it saves
-   and activates the context and can verify the live connection.
+   `mc2 server …` command and save the one-time API token (printed to stderr
+   on a TTY, or written to `<data-dir>/bootstrap-token` at 0600 otherwise).
+   With a public hostname, the control plane itself appears in the Traefik
+   catalog (`https://mc2.example.com`).
+2. **On the client:** `mc2 setup client`. Paste the URL and token (leave the
+   token blank for a `--no-auth` server); it saves and activates the context
+   and can verify the live connection.
 
 The equivalent hand-typed commands are
 `mc2 server --public-hostname mc2.example.com …` and
@@ -71,8 +73,8 @@ See [Manage a remote server](/documentation/guides/manage-a-remote-server).
   env, or the contexts file.
 - **Remote means https + token.** There is no "trust me, it's fine" remote
   over plaintext.
-- **One-time bootstrap token.** The API token prints once; keep it in your
-  secrets manager, not the stack file.
+- **One-time bootstrap token.** The API token is shown once; keep it in your
+  secrets manager, not the stack file. Lost it? `mc2 server token rotate`.
 
 ## Deeper
 

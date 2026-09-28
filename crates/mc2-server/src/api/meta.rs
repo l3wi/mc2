@@ -14,10 +14,7 @@ pub async fn health() -> impl axum::response::IntoResponse {
     }))
 }
 
-pub async fn status(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<ClusterStatus> {
+pub async fn status(State(state): State<AppState>) -> ApiResult<ClusterStatus> {
     let counts = state.store.cluster_counts().await.map_err(|e| {
         tracing::error!(error = %e, "cluster_counts");
         ApiError::internal("store error")
@@ -86,10 +83,7 @@ async fn resource_status(state: &AppState) -> mc2_api::ResourceStatus {
     }
 }
 
-pub async fn list_nodes(
-    State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
-) -> ApiResult<Vec<NodeView>> {
+pub async fn list_nodes(State(state): State<AppState>) -> ApiResult<Vec<NodeView>> {
     let nodes = state.store.list_nodes().await.map_err(|e| {
         tracing::error!(error = %e, "list_nodes");
         ApiError::internal("store error")
@@ -106,7 +100,6 @@ pub async fn list_nodes(
                 cpus: n.cpus,
                 memory_mib: n.memory_mib,
                 status: n.status,
-                last_heartbeat: n.last_heartbeat,
                 labels,
                 created_at: n.created_at,
             }

@@ -96,6 +96,11 @@ ssh -p 2222 root@127.0.0.1
   add-key`; an empty list means *all* registered keys authenticate.
 - **TCP ingress needs a fixed port.** `ssh.port: 0` (auto) can't be routed
   by Traefik.
+- **Sessions are capped, not idled out.** `--max-ssh-sessions` (64) and
+  `--max-ssh-sessions-per-listener` (16) close connections beyond the cap,
+  and a client has 30 s to finish the handshake. There is **no idle
+  timeout**, so a quiet `tmux` or agent session stays connected; accepted
+  sockets use TCP keepalive to notice a peer that vanished.
 
 ## Next
 

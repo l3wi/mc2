@@ -48,7 +48,7 @@ replica instead. Allocations are stable across re-applies.
 non-zero. Kill one from inside and watch it come back:
 
 ```bash
-mc2 exec shop/web/1 'kill 1'   # simulate a crash
+mc2 exec shop/web/1 /bin/sh -c 'kill 1'   # simulate a crash
 mc2 ps                          # replica recreated, not left dead
 ```
 
@@ -59,13 +59,17 @@ mc2 ps                          # replica recreated, not left dead
 Each replica is addressable as `<stack>/<service>/<ordinal>`:
 
 ```bash
-mc2 exec shop/web/2 'echo third replica'
+mc2 exec shop/web/2 /bin/sh -c 'echo third replica'
 mc2 logs shop/web/0 --follow
 ```
 
 ## Key behaviors
 
 - **Distinct host ports per replica** — no port bookkeeping.
+- **Scale down deletes the extras.** Lowering `scale` removes the replicas
+  above the new count (and frees their host ports); the remaining ones keep
+  their identity, ports and placement. `mc2 up` is all-or-nothing, so a
+  rejected apply leaves the running stack untouched.
 - **Ingress targets replica 0.** Routes for a scaled service point at
   ordinal 0's port.
 - **`restart` + reconcile = self-healing.** Without it, a crash surfaces as

@@ -6,14 +6,23 @@ use crate::stack::schema::{
 };
 use serde::{Deserialize, Deserializer, Serializer};
 
-/// Serialize `mem_limit_mib` as **bytes** (matching [`de_mem_limit`], which
-/// treats a bare number as bytes per compose semantics). This keeps a
-/// `ServiceSpec` JSON round-trip lossless: 512 MiB → `"mem_limit": 536870912`.
-pub(crate) fn se_mem_limit<S>(mib: &u64, s: S) -> Result<S::Ok, S::Error>
+use super::validate::validate_hostname;
+
+/// Serialize a MiB size as **bytes** (matching the byte-size deserializers,
+/// which treat a bare number as bytes per compose semantics), so a
+/// `size` round-trip through JSON is lossless: 10 GiB → `10737418240`.
+pub(crate) fn se_disk_size_mib<S>(mib: &u64, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     s.serialize_u64(mib.saturating_mul(1024 * 1024))
+}
+
+pub(crate) fn se_mem_limit<S>(mib: &u64, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    se_disk_size_mib(mib, s)
 }
 
 pub(crate) fn de_expose<'de, D>(d: D) -> Result<Vec<ExposeSpec>, D::Error>
@@ -80,8 +89,38 @@ where
     })
 }
 
-/// Parse compose `mem_limit` (`512m`, `1g`, `1.5g`, or bytes) → MiB.
-pub(crate) fn de_mem_limit<'de, D>(d: D) -> Result<u64, D::Error>
+/// Parse a compose byte size (`512m`, `1g`, `1.5g`, `10GiB`, bare bytes) → MiB.
+pub(crate) fn parse_byte_size_mib(raw: &str) -> Result<u64, String> {
+    let s = raw.trim().to_ascii_lowercase();
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let mult = match unit.trim() {
+        "" | "b" => 1.0 / (1024.0 * 1024.0),
+        "k" | "kb" | "kib" => 1.0 / 1024.0,
+        "m" | "mb" | "mib" => 1.0,
+        "g" | "gb" | "gib" => 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0,
+        other => {
+            return Err(format!(
+                "unsupported size unit {other:?} (use b, k, m, g, t, or the `ib` forms)"
+            ))
+        }
+    };
+    let val: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {raw:?}"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!(
+            "invalid size {raw:?}: must be a non-negative number"
+        ));
+    }
+    Ok((val * mult).ceil() as u64)
+}
+
+/// Shared byte-size visitor (`mem_limit`, `volumes.<name>.size`,
+/// `storage_opt.size`). A bare number is bytes, per compose semantics.
+pub(crate) fn de_byte_size_mib<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -90,27 +129,32 @@ where
     impl<'de> serde::de::Visitor<'de> for V {
         type Value = u64;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(f, "a memory size (e.g. 512m, 1g, or bytes)")
+            write!(f, "a byte size (e.g. 512m, 1g, 10GiB, or bytes)")
         }
         fn visit_u64<E: Error>(self, v: u64) -> Result<u64, E> {
             Ok(v.div_ceil(1024 * 1024))
         }
         fn visit_str<E: Error>(self, s: &str) -> Result<u64, E> {
-            let s = s.trim().to_ascii_lowercase();
-            let (num, mult) = if let Some(n) = s.strip_suffix('g') {
-                (n, 1024.0)
-            } else if let Some(n) = s.strip_suffix('m') {
-                (n, 1.0)
-            } else if let Some(n) = s.strip_suffix('k') {
-                (n, 1.0 / 1024.0)
-            } else {
-                (s.as_str(), 1.0 / (1024.0 * 1024.0))
-            };
-            let val: f64 = num.trim().parse().map_err(E::custom)?;
-            Ok((val * mult).ceil() as u64)
+            parse_byte_size_mib(s).map_err(E::custom)
         }
     }
     d.deserialize_any(V)
+}
+
+/// Parse compose `mem_limit` (`512m`, `1g`, `1.5g`, or bytes) → MiB.
+pub(crate) fn de_mem_limit<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_byte_size_mib(d)
+}
+
+/// Parse a disk size (`volumes.<name>.size`, `storage_opt.size`) → MiB.
+pub(crate) fn de_disk_size_mib<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_byte_size_mib(d)
 }
 
 /// Accept compose `environment` as a map or a `KEY=VALUE` list.
@@ -269,6 +313,18 @@ where
     })
 }
 
+/// Decode compose `healthcheck.test` into the argv MC2 execs in the guest.
+///
+/// Compose forms (B6a):
+/// - `test: "<script>"` — a bare string is `CMD-SHELL` in compose →
+///   `["/bin/sh", "-c", "<script>"]`;
+/// - `["CMD-SHELL", "<script>"]` → `["/bin/sh", "-c", "<script>"]`
+///   (the script must actually reach a shell);
+/// - `["CMD", a, b]` / `[a, b]` → `[a, b]` (the prefix is not an argv element);
+/// - `["NONE"]` → disabled (`None`);
+/// - `null` → disabled. The stored spec of `healthcheck: {disable: true}`
+///   serializes `"test": null`, so rejecting it would make that spec
+///   unreadable and wedge the scheduler.
 pub(crate) fn de_healthcheck_test<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -279,21 +335,39 @@ where
         Str(String),
         Seq(Vec<String>),
     }
-    let cmd: Vec<String> = match Test::deserialize(d)? {
-        Test::Str(s) => vec!["/bin/sh".into(), "-c".into(), s],
-        Test::Seq(seq) => seq,
+    let Some(test) = Option::<Test>::deserialize(d)? else {
+        return Ok(None);
     };
-    let mut cmd = cmd;
-    if let Some(first) = cmd.first().map(|s| s.to_ascii_lowercase()) {
-        if first == "cmd" || first == "cmd-shell" {
-            cmd.remove(0);
+    let cmd = match test {
+        Test::Str(script) => vec!["/bin/sh".to_string(), "-c".to_string(), script],
+        Test::Seq(seq) => {
+            let head = seq.first().map(|s| s.to_ascii_lowercase());
+            match head.as_deref() {
+                None => return Ok(None),
+                Some("none") => return Ok(None),
+                Some("cmd") => {
+                    let argv = &seq[1..];
+                    if argv.is_empty() {
+                        return Ok(None);
+                    }
+                    argv.to_vec()
+                }
+                Some("cmd-shell") => {
+                    let script = &seq[1..];
+                    if script.is_empty() {
+                        return Ok(None);
+                    }
+                    vec!["/bin/sh".to_string(), "-c".to_string(), script.join(" ")]
+                }
+                Some(_) => seq,
+            }
         }
-    }
+    };
     if cmd.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(cmd))
+        // `[]` or a leading `CMD` / `CMD-SHELL` with no argv: nothing to run.
+        return Ok(None);
     }
+    Ok(Some(cmd))
 }
 
 pub(crate) fn de_interval<'de, D>(d: D) -> Result<u32, D::Error>
@@ -330,8 +404,10 @@ where
     d.deserialize_any(V)
 }
 
-/// Parse a compose duration (`30s`, `1m`, `2h`, bare seconds) → seconds.
-/// Unlike `de_interval`, `0` is allowed (no timeout / no grace period).
+/// Parse a compose duration (`30s`, `1m`, `2h`, `100ms`, bare seconds) →
+/// **seconds**, rounded UP for a positive value so a sub-second duration never
+/// collapses to `0` (B6a: `timeout: 100ms` used to mean "no timeout").
+/// `0` (and anything not positive) stays `0`.
 pub(crate) fn de_duration<'de, D>(d: D) -> Result<u32, D::Error>
 where
     D: Deserializer<'de>,
@@ -360,19 +436,42 @@ where
                 (s.as_str(), 1.0)
             };
             let val: f64 = num.trim().parse().map_err(E::custom)?;
-            Ok((val * mult).max(0.0).round() as u32)
+            if !val.is_finite() {
+                return Err(E::custom("duration must be a finite number"));
+            }
+            if val <= 0.0 {
+                return Ok(0);
+            }
+            Ok((val * mult).ceil().max(1.0).min(u32::MAX as f64) as u32)
         }
     }
     d.deserialize_any(V)
+}
+
+/// Healthcheck `timeout`: [`de_duration`] with a mandatory deadline. An
+/// explicit `0` would mean "wait forever" and one hung probe would hang the
+/// guest exec it is waiting on, so it is rejected here; omit the key for the
+/// compose default (30s) instead.
+pub(crate) fn de_healthcheck_timeout<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let secs = de_duration(d)?;
+    if secs == 0 {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "healthcheck.timeout must be > 0; omit it for the 30s default",
+        ));
+    }
+    Ok(secs)
 }
 
 pub(crate) fn de_ports<'de, D>(d: D) -> Result<Vec<PortSpec>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    use serde::de::Error;
-    #[derive(Deserialize)]
-    #[serde(untagged)]
+    use serde::de::{Error, MapAccess, Visitor};
+
+    /// One `ports:` entry: the short compose string, or the long map form.
     enum Entry {
         Short(String),
         Long {
@@ -382,6 +481,54 @@ where
             hostname: Option<String>,
         },
     }
+
+    /// Keys the long form accepts. Anything else is a typo (a misspelt
+    /// `published` used to be silently dropped, yielding a random auto port),
+    /// so it is rejected by name rather than ignored.
+    const LONG_KEYS: &[&str] = &["target", "published", "protocol", "hostname"];
+
+    impl<'de> Deserialize<'de> for Entry {
+        fn deserialize<D2>(d: D2) -> Result<Self, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            struct EntryVisitor;
+            impl<'de> Visitor<'de> for EntryVisitor {
+                type Value = Entry;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    write!(f, "a port string like \"8080:80\" or a map with `target`")
+                }
+                fn visit_str<E: Error>(self, v: &str) -> Result<Entry, E> {
+                    Ok(Entry::Short(v.to_owned()))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Entry, A::Error> {
+                    let mut target = None;
+                    let mut published = None;
+                    let mut protocol = None;
+                    let mut hostname = None;
+                    while let Some(key) = map.next_key::<String>()? {
+                        match key.as_str() {
+                            "target" => target = Some(map.next_value::<u16>()?),
+                            "published" => published = Some(map.next_value::<u16>()?),
+                            // Optional keys accept `null` (the stored JSON form).
+                            "protocol" => protocol = map.next_value::<Option<String>>()?,
+                            "hostname" => hostname = map.next_value::<Option<String>>()?,
+                            other => return Err(A::Error::unknown_field(other, LONG_KEYS)),
+                        }
+                    }
+                    let target = target.ok_or_else(|| A::Error::missing_field("target"))?;
+                    Ok(Entry::Long {
+                        target,
+                        published,
+                        protocol,
+                        hostname,
+                    })
+                }
+            }
+            d.deserialize_any(EntryVisitor)
+        }
+    }
+
     let entries = Vec::<Entry>::deserialize(d)?;
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
@@ -396,6 +543,10 @@ where
                     return Err(Error::custom(
                         "ports entry: published must be a non-zero host port",
                     ));
+                }
+                if let Some(host) = &hostname {
+                    validate_hostname(host)
+                        .map_err(|e| Error::custom(format!("ports hostname: {e}")))?;
                 }
                 out.push(PortSpec {
                     published: published.unwrap_or(0),
@@ -433,6 +584,10 @@ where
                         )))
                     }
                 };
+                if let Some(host) = &hostname {
+                    validate_hostname(host)
+                        .map_err(|e| Error::custom(format!("ports hostname: {e}")))?;
+                }
                 out.push(PortSpec {
                     published,
                     target,

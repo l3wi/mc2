@@ -12,7 +12,10 @@ routes derived from stack `ingress:` + `ports:`. All require a bearer token.
 ## GET /v1/networks
 
 `GET /v1/networks` returns the server-wide network membership summary (default
-+ named networks) with member instances and ports.
++ named networks) with member instances and ports, plus `exposedPorts` — every
+claimed `expose` port with its owning `stack`/`service` (`{port, stack,
+service}`). Claims are exclusive server-wide, so this is the authoritative
+owner map; `mc2 network` renders it.
 
 ```
 GET /v1/networks

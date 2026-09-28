@@ -21,13 +21,19 @@ pub struct StackDeleteQuery {
 
 pub async fn apply_stack(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Json(body): Json<ApplyBody>,
 ) -> ApiResult<crate::ApplyResult> {
+    // Serialize applies (and stack deletes): planning reads the store (expose
+    // claims, port allocations, the instance diff) and the commit writes it, so
+    // concurrent applies could otherwise race a claim.
+    let _guard = state.apply_lock.lock().await;
     let cfg = ApplyConfig {
         limits: state.limits,
         data_dir: state.data_dir.clone(),
         volume_dir: state.volume_dir.clone(),
+        rest_port: state.rest_port,
+        allow_host_profile: state.allow_host_profile,
+        port_probe: state.port_probe,
     };
     match apply_stack_yaml(state.store.clone(), &cfg, &body.yaml).await {
         Ok(r) => Ok(Json(r)),
@@ -42,10 +48,11 @@ pub async fn apply_stack(
 /// removes the stack's named volumes (best-effort).
 pub async fn delete_stack(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(name): Path<String>,
     Query(params): Query<StackDeleteQuery>,
 ) -> Result<StatusCode, ApiError> {
+    // Same lock as apply: both mutate stack/instance rows the claim checks read.
+    let _guard = state.apply_lock.lock().await;
     // Snapshot the YAML before deleting so `--volumes` knows the volume names.
     let stack = state
         .store
@@ -87,11 +94,9 @@ pub async fn delete_stack(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Resolve the named-volume root: `--volume-dir` if set, else the msb default.
+/// Resolve the MC2 volume root: `--volume-dir` if set, else `~/.mc2/volumes`.
 pub(crate) fn volume_root(volume_dir: Option<&std::path::Path>) -> std::path::PathBuf {
-    volume_dir
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| crate::expand_data_dir("~/.microsandbox/volumes"))
+    mc2_runtime::volume_root(volume_dir)
 }
 
 #[cfg(test)]
@@ -99,11 +104,11 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use mc2_store::{MemoryStore, Store};
+    use mc2_store::{MemoryStore, StackPlan, Store};
     use tower::ServiceExt;
 
     use crate::api::router;
-    use crate::api::testing::test_state;
+    use crate::api::testing::test_state_open;
 
     /// ApplyConfig with no limits, for tests that exercise validation only.
     fn unlimited_cfg() -> ApplyConfig {
@@ -111,6 +116,9 @@ mod tests {
             limits: crate::ResourceLimits::default(),
             data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
             volume_dir: None,
+            rest_port: 0,
+            allow_host_profile: false,
+            port_probe: crate::probe_host_loopback_port,
         }
     }
 
@@ -149,12 +157,16 @@ services:
     async fn delete_stack_tears_down_and_reports_missing() {
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         store
-            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+            .commit_stack_plan(&StackPlan::replicas(
+                "demo",
+                "{}",
+                "yaml",
+                vec![("web", vec![r#"{"image":"x"}"#.to_string()])],
+            ))
             .await
             .unwrap();
-        let app = router(test_state(store.clone()));
+        let app = router(test_state_open(store.clone()));
 
         let res = app
             .clone()
@@ -200,14 +212,17 @@ services:
       - name: data
         target: /data
 "#;
-        store.upsert_stack("demo", "{}", yaml).await.unwrap();
+        store
+            .commit_stack_plan(&StackPlan::replicas("demo", "{}", yaml, []))
+            .await
+            .unwrap();
 
         let root = tempfile::tempdir().unwrap();
         let volume_path = root.path().join("mc2-demo--data");
         std::fs::create_dir_all(volume_path.join("sub")).unwrap();
         std::fs::write(volume_path.join("sub/keep.txt"), "x").unwrap();
 
-        let mut state = test_state(store);
+        let mut state = test_state_open(store);
         state.volume_dir = Some(root.path().to_path_buf());
         let app = router(state);
 
@@ -226,5 +241,42 @@ services:
             !root.path().join("mc2-demo--data").exists(),
             "volume dir removed"
         );
+    }
+
+    /// A port-allocation conflict is a user error: the REST layer must answer
+    /// 400, not 500 (C5).
+    #[tokio::test]
+    async fn allocation_errors_classify_as_bad_request() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        store
+            .commit_stack_plan(&StackPlan::replicas(
+                "app",
+                "{}",
+                "yaml",
+                vec![(
+                    "web",
+                    vec![r#"{"image":"alpine","ports":[{"published":8080,"target":80},{"published":8081,"target":81}]}"#.to_string()],
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let app = router(test_state_open(store));
+        let body = serde_json::json!({
+            "yaml": "name: app\nservices:\n  web:\n    image: alpine\n    ports: [\"8080:80\",\"8080:81\"]\n"
+        });
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/stacks:apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

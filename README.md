@@ -33,7 +33,9 @@ tooling, the parts msb leaves to you.
   `ingress` in a git-committable file. Unknown keys are rejected, not ignored.
 - **Desired state, converged.** `mc2 up` reconciles replicas, restart
   policies, and health-gated startup ordering (`depends_on: {db: {condition:
-  service_healthy}}`); `mc2 down` (alias `rm`, add `--volumes`) tears down. No run-once, no drift.
+  service_healthy}}`); `mc2 down` (alias `rm`, add `--volumes`) tears down. An
+  apply is all-or-nothing, and the file is the *whole* desired state: a service
+  you delete from it is torn down by the next `up`. No run-once, no drift.
 - **A local, private sandbox and app host.** The embedded SDK keeps every
   microVM on your box (or a server you control) — no account, no egress of
   your code or data. `mc2 exec` and `mc2 logs --follow` are built in.
@@ -72,14 +74,41 @@ tooling, the parts msb leaves to you.
 ## Install
 
 Prebuilt binaries for Linux (amd64/arm64) and macOS (Apple Silicon) ship with
-every release:
+every release. Download the archive for your platform, check it against the
+published SHA-256, then install it:
 
 ```bash
-curl -fsSL https://github.com/l3wi/mc2/releases/latest/download/mc2-installer.sh | sh
+VERSION=0.1.0                    # pin the version you verified
+TARGET=aarch64-apple-darwin      # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
+BASE="https://github.com/l3wi/mc2/releases/download/v${VERSION}"
+ARCHIVE="mc2-${TARGET}.tar.xz"
+
+curl -fsSL -O "$BASE/$ARCHIVE" -O "$BASE/$ARCHIVE.sha256"
+
+# Verify the download against the checksum published with the release.
+# macOS: use `shasum -a 256 -c -` instead of `sha256sum -c -`.
+grep -F "$ARCHIVE" "$ARCHIVE.sha256" | sha256sum -c -
+
+# Optional: verify the build's provenance with GitHub Artifact Attestations.
+# Requires the GitHub CLI; only releases published with attestations pass.
+gh attestation verify "$ARCHIVE" --repo l3wi/mc2
+
+tar -xJf "$ARCHIVE" && sudo install -m 0755 "mc2-${TARGET}/mc2" /usr/local/bin/mc2
+mc2 --version
 ```
 
-Or grab the checksummed `.tar.xz` for your platform from
-[releases](https://github.com/l3wi/mc2/releases).
+`VERSION` is pinned deliberately: `releases/latest` is a moving target, so an
+unpinned installer can silently replace the binary you verified.
+
+Prefer a script? A shell installer is published too — download it, read it,
+then run it:
+
+```bash
+VERSION=0.1.0
+curl -fsSLo mc2-installer.sh "https://github.com/l3wi/mc2/releases/download/v${VERSION}/mc2-installer.sh"
+less mc2-installer.sh   # inspect before running
+sh mc2-installer.sh
+```
 
 ## First run
 
@@ -97,14 +126,16 @@ one with `mc2 setup server` / `mc2 setup client`. The wizard only scaffolds
 config — it never starts the server or Traefik.
 
 1. **On the machine that will run VMs** choose **Server**. It asks for bind
-   address, data dir, API key on/off, optional public hostname / Traefik, then
+   address, data dir, optional public hostname / Traefik, then auth, then
    prints a copy-paste `mc2 server …` command and a finish-setup checklist.
-2. **Start the server** with that command. Auth is on by default; the API
-   token prints **once** on first bootstrap — save it. (`--no-auth` is lab
-   only.)
+2. **Start the server** with that command. Auth is on by default; the token is
+   **shown once** on first bootstrap — stderr on a TTY, else
+   `<data-dir>/bootstrap-token` (0600). Save it. (`--no-auth` runs this start
+   open; loopback only unless you add `--allow-unauthenticated-remote`.)
 3. **On your laptop** (or the same machine) run `mc2 setup` again and choose
-   **Client**. Paste the control-plane URL and token; it saves a named
-   context in `~/.mc2/config.toml` (0600) and can verify the connection.
+   **Client**. Paste the control-plane URL and token (leave the token blank
+   for a `--no-auth` server); it saves a named context in
+   `~/.mc2/config.toml` (0600) and can verify the connection.
 4. **Operate:**
 
 ```bash
@@ -125,6 +156,7 @@ bind `127.0.0.1:7443`; the CLI already talks to that loopback URL.
 
 ```bash
 # Terminal 1 — the orchestrator (one process)
+# Loopback bind: --no-auth is fine here. The token still exists in the store.
 mc2 server --no-auth
 
 # Terminal 2 — operator
@@ -133,6 +165,10 @@ mc2 up -f examples/01-hello-service/stack.yaml
 mc2 ps
 curl -s http://127.0.0.1:7443/v1/status
 ```
+
+Save the token from the first normal `mc2 server` start (stderr on a TTY, else
+`<data-dir>/bootstrap-token`). Lost it? `mc2 server token rotate --data-dir
+~/.mc2`.
 
 Optional OTLP:
 
@@ -148,12 +184,13 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | Command | Role |
 | ------- | ---- |
 | `mc2 server` | The orchestrator (SQLite, REST, scheduler, embedded msb runtime) |
+| `mc2 server token rotate [--data-dir d]` | Mint a new operator API token in place (the old one dies immediately) |
 | `mc2 node ls` | Show the local node (capacity, status) |
 | `mc2 up -f stack.yaml` | Bring up a stack (publish desired state, converge) |
 | `mc2 down <stack> [--volumes]` | Tear down a stack (instances + definition; volumes retained unless `--volumes`; `rm` is an alias) |
 | `mc2 config -f stack.yaml` | Validate and print a normalized stack config |
 | `mc2 ps [--stack s] [--service s]` | List instances / phases |
-| `mc2 exec <instance> <cmd…>` | Run a command inside a sandbox (piped stdin forwarded) |
+| `mc2 exec <instance> <cmd…>` | Run a command inside a sandbox (argv verbatim; raw stdin forwarded) |
 | `mc2 logs <instance> [--tail N] [--follow]` | Sandbox logs; `--follow` streams |
 | `mc2 status` | Health + version + counts (mode/context-aware) |
 | `mc2 network [name \| inst-ref]` | Network membership summary; `<name>` detail; `<stack>/<service>/<ordinal>` per-instance connectivity |

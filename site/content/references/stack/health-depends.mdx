@@ -10,12 +10,16 @@ startup. Both only matter *while the stack is coming up and running*.
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `test` | no | — | Probe command. String (`curl -f http://localhost/`) or list (`["CMD", "curl", "-f", "http://localhost/"]`); `CMD` / `CMD-SHELL` prefix is stripped. |
+| `test` | no | — | Probe command. A bare string (`curl -f http://localhost/`) is a shell command (`CMD-SHELL`); list form is `["CMD", "curl", "-f", "http://localhost/"]` or `["CMD-SHELL", "curl -f http://localhost/"]`. `CMD` / `CMD-SHELL` are prefixes, not argv elements — `CMD-SHELL` runs `/bin/sh -c <script>`. `["NONE"]` (or `test` omitted) disables the probe. |
 | `interval` | no | `30s` | Probe interval (e.g. `30s`, `1m`). |
-| `timeout` | no | `0` | Per-probe timeout (e.g. `5s`). `0` = no timeout. |
-| `retries` | no | `3` | Consecutive failures before the service is marked unhealthy / restarted. |
-| `start_period` | no | `0` | Grace period after start during which probe failures are ignored. |
+| `timeout` | no | `30s` | Per-probe deadline (e.g. `5s`). An explicit `0` is rejected — a probe always has a finite deadline. |
+| `retries` | no | `3` | Consecutive failures after `start_period` before the service is marked unhealthy / restarted. |
+| `start_period` | no | `0` | Grace period after start during which probe failures are not counted toward `retries`. |
 | `disable` | no | `false` | `true` disables the healthcheck entirely. |
+
+Durations accept `ms`/`s`/`m`/`h` or bare seconds. Sub-second values are
+rounded **up** to the next second, so `timeout: 100ms` means a 1s deadline
+(never `0`, which would be "no deadline").
 
 ```yaml
 services:
@@ -29,15 +33,20 @@ services:
 
 The `test` value may be given as a string or a list; the `CMD` / `CMD-SHELL`
 prefix is stripped, so `test: ["pg_isready"]` and `test: ["CMD", "pg_isready"]`
-are equivalent.
+are equivalent. A string form runs through a shell, so
+`test: "pg_isready -U postgres"` and
+`test: ["CMD-SHELL", "pg_isready -U postgres"]` are also equivalent.
 
 ## Healthcheck behavior
 
-When running, the node `exec`s `test` every `interval`. A passing probe sets
-the instance healthy (which gates `depends_on: {condition: service_healthy}`);
+When running, the node `exec`s `test` every `interval`. Each probe runs in its
+own task with the `timeout` as a deadline, so a guest command that hangs can
+never stall the node's reconcile loop (or any other instance). A passing probe
+sets the instance healthy (which gates `depends_on: {condition: service_healthy}`);
 `retries` consecutive failures past `start_period` mark it unhealthy — with
 `restart` set the sandbox is removed and recreated, otherwise it reports
-`Failed`.
+`Failed`. Failures during `start_period` are not counted, and a recreate resets
+both the counters and the grace period.
 
 <Callout type="note" title="Unhealthy ≠ dead">
   Marking unhealthy triggers recreate only when `restart` is set. Without it,

@@ -39,7 +39,7 @@ pub fn pick_node(
                 .get(&n.id)
                 .copied()
                 .unwrap_or((n.cpus, n.memory_mib));
-            (cpu as f64) >= spec.cpus && mem >= spec.mem_limit_mib
+            (cpu >= effective_vcpus(spec.cpus)) && mem >= spec.mem_limit_mib
         })
         .collect();
 
@@ -131,12 +131,42 @@ pub fn residual_capacity(
     res
 }
 
+/// vCPUs the sandbox runtime actually allocates for a declared `cpus`.
+///
+/// Mirrors `create_detached` in `mc2-runtime` (`msb_sdk.rs`), which hands the
+/// builder `(cpus.clamp(1.0, 255.0)) as u8`: values are clamped to `[1, 255]`
+/// and truncated to a whole vCPU. Reservation accounting must charge exactly
+/// this, or a stack could reserve less than its VMs take. A non-finite `cpus`
+/// can never create a VM (validation rejects it), so charge the minimum
+/// rather than letting the NaN → 0 cast reserve nothing.
+pub fn effective_vcpus(cpus: f64) -> u32 {
+    if !cpus.is_finite() {
+        return 1;
+    }
+    u32::from(cpus.clamp(1.0, 255.0) as u8)
+}
+
 /// Cluster-wide reserved CPU/memory across bound instances (same accounting as
 /// [`residual_capacity`]). Used for apply-time budget checks.
 pub fn reserved_capacity(instances: &[InstanceRecord]) -> (u32, u64) {
+    reserved_capacity_excluding(instances, None)
+}
+
+/// Reserved CPU/memory of every bound instance **not** belonging to `exclude`.
+///
+/// An apply replaces that stack's instances wholesale, so their current
+/// reservation must not be counted alongside the incoming document; pass the
+/// stack being applied. `None` counts every stack.
+pub fn reserved_capacity_excluding(
+    instances: &[InstanceRecord],
+    exclude: Option<&str>,
+) -> (u32, u64) {
     let mut cpu = 0u32;
     let mut mem = 0u64;
     for inst in instances {
+        if exclude == Some(inst.stack.as_str()) {
+            continue;
+        }
         if inst.node_id.is_none() {
             continue;
         }
@@ -173,25 +203,12 @@ pub fn service_load_map(instances: &[InstanceRecord], service: &str) -> HashMap<
     m
 }
 
-/// True when the service has node-local volume mounts (sticky placement).
-pub fn is_volume_sticky(spec: &ServiceSpec) -> bool {
-    !spec.volumes.is_empty()
-}
-
-/// Whether control plane may unbind this instance from a NotReady node.
-pub fn may_reschedule_on_node_loss(spec: &ServiceSpec) -> bool {
-    if is_volume_sticky(spec) {
-        return false;
-    }
-    !spec.restart.eq_ignore_ascii_case("no")
-}
-
 fn resources_from_spec_json(spec_json: &str) -> (u32, u64) {
     let spec: ServiceSpec = match serde_json::from_str(spec_json) {
         Ok(s) => s,
         Err(_) => return (1, 512),
     };
-    (spec.cpus.ceil() as u32, spec.mem_limit_mib)
+    (effective_vcpus(spec.cpus), spec.mem_limit_mib)
 }
 
 #[cfg(test)]
@@ -226,6 +243,7 @@ mod tests {
             message: None,
             spec_json: r#"{"resources":{"cpus":1,"memoryMiB":512}}"#.into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }
     }
@@ -250,6 +268,7 @@ mod tests {
             node_name: Some("linux".into()),
             node_selector: BTreeMap::new(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -277,40 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn may_reschedule_respects_sticky_and_never() {
-        let mut sticky = ServiceSpec {
-            image: "x".into(),
-            scale: 1,
-            cpus: 1.0,
-            mem_limit_mib: 512,
-            ports: vec![],
-            network: Default::default(),
-            env: BTreeMap::new(),
-            secrets: vec![],
-            volumes: vec![mc2_api::VolumeMount {
-                name: "d".into(),
-                mount: "/data".into(),
-            }],
-            restart: "on-failure".into(),
-            healthcheck: None,
-            labels: BTreeMap::new(),
-            command: None,
-            node_name: None,
-            node_selector: BTreeMap::new(),
-            ssh: None,
-            expose: vec![],
-            networks: vec![],
-            depends_on: BTreeMap::new(),
-        };
-        assert!(!may_reschedule_on_node_loss(&sticky));
-        sticky.volumes.clear();
-        sticky.restart = "no".into();
-        assert!(!may_reschedule_on_node_loss(&sticky));
-        sticky.restart = "on-failure".into();
-        assert!(may_reschedule_on_node_loss(&sticky));
-    }
-
-    #[test]
     fn spread_prefers_empty_node() {
         let nodes = vec![node("a", "n1", "{}", 4), node("b", "n2", "{}", 4)];
         let mut load = HashMap::new();
@@ -332,6 +317,7 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -368,6 +354,7 @@ mod tests {
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -390,6 +377,7 @@ mod tests {
             message: None,
             spec_json: serde_json::to_string(&db_spec).unwrap(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let id = pick_node(
@@ -402,5 +390,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, "a");
+    }
+
+    #[test]
+    fn effective_vcpus_matches_what_the_runtime_allocates() {
+        // `create_detached` (mc2-runtime) clamps to [1, 255] then truncates.
+        assert_eq!(effective_vcpus(0.0), 1, "sub-1 vCPU is raised to one");
+        assert_eq!(effective_vcpus(0.5), 1);
+        assert_eq!(effective_vcpus(1.0), 1);
+        assert_eq!(effective_vcpus(1.9), 1, "the fraction is dropped");
+        assert_eq!(effective_vcpus(2.5), 2);
+        assert_eq!(effective_vcpus(255.0), 255);
+        assert_eq!(
+            effective_vcpus(300.0),
+            255,
+            "capped at the u8 the runtime takes"
+        );
+        assert_eq!(
+            effective_vcpus(f64::NAN),
+            1,
+            "a NaN cpus never creates a VM"
+        );
+    }
+
+    #[test]
+    fn reserved_capacity_excludes_the_stack_being_applied() {
+        fn bound(stack: &str, service: &str, cpus: f64) -> InstanceRecord {
+            InstanceRecord {
+                id: format!("{stack}-{service}"),
+                stack: stack.into(),
+                service: service.into(),
+                ordinal: 0,
+                node_id: Some("n1".into()),
+                phase: "Running".into(),
+                runtime_id: None,
+                message: None,
+                spec_json: format!(r#"{{"image":"x","cpus":{cpus}}}"#),
+                healthy: false,
+                applied_hash: None,
+                updated_at: String::new(),
+            }
+        }
+        let instances = vec![
+            bound("app", "web", 3.0),
+            bound("other", "db", 2.0),
+            InstanceRecord {
+                node_id: None,
+                ..bound("pending", "job", 4.0)
+            },
+        ];
+        assert_eq!(
+            reserved_capacity(&instances),
+            (5, 1024),
+            "every bound stack (unbound instances reserve nothing)"
+        );
+        assert_eq!(
+            reserved_capacity_excluding(&instances, Some("app")),
+            (2, 512),
+            "the stack being applied must not count against itself"
+        );
+        assert_eq!(
+            reserved_capacity_excluding(&instances, Some("nope")),
+            (5, 1024)
+        );
     }
 }

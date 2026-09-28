@@ -10,10 +10,17 @@ nothing here requires tools MC2 does not ship or document.
 
 ## Baseline posture
 
-- [ ] **Auth is on.** Start the server without `--no-auth` and save the printed
-      API token on first bootstrap.
+- [ ] **Auth is on.** Start the server without `--no-auth` and save the token
+      it shows once on first bootstrap (stderr on a TTY, else
+      `<data-dir>/bootstrap-token` at mode 0600 — read it, then delete it).
 - [ ] **The data dir is private.** A dedicated user owns it and nothing else
-      reads it.
+      reads it. `secrets.key` and `config.toml` are created 0600; the server
+      refuses to start if an existing `secrets.key` is world-readable, and
+      rejects a symlinked key file.
+- [ ] **Back up `secrets.key` with `mc2.db`.** They are a pair: if the
+      database already holds secrets, a missing key file (or a key that cannot
+      decrypt them) is a startup error, not a new key — the stored ciphertext
+      is unrecoverable without the original.
 - [ ] **`--allow-insecure-http` is off.** Remote endpoints are https-only by
       default; do not re-enable plaintext.
 - [ ] **Secrets are not in stack files.** Credentials live in the encrypted
@@ -37,10 +44,32 @@ nothing here requires tools MC2 does not ship or document.
   patched; run the server with least-privilege accounts.
 </Callout>
 
+## Cap and time out the listeners
+
+- [ ] **Keep the REST caps on.** `--max-connections` (256) sheds extra
+      connections with a `503` instead of queueing them, and
+      `--request-timeout-secs` (60) bounds ordinary routes. A client that
+      sends no request headers is dropped after 30 s. Lower both on a busy or
+      hostile host; `exec` and `logs` stay exempt by design.
+- [ ] **Keep the SSH caps on.** `--max-ssh-sessions` (64) and
+      `--max-ssh-sessions-per-listener` (16) close connections beyond the
+      cap, and a client has 30 s to finish the handshake. There is no idle
+      timeout, so a quiet shell can hold a slot — size the caps for the
+      sessions you actually expect.
+- [ ] **Do not rely on per-IP limiting.** Behind Traefik every client is
+      `127.0.0.1`, so MC2's caps are global; rate-limit at the proxy if you
+      need per-client fairness.
+
 ## Authenticate the control plane
 
 - [ ] **Never `--no-auth`.** It is for disposable loopback labs only; it
-      removes the only credential on the API.
+      removes the only credential on the API for that run. On a routable bind
+      the server refuses to start unless you also pass
+      `--allow-unauthenticated-remote`, and it never starts with
+      `--public-hostname`.
+- [ ] **Plan for token loss.** `mc2 server token rotate --data-dir <dir>`
+      mints a new token in place (old one dies immediately); no restart or
+      data-dir edit needed.
 - [ ] **Always https + a token remotely.** Bind appropriately and, for remote
       management, publish the control plane via `--public-hostname` with a
       cert resolver — then reach it as `https://…` from a saved context.
@@ -60,7 +89,9 @@ nothing here requires tools MC2 does not ship or document.
       is not pushed to running sandboxes in place.
 - [ ] **Back up the data dir.** It holds state, volumes, the operator token,
       and the secret-store key material. Lose it and you lose the ability to
-      decrypt secrets and authenticate as operator.
+      decrypt secrets and authenticate as operator — if you only lose the
+      token, rotate it (`mc2 server token rotate`) rather than restoring an
+      older data-dir copy.
 - [ ] Do not hand-edit the data dir; treat it as opaque state.
 
 <Callout type="warning" title="The data dir is the crown jewels">

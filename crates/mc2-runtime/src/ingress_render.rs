@@ -1,9 +1,11 @@
 //! Pure Ingress catalog → Traefik dynamic YAML (D7).
 //!
 //! No I/O except callers writing the strings. Unit-tested without a hypervisor.
+//! The dynamic config is built as typed structs and serialized with
+//! `serde_yaml`, so no untrusted value can inject extra YAML keys.
 
 use serde::Serialize;
-use std::fmt::Write as _;
+use std::collections::BTreeMap;
 
 /// One route ready for proxy config (backend already selected + probed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -66,6 +68,102 @@ pub struct CatalogTls {
     pub cert_resolver: String,
 }
 
+// ---------------------------------------------------------------------------
+// Typed Traefik file-provider dynamic config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct TraefikDynamic {
+    #[serde(skip_serializing_if = "HttpDynamic::is_empty")]
+    http: HttpDynamic,
+    #[serde(skip_serializing_if = "TcpDynamic::is_empty")]
+    tcp: TcpDynamic,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct HttpDynamic {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    routers: BTreeMap<String, HttpRouter>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    services: BTreeMap<String, HttpService>,
+}
+
+impl HttpDynamic {
+    fn is_empty(&self) -> bool {
+        self.routers.is_empty() && self.services.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HttpRouter {
+    rule: String,
+    #[serde(rename = "entryPoints")]
+    entry_points: Vec<String>,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<HttpTls>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpTls {
+    #[serde(rename = "certResolver", skip_serializing_if = "Option::is_none")]
+    cert_resolver: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpService {
+    #[serde(rename = "loadBalancer")]
+    load_balancer: HttpLoadBalancer,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpLoadBalancer {
+    servers: Vec<HttpServer>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpServer {
+    url: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TcpDynamic {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    routers: BTreeMap<String, TcpRouter>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    services: BTreeMap<String, TcpService>,
+}
+
+impl TcpDynamic {
+    fn is_empty(&self) -> bool {
+        self.routers.is_empty() && self.services.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TcpRouter {
+    #[serde(rename = "entryPoints")]
+    entry_points: Vec<String>,
+    rule: String,
+    service: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TcpService {
+    #[serde(rename = "loadBalancer")]
+    load_balancer: TcpLoadBalancer,
+}
+
+#[derive(Debug, Serialize)]
+struct TcpLoadBalancer {
+    servers: Vec<TcpServer>,
+}
+
+#[derive(Debug, Serialize)]
+struct TcpServer {
+    address: String,
+}
+
 /// Normalize path for proxy rules (`""` → `/`).
 fn normalize_path(path: &str) -> String {
     mc2_api::normalize_ingress_path(path)
@@ -73,15 +171,7 @@ fn normalize_path(path: &str) -> String {
 
 /// Stable router/service name safe for Traefik keys.
 pub fn route_key(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    mc2_api::route_key(id)
 }
 
 /// Build Traefik file-provider dynamic YAML (`http.routers` + `http.services`).
@@ -90,76 +180,85 @@ pub fn render_traefik_dynamic(routes: &[ReadyIngressRoute]) -> String {
         return "# Managed by MC2 — no ready Ingress routes\nhttp: {}\n".into();
     }
 
-    let http_routes: Vec<_> = routes.iter().filter(|r| !r.tcp).collect();
-    let tcp_routes: Vec<_> = routes.iter().filter(|r| r.tcp).collect();
-    let mut out = String::from("# Managed by MC2 — do not edit; agent overwrites.\n");
-    if !http_routes.is_empty() {
-        out.push_str("http:\n  routers:\n");
-    }
-    for r in &http_routes {
+    let mut http = HttpDynamic::default();
+    let mut tcp = TcpDynamic::default();
+    for r in routes {
         let key = route_key(&r.id);
-        let path = normalize_path(&r.path);
-        let rule = traefik_rule(&r.host, &path, &r.path_type);
-        let _ = writeln!(out, "    {key}:");
-        let _ = writeln!(out, "      rule: \"{rule}\"");
-        if r.tls_enabled {
-            let _ = writeln!(out, "      entryPoints:");
-            let _ = writeln!(out, "        - websecure");
-            let _ = writeln!(out, "      service: {key}");
-            let _ = writeln!(out, "      tls:");
-            if !r.cert_resolver.is_empty() {
-                let _ = writeln!(out, "        certResolver: {}", r.cert_resolver);
-            }
+        if r.tcp {
+            tcp.routers.insert(
+                key.clone(),
+                TcpRouter {
+                    entry_points: vec![r.entry_point.clone()],
+                    rule: "HostSNI(`*`)".into(),
+                    service: key.clone(),
+                },
+            );
+            tcp.services.insert(
+                key,
+                TcpService {
+                    load_balancer: TcpLoadBalancer {
+                        servers: vec![TcpServer {
+                            address: format!("{}:{}", r.backend_host, r.backend_port),
+                        }],
+                    },
+                },
+            );
         } else {
-            let _ = writeln!(out, "      entryPoints:");
-            let _ = writeln!(out, "        - web");
-            let _ = writeln!(out, "      service: {key}");
-        }
-    }
-    if http_routes.is_empty() && tcp_routes.is_empty() {
-        out.push_str("http: {}\n");
-    } else if !http_routes.is_empty() {
-        out.push_str("  services:\n");
-    }
-    for r in routes.iter().filter(|r| !r.tcp) {
-        let key = route_key(&r.id);
-        let url = format!("http://{}:{}", r.backend_host, r.backend_port);
-        let _ = writeln!(out, "    {key}:");
-        let _ = writeln!(out, "      loadBalancer:");
-        let _ = writeln!(out, "        servers:");
-        let _ = writeln!(out, "          - url: \"{url}\"");
-    }
-    if !tcp_routes.is_empty() {
-        out.push_str("tcp:\n  routers:\n");
-        for r in &tcp_routes {
-            let key = route_key(&r.id);
-            let _ = writeln!(out, "    {key}:\n      entryPoints:\n        - {}\n      rule: HostSNI(`*`)\n      service: {key}", r.entry_point);
-        }
-        out.push_str("  services:\n");
-        for r in tcp_routes {
-            let key = route_key(&r.id);
-            let _ = writeln!(
-                out,
-                "    {key}:\n      loadBalancer:\n        servers:\n          - address: {}:{}",
-                r.backend_host, r.backend_port
+            let path = normalize_path(&r.path);
+            let entry_points = if r.tls_enabled {
+                vec!["websecure".to_string()]
+            } else {
+                vec!["web".to_string()]
+            };
+            let tls = if r.tls_enabled {
+                Some(HttpTls {
+                    cert_resolver: if r.cert_resolver.is_empty() {
+                        None
+                    } else {
+                        Some(r.cert_resolver.clone())
+                    },
+                })
+            } else {
+                None
+            };
+            http.routers.insert(
+                key.clone(),
+                HttpRouter {
+                    rule: traefik_rule(&r.host, &path, &r.path_type),
+                    entry_points,
+                    service: key.clone(),
+                    tls,
+                },
+            );
+            http.services.insert(
+                key,
+                HttpService {
+                    load_balancer: HttpLoadBalancer {
+                        servers: vec![HttpServer {
+                            url: format!("http://{}:{}", r.backend_host, r.backend_port),
+                        }],
+                    },
+                },
             );
         }
     }
-    out
+
+    let doc = TraefikDynamic { http, tcp };
+    let body = serde_yaml::to_string(&doc).unwrap_or_default();
+    format!("# Managed by MC2 — do not edit; agent overwrites.\n{body}")
 }
 
 fn traefik_rule(host: &str, path: &str, path_type: &str) -> String {
-    let host_esc = host.replace('`', "");
-    let path_esc = path.replace('`', "");
     let exact = path_type.eq_ignore_ascii_case("exact");
-    if path_esc == "/" && !exact {
-        format!("Host(`{host_esc}`)")
+    if path == "/" && !exact {
+        format!("Host(`{host}`)")
     } else if exact {
-        format!("Host(`{host_esc}`) && Path(`{path_esc}`)")
+        format!("Host(`{host}`) && Path(`{path}`)")
     } else {
-        format!("Host(`{host_esc}`) && PathPrefix(`{path_esc}`)")
+        format!("Host(`{host}`) && PathPrefix(`{path}`)")
     }
 }
+
 /// Build `catalog.json` body (pretty JSON).
 pub fn render_catalog_json(
     node_name: &str,
@@ -263,7 +362,7 @@ mod tests {
             guest_port: 8000,
             backend_host: "127.0.0.1".into(),
             backend_port: 8080,
-            instance_id: "demo-web-0".into(),
+            instance_id: "demo--web--0".into(),
             ordinal: 0,
             tls_enabled: true,
             cert_resolver: "le".into(),
@@ -272,19 +371,99 @@ mod tests {
         }
     }
 
+    fn parse(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml)
+            .unwrap_or_else(|e| panic!("rendered YAML must parse: {e}\n{yaml}"))
+    }
+
+    /// Fetch a nested mapping key, failing loudly when absent.
+    fn get<'a>(v: &'a serde_yaml::Value, path: &[&str]) -> &'a serde_yaml::Value {
+        let mut cur = v;
+        for p in path {
+            cur = cur
+                .as_mapping()
+                .unwrap_or_else(|| panic!("{p}: parent is not a mapping: {cur:?}"))
+                .get(serde_yaml::Value::String((*p).into()))
+                .unwrap_or_else(|| panic!("missing key {p} in {cur:?}"));
+        }
+        cur
+    }
+
     #[test]
     fn traefik_renders_router_and_service() {
         let y = render_traefik_dynamic(&[sample_route()]);
-        assert!(y.contains("Host(`demo.local`)"), "{y}");
-        assert!(y.contains("http://127.0.0.1:8080"), "{y}");
-        assert!(y.contains("certResolver: le"), "{y}");
-        assert!(y.contains("websecure"), "{y}");
+        let v = parse(&y);
+        let key = route_key("demo-demo.local-/-web-8000");
+        let routers = get(&v, &["http", "routers"]);
+        assert_eq!(routers.as_mapping().unwrap().len(), 1, "{y}");
+        assert_eq!(
+            get(&v, &["http", "routers", &key, "rule"]).as_str(),
+            Some("Host(`demo.local`)")
+        );
+        assert_eq!(
+            get(&v, &["http", "routers", &key, "entryPoints"])[0].as_str(),
+            Some("websecure")
+        );
+        assert_eq!(
+            get(&v, &["http", "routers", &key, "service"]).as_str(),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            get(&v, &["http", "routers", &key, "tls", "certResolver"]).as_str(),
+            Some("le")
+        );
+        assert_eq!(
+            get(&v, &["http", "services", &key, "loadBalancer", "servers"])[0]
+                .get("url")
+                .and_then(|u| u.as_str()),
+            Some("http://127.0.0.1:8080")
+        );
     }
 
     #[test]
     fn traefik_empty() {
         let y = render_traefik_dynamic(&[]);
         assert!(y.contains("http: {}"));
+    }
+
+    #[test]
+    fn traefik_tcp_route_renders_address() {
+        let mut r = sample_route();
+        r.id = "ssh-ingress-tcp-web-ssh-web".into();
+        r.tcp = true;
+        r.entry_point = "ssh".into();
+        r.backend_port = 2222;
+        r.tls_enabled = false;
+        let y = render_traefik_dynamic(std::slice::from_ref(&r));
+        let v = parse(&y);
+        let key = route_key(&r.id);
+        assert!(v.get("http").is_none(), "{y}");
+        assert_eq!(
+            get(&v, &["tcp", "routers", &key, "entryPoints"])[0].as_str(),
+            Some("ssh")
+        );
+        assert_eq!(
+            get(&v, &["tcp", "routers", &key, "rule"]).as_str(),
+            Some("HostSNI(`*`)")
+        );
+        assert_eq!(
+            get(&v, &["tcp", "services", &key, "loadBalancer", "servers"])[0]
+                .get("address")
+                .and_then(|a| a.as_str()),
+            Some("127.0.0.1:2222")
+        );
+    }
+
+    #[test]
+    fn injection_payload_stays_a_yaml_scalar() {
+        // Validation rejects such hosts at parse time; if one ever reaches the
+        // renderer it must remain an inert scalar, not extra YAML structure.
+        let mut r = sample_route();
+        r.host = "evil.local\n        evil: {rule: \"boo\"}".into();
+        let y = render_traefik_dynamic(&[r]);
+        let v = parse(&y);
+        let routers = v.get("http").unwrap().get("routers").unwrap();
+        assert_eq!(routers.as_mapping().unwrap().len(), 1, "{y}");
     }
 
     #[test]
@@ -315,11 +494,18 @@ mod tests {
         let mut r = sample_route();
         r.backend_port = 18080;
         let y1 = render_traefik_dynamic(&[r.clone()]);
-        assert!(y1.contains("http://127.0.0.1:18080"), "{y1}");
+        let v1 = parse(&y1);
+        let key = route_key(&r.id);
+        assert_eq!(
+            get(&v1, &["http", "services", &key, "loadBalancer", "servers"])[0]
+                .get("url")
+                .and_then(|u| u.as_str()),
+            Some("http://127.0.0.1:18080")
+        );
         r.backend_port = 19090;
         let y2 = render_traefik_dynamic(&[r]);
-        assert!(y2.contains("http://127.0.0.1:19090"), "{y2}");
-        assert!(!y2.contains(":18080"), "{y2}");
+        assert!(y2.contains("19090"), "{y2}");
+        assert!(!y2.contains("18080"), "{y2}");
     }
 
     #[test]
@@ -338,7 +524,7 @@ mod tests {
             cert_resolver: String::new(),
             tcp: false,
             entry_point: String::new(),
-            backend_instance_id: "s-web-0".into(),
+            backend_instance_id: "s--web--0".into(),
             backend_ordinal: 0,
         };
         let r = d.to_ready("127.0.0.1");
@@ -346,9 +532,18 @@ mod tests {
         assert_eq!(r.backend_port, 18080);
         assert_eq!(r.backend_host, "127.0.0.1");
         let y = render_traefik_dynamic(std::slice::from_ref(&r));
-        assert!(y.contains("entryPoints:"), "{y}");
-        assert!(y.contains("- web"), "{y}");
-        assert!(!y.contains("websecure"), "{y}");
+        let v = parse(&y);
+        let key = route_key("id");
+        let entry = get(&v, &["http", "routers", &key, "entryPoints"]);
+        assert_eq!(entry[0].as_str(), Some("web"));
+        assert!(
+            get(&v, &["http", "routers", &key])
+                .as_mapping()
+                .unwrap()
+                .get(serde_yaml::Value::String("tls".into()))
+                .is_none(),
+            "plain router must not carry tls: {y}"
+        );
     }
 
     #[test]

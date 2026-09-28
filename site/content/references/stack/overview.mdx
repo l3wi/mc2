@@ -11,10 +11,10 @@ The desired-state document `mc2 up -f <file>` sends to the MC2 server. It is
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `name` | no\* | file stem | Stack name. Must not contain `--` (volume namespace separator). |
-| `services` | yes | — | Map of service name → service spec. Must be non-empty. |
-| `volumes` | no | `{}` | Declared volumes; service mounts must reference them. |
-| `networks` | no | `{}` | Logical network groups (membership only in v1). |
+| `name` | no\* | file stem | Stack name: lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, no `--`, ≤ 40 characters. |
+| `services` | yes | — | Map of service name → service spec. Must be non-empty; names share the stack grammar (≤ 63). |
+| `volumes` | no | `{}` | Declared volumes; service mounts must reference them. Names: `[a-z0-9][a-z0-9._-]*`, no `--`, no trailing `-`, ≤ 63. |
+| `networks` | no | `{}` | Logical network groups (membership only in v1). Names share the stack grammar (≤ 63). |
 | `ingress` | no | — | HTTP(S) rules + TCP routes for a BYO Traefik. |
 
 \* filled by `mc2 up` when missing.
@@ -39,8 +39,9 @@ no-ops**. If a key isn't in this reference, it doesn't apply.
 
 ## Minimal file
 
-`mc2 up` fills a missing top-level `name:` from the sanitized file stem, so
-this is a complete stack:
+`mc2 up` fills a missing top-level `name:` from the sanitized file stem
+(lowercased, invalid characters → `-`, ≤ 40 characters), so this is a complete
+stack:
 
 ```yaml
 services:
@@ -56,13 +57,20 @@ services:
 Apply returns `400` for:
 
 - unknown keys (canonical parser — see above)
-- empty services; a missing `name`; `--` in the stack name
-- undeclared volume mounts or invalid volume names; non-`dir` volume kinds
+- empty services; a missing `name`; names that violate the grammar or length
+  caps (stack ≤ 40; service/network/volume ≤ 63); `--` anywhere in a name
+- undeclared volume mounts; non-`dir` volume kinds
 - relative or duplicate target paths
 - `scale: 0`; unknown `restart` values; non-mediated networks
+- `network.profiles` values outside `public|private|host|none`, `none` with
+  another profile, or duplicates
 - zero/duplicate `expose` ports; non-unique expose ports across the stack
-- ingress without routes; ingress paths whose backend ports are missing or
-  non-tcp; TCP ingress targeting services without fixed SSH ports
+- ingress without routes; hosts that are not lowercase RFC 1123 names (no
+  ports, wildcards or trailing dot); paths without a leading `/` or containing
+  whitespace/quotes/backticks/backslashes/control characters;
+  `certResolver`/`entryPoint`/TCP `name` outside `[A-Za-z0-9_-]+`; two routes
+  that collide on a Traefik router key; ingress paths whose backend ports are
+  missing or non-tcp; TCP ingress targeting services without fixed SSH ports
 - `depends_on` references to services outside the stack, unknown conditions, or
   cycles; `service_healthy` dependencies without a declared healthcheck
 

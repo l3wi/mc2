@@ -34,20 +34,64 @@ pub(crate) async fn ps_cmd(args: PsArgs, conn: &Conn) -> Result<()> {
         return Ok(());
     }
     let mut t = crate::table::Table::new()
-        .header(["STACK", "SERVICE", "ORD", "PHASE", "NODE", "ID"])
+        .header(["STACK", "SERVICE", "ORD", "PHASE", "NODE", "NOTES", "ID"])
         .right_align([2]);
     for i in instances {
+        let notes = disk_notes(i.message.as_deref());
         t = t.row([
             i.stack,
             i.service,
             i.ordinal.to_string(),
             i.phase,
             i.node_id.unwrap_or_else(|| "-".into()),
+            notes,
             i.id,
         ]);
     }
     print!("{}", t.render());
     Ok(())
+}
+
+/// Short disk-condition notes for the `ps` NOTES column (empty when healthy).
+pub(crate) fn disk_notes(message: Option<&str>) -> String {
+    message
+        .map(mc2_api::disk::notes_from_message)
+        .unwrap_or_default()
+}
+
+/// Fetch one instance record by id from `/v1/instances`.
+///
+/// Used by `exec`/`ssh`/`logs` to surface the disk-condition text stored on the
+/// instance before connecting.
+pub(crate) async fn fetch_instance(conn: &Conn, id: &str) -> Option<mc2_store::InstanceRecord> {
+    let url = format!("{}/v1/instances", conn.url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let res = operator_get(&client, &url, conn.token.as_deref())
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let body = res.text().await.ok()?;
+    let instances: Vec<mc2_store::InstanceRecord> = serde_json::from_str(&body).ok()?;
+    instances.into_iter().find(|i| i.id == id)
+}
+
+/// Print an instance's full disk-condition text to stderr (no-op when absent).
+pub(crate) fn eprint_disk_conditions(record: &mc2_store::InstanceRecord) {
+    let Some(message) = record.message.as_deref() else {
+        return;
+    };
+    let text = mc2_api::disk::full_text_from_message(
+        message,
+        &record.stack,
+        &record.service,
+        record.ordinal,
+    );
+    if !text.is_empty() {
+        eprintln!("{text}");
+    }
 }
 
 pub(crate) async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
@@ -75,15 +119,7 @@ pub(crate) async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
     }
 
     let mut t = crate::table::Table::new()
-        .header([
-            "ID",
-            "NAME",
-            "STATUS",
-            "CPU",
-            "MEM_MiB",
-            "ARCH",
-            "LAST_HEARTBEAT",
-        ])
+        .header(["ID", "NAME", "STATUS", "CPU", "MEM_MiB", "ARCH"])
         .right_align([3, 4]);
     for n in nodes {
         t = t.row([
@@ -93,7 +129,6 @@ pub(crate) async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
             n.cpus.to_string(),
             n.memory_mib.to_string(),
             n.arch,
-            n.last_heartbeat.unwrap_or_else(|| "-".into()),
         ]);
     }
     print!("{}", t.render());
@@ -280,6 +315,7 @@ pub(crate) async fn network_cmd(args: NetworkArgs, conn: &Conn) -> Result<()> {
     }
     let v: serde_json::Value = serde_json::from_str(&body)?;
     let all = v["networks"].as_array().cloned().unwrap_or_default();
+    let claims = v["exposedPorts"].as_array().cloned().unwrap_or_default();
     let selected: Vec<serde_json::Value> = all
         .into_iter()
         .filter(|n| n["name"] == target.as_str())
@@ -305,6 +341,7 @@ pub(crate) async fn network_cmd(args: NetworkArgs, conn: &Conn) -> Result<()> {
         );
     };
     print_network_detail(net);
+    print_port_claims(&claims);
     Ok(())
 }
 
@@ -328,6 +365,7 @@ pub(crate) async fn network_summary_cmd(args: NetworkArgs, conn: &Conn) -> Resul
         return Ok(());
     }
     print_network_summary(&all);
+    print_port_claims(&v["exposedPorts"].as_array().cloned().unwrap_or_default());
     Ok(())
 }
 
@@ -456,12 +494,17 @@ fn print_network_detail(n: &serde_json::Value) {
         active
     );
     for i in n["instances"].as_array().into_iter().flatten() {
+        let owner = format!(
+            "{}/{}",
+            i["stack"].as_str().unwrap_or("-"),
+            i["service"].as_str().unwrap_or("-")
+        );
         let expose: Vec<String> = i["exposePorts"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|p| p.as_u64())
-            .map(|p| p.to_string())
+            .map(|p| format!("{p} ({owner})"))
             .collect();
         let ports: Vec<String> = i["ports"]
             .as_array()
@@ -494,6 +537,22 @@ fn print_network_detail(n: &serde_json::Value) {
         if !ports.is_empty() {
             println!("      host ports: {}", ports.join(", "));
         }
+    }
+}
+
+/// Server-wide `expose` port claims: each port and its owning `stack/service`.
+fn print_port_claims(claims: &[serde_json::Value]) {
+    if claims.is_empty() {
+        return;
+    }
+    println!("port claims (exclusive server-wide):");
+    for c in claims {
+        println!(
+            "  {}  {}/{}",
+            c["port"].as_u64().unwrap_or(0),
+            c["stack"].as_str().unwrap_or("-"),
+            c["service"].as_str().unwrap_or("-")
+        );
     }
 }
 
@@ -557,5 +616,23 @@ mod tests {
         assert_eq!(fmt_mib_ratio(0, 0), "0/Unlim");
         assert_eq!(fmt_mib_ratio(512, 8192), "512 MiB/8 GiB");
         assert_eq!(fmt_mib_ratio(0, 2048), "0/2 GiB");
+    }
+
+    #[test]
+    fn ps_notes_column_renders_short_disk_conditions() {
+        assert_eq!(disk_notes(None), "", "no message → blank column");
+        assert_eq!(disk_notes(Some("starting")), "", "no condition → blank");
+        let conds = vec![
+            mc2_api::disk::DiskCondition::root_disk(4096, 4096).unwrap(),
+            mc2_api::disk::DiskCondition::volume("data", "/data", 9216, 10240).unwrap(),
+        ];
+        let message = format!(
+            "microsandbox sdk (local)\n{}",
+            mc2_api::disk::block(&conds, "shop", "web", 0)
+        );
+        assert_eq!(
+            disk_notes(Some(&message)),
+            "root disk full, volume data 90%"
+        );
     }
 }

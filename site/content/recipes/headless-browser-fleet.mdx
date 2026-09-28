@@ -98,9 +98,11 @@ mc2 down scraper-fleet --volumes
 
 ## Notes
 
-- Network profiles are `public` (default), `private`, `host`, and `none`.
+- Network profiles are `public` (default), `private`, `host`, and `none` — a
+  closed set (unknown values are rejected, not defaulted to public).
   `[private]` keeps the microVM off the public internet; `[none]` turns off
-  networking entirely.
+  networking entirely. `[host]` gives the guest the whole host loopback and
+  needs the server flag `--allow-host-profile`.
 - Each scraper is a full microVM, so 30 scrapers = 30 VMs — budget CPU and
   memory on the host.
 - A scraper that legitimately needs the internet should use

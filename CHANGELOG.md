@@ -4,12 +4,119 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### VM lifecycle & atomic apply (Wave 4 — breaking, pre-release)
+
+- **`mc2 up` is all-or-nothing.** Apply plans the whole stack (validation,
+  capacity, ports, claims) with no writes, then commits the stack and every
+  instance change in one transaction. A rejected apply leaves the running
+  stack untouched; services removed from the YAML, and ordinals beyond a
+  lower `scale`, are deleted. `mc2 down` is transactional too.
+- **Single embedded node.** The NotReady watcher, unbind/reschedule loop,
+  heartbeat staleness, `--heartbeat-grace-secs` and `--reschedule-interval-secs`
+  are gone. The node id is persisted, so `--node-name`/hostname changes keep
+  placements; the node is registered before the API accepts requests.
+- **VMs survive restarts correctly.** Every sandbox carries an install-id
+  label. On startup MC2 adopts its own sandboxes and removes labelled orphans
+  (foreign sandboxes are never touched); a failed removal is retried every
+  pass. The applied config hash is persisted (migration 009), so a stale VM is
+  recreated after a restart and a failed recreate never records the new config.
+- **Isolation of bad instances.** A missing secret or SSH resolution error
+  fails only that instance (it keeps its sandbox) instead of halting the node.
+- **Status writes are checked.** A failed observed-state write fails the
+  reconcile pass and is logged, rather than being silently dropped. The
+  reconcile loop is split into lifecycle, report and GC modules.
+
+### Correctness fixes (Wave 3 — breaking, pre-release)
+
+- **Healthchecks.** `CMD-SHELL` runs through `/bin/sh -c`; `["NONE"]`
+  disables; `disable: true` no longer makes the stored spec unreadable (which
+  used to stall every reconcile pass). `timeout` defaults to 30 s and `0` is
+  rejected; sub-second values round up. Probes run out of band, so a hung
+  probe can't freeze the node; failures during `start_period` don't count.
+- **Capacity.** Reapplying a stack no longer counts its own CPU/RAM twice.
+  Reservations use the vCPUs the VM actually gets.
+- **Ports.** A published port reused by another target is a 400; port-range
+  overflow and auto-pool exhaustion are 400 (were 500). Long-form `ports`
+  entries reject unknown keys; `cpus` must be finite and in (0, 255].
+- **`mc2 exec`.** Everything after the instance ref is guest argv
+  (`mc2 exec ref /bin/sh -c '…'` works without `--`); stdin, stdout and stderr
+  are carried as bytes (base64 on the wire), so binary data round-trips.
+- **Secrets key guard.** A missing key with stored secrets, or a key that can't
+  decrypt them, refuses to start instead of silently re-keying.
+  `mc2 server secrets purge --data-dir <dir> [--yes]` is the recovery path when
+  the key is truly lost.
+
+### Security & isolation hardening (Epic A — breaking, pre-release)
+
+- **Auth is router-wide.** Every `/v1` route sits behind one auth middleware
+  (only `/health` is public); `GET /v1/volumes` no longer answers without a
+  token.
+- **`--no-auth` is per start, loopback only.** Bootstrap always creates a
+  token; `--no-auth` skips the check for that process only. A non-loopback
+  `--bind` additionally needs `--allow-unauthenticated-remote`; `--no-auth`
+  with `--public-hostname` always refuses to start.
+- **Token recovery.** `mc2 server token rotate [--data-dir]` replaces the API
+  token in place (works while the server runs; the old token is rejected
+  immediately).
+- **Credential files.** `secrets.key` and `~/.mc2/config.toml` are created
+  0600; a world-readable or symlinked key refuses to start. Secrets are
+  encrypted with their name as AEAD associated data. Without a TTY the first
+  token goes to `<data-dir>/bootstrap-token` (0600), never to logs. `--help`
+  no longer echoes `MC2_API_KEY` / `MC2_SECRET_VALUE` values.
+- **Names.** Stack, service and network names are lowercase
+  `[a-z0-9]([a-z0-9_-]*[a-z0-9])?` without `--` (stack ≤ 40, others ≤ 63);
+  sandboxes are named `{stack}--{service}--{ordinal}`, so names and volume
+  dirs can no longer collide across stacks.
+- **Ingress.** Hosts, paths, `certResolver`, TCP `entryPoint`/`name`,
+  `ports[].hostname` and `--public-hostname`/`--public-tls-cert-resolver` are
+  strictly validated; the Traefik dynamic config is serialized from typed
+  structs (no YAML injection); colliding router keys are rejected.
+- **Network profiles** are a closed set (`public|private|host|none`, `none`
+  alone); unknown values and the old `local`/`any` aliases are rejected and
+  never fall back to public egress. `host` needs `--allow-host-profile`.
+- **Exclusive `expose` ports.** An exposed port is claimed server-wide at
+  `mc2 up`; a second claim is a 400 naming the owner. `mc2 network` lists
+  claims. Applies and deletes are serialized.
+- **Egress hardening.** `expose` ports that collide with the REST bind, SSH
+  listeners, published ports, `53`, a port already listening on host
+  loopback, or (Linux, non-root) a privileged port are rejected at apply.
+  Splice listeners are held from apply until the stack is removed, and a VM
+  whose allowed port has no MC2 listener is not created (fail closed).
+- **Service network fixes.** Services without `expose` now reach their peers;
+  replicas reach their own service name. The recreate hash covers only the
+  effective policy (allowed ports + exposes), so neighbours changing no longer
+  recreate consumer VMs, and the plan is deterministic.
+- **Disk limits.** `volumes.<name>.size` (default 10 GiB) is enforced as a
+  write quota (guest sees ENOSPC, `df` shows the cap) and is resizable with
+  data kept; shrinking below usage is a 400. `services.<name>.storage_opt.size`
+  (default 4 GiB) sets the VM root disk. Volumes are MC2-owned directories
+  under `~/.mc2/volumes`. `--limit-disk-mib` is now an apply-time reservation
+  (volume sizes + root disks × replicas) with a breakdown on refusal.
+- **Disk-full is visible.** `mc2 ps` gains a `NOTES` column; `mc2 exec`,
+  `mc2 ssh open`, `mc2 logs` and `mc2 up` print the condition with the exact
+  stack.yaml fix. Server logs condition changes and exports
+  `mc2.instance.disk_{used,limit}_mib`.
+- **Listener limits.** REST: connection cap with 503 load-shedding
+  (`--max-connections`, 256), header-read deadline, per-request timeout for
+  ordinary routes (`--request-timeout-secs`, 60; `exec`/`logs` exempt), SSE
+  keepalive, 16 MiB `exec` body limit, bounded graceful drain. SSH: global and
+  per-listener session caps (`--max-ssh-sessions`,
+  `--max-ssh-sessions-per-listener`), 30 s handshake deadline, TCP keepalive,
+  no idle timeout.
+- **Release pipeline.** Automated tags are pushed with a GitHub App token so
+  they trigger releases (secrets `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY`);
+  all actions are SHA-pinned; cargo-dist is installed from a checksum-verified
+  archive; workflows default to read-only permissions; releases carry GitHub
+  artifact attestations. README install uses a version-pinned, checksum-verified
+  archive.
+- **CLI tables** end with a newline.
+
 ### Resource limits (opt-in; unlimited by default)
 
 - **Configurable cluster budgets.** `--limit-cpus`, `--limit-memory-mib`,
   `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
-  refuses an apply that would exceed the reserved CPU/RAM budget, or when MC2's
-  measured disk usage (data dir + named volumes) is already at the disk limit.
+  refuses an apply that would exceed the reserved CPU/RAM budget or the disk
+  reservation (see *Disk limits* above).
 - **Node capacity is host-derived.** The `--cpus` / `--memory-mib` flags are
   gone; each node now advertises the host's real CPU/RAM (detected via
   `num_cpus` and `/proc`/`sysctl`). Apply is also refused when a stack would

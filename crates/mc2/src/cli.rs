@@ -24,8 +24,8 @@ pub struct Cli {
     )]
     pub api: String,
 
-    /// Operator API bearer token
-    #[arg(long, global = true, env = "MC2_API_KEY")]
+    /// Operator API bearer token (the env value is never echoed in `--help`)
+    #[arg(long, global = true, env = "MC2_API_KEY", hide_env_values = true)]
     pub token: Option<String>,
 
     /// Named context from ~/.mc2/config.toml (overrides the current context)
@@ -73,7 +73,7 @@ pub enum Commands {
     Context(ContextCmd),
 
     /// Run the MC2 orchestrator (single process)
-    Server(Box<mc2_server::ServerArgs>),
+    Server(Box<ServerCmd>),
     /// Check host readiness (hypervisor / msb / paths)
     Doctor(DoctorArgs),
     /// Node operations
@@ -84,6 +84,66 @@ pub enum Commands {
     Completions(CompletionsArgs),
     /// Show version info
     Version,
+}
+
+/// `mc2 server`: run the orchestrator, or operate on its data directory.
+#[derive(Debug, Parser)]
+pub struct ServerCmd {
+    #[command(subcommand)]
+    pub command: Option<ServerCommands>,
+
+    #[command(flatten)]
+    pub args: mc2_server::ServerArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerCommands {
+    /// Operator API token operations (needs filesystem access to the data dir)
+    Token(ServerTokenCmd),
+    /// Stored-secret recovery (needs filesystem access to the data dir)
+    Secrets(ServerSecretsCmd),
+}
+
+#[derive(Debug, Parser)]
+pub struct ServerTokenCmd {
+    #[command(subcommand)]
+    pub command: ServerTokenCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerTokenCommands {
+    /// Generate a new operator API token and replace the stored hash
+    Rotate(TokenRotateArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct TokenRotateArgs {
+    /// Data directory (SQLite, tokens)
+    #[arg(long, default_value = "~/.mc2", env = "MC2_DATA_DIR")]
+    pub data_dir: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct ServerSecretsCmd {
+    #[command(subcommand)]
+    pub command: ServerSecretsCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerSecretsCommands {
+    /// Delete every stored secret — the recovery path when the secrets key is
+    /// lost (the server refuses to start while undecryptable secrets remain)
+    Purge(SecretsPurgeArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct SecretsPurgeArgs {
+    /// Data directory (SQLite, tokens)
+    #[arg(long, default_value = "~/.mc2", env = "MC2_DATA_DIR")]
+    pub data_dir: String,
+    /// Actually delete (without it, only list what would be deleted)
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -170,7 +230,7 @@ pub struct SecretSetArgs {
     /// Secret name
     pub name: String,
     /// Secret value (prefer env MC2_SECRET_VALUE or stdin for scripts)
-    #[arg(long, env = "MC2_SECRET_VALUE")]
+    #[arg(long, env = "MC2_SECRET_VALUE", hide_env_values = true)]
     pub value: Option<String>,
 }
 
@@ -214,8 +274,21 @@ pub struct ConfigArgs {
 pub struct ExecArgs {
     /// Instance id, or `stack/service/ordinal` (e.g. `demo/web/0`)
     pub instance: String,
-    /// Command to run in the sandbox
-    #[arg(required = true, num_args = 1..)]
+    /// Command and arguments to run in the sandbox.
+    ///
+    /// Everything after the instance ref is passed through verbatim — arguments
+    /// starting with `-` (e.g. `-c`) included — so `mc2 exec ref /bin/sh -c 'x'`
+    /// and `mc2 exec ref wget -qO- http://…` both work. `mc2`'s own global flags
+    /// (`--token`, `--context`, …) are therefore only recognised *before* the
+    /// instance ref. `--` still works as an explicit escape — and is required
+    /// to forward a guest `--help`/`-h`/`-V`, which clap keeps for `mc2`
+    /// itself.
+    #[arg(
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     pub cmd: Vec<String>,
 }
 
@@ -379,5 +452,143 @@ mod tests {
     #[test]
     fn cli_parses_help() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn server_token_rotate_parses() {
+        let cli =
+            Cli::try_parse_from(["mc2", "server", "token", "rotate", "--data-dir", "/tmp/mc2"])
+                .unwrap();
+        let Commands::Server(cmd) = cli.command else {
+            panic!("expected server command");
+        };
+        match *cmd {
+            ServerCmd {
+                command:
+                    Some(ServerCommands::Token(ServerTokenCmd {
+                        command: ServerTokenCommands::Rotate(a),
+                    })),
+                ..
+            } => assert_eq!(a.data_dir, "/tmp/mc2"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_server_flags_still_parse() {
+        let cli = Cli::try_parse_from([
+            "mc2",
+            "server",
+            "--init-only",
+            "--data-dir",
+            "/tmp/mc2",
+            "--no-auth",
+            "--allow-unauthenticated-remote",
+        ])
+        .unwrap();
+        let Commands::Server(cmd) = cli.command else {
+            panic!("expected server command");
+        };
+        match *cmd {
+            ServerCmd {
+                command: None,
+                args,
+                ..
+            } => {
+                assert!(args.init_only);
+                assert!(args.no_auth);
+                assert!(args.allow_unauthenticated_remote);
+                assert_eq!(args.data_dir, "/tmp/mc2");
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    /// Everything after the instance ref is a guest argv token — hyphen
+    /// prefixed ones included — with no `--` required.
+    #[test]
+    fn exec_forwards_hyphen_args_after_the_instance_ref() {
+        let cases: [(&[&str], &[&str]); 3] = [
+            (
+                &["mc2", "exec", "demo/web/0", "/bin/sh", "-c", "uname -a"],
+                &["/bin/sh", "-c", "uname -a"],
+            ),
+            (
+                &[
+                    "mc2",
+                    "exec",
+                    "demo/web/0",
+                    "wget",
+                    "-qO-",
+                    "http://echo.smoke-networks.svc.mc2:8080/",
+                ],
+                &["wget", "-qO-", "http://echo.smoke-networks.svc.mc2:8080/"],
+            ),
+            (
+                &["mc2", "exec", "demo/web/0", "ls", "--", "-l"],
+                &["ls", "--", "-l"],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Commands::Exec(args) = cli.command else {
+                panic!("expected exec command for {argv:?}");
+            };
+            assert_eq!(args.instance, "demo/web/0");
+            assert_eq!(args.cmd, expected, "argv: {argv:?}");
+        }
+    }
+
+    /// `--` explicitly escapes a guest argv that would otherwise look like a
+    /// flag, and still forwards everything verbatim.
+    #[test]
+    fn exec_double_dash_form_works() {
+        let cli =
+            Cli::try_parse_from(["mc2", "exec", "demo/web/0", "--", "/bin/sh", "-c", "x"]).unwrap();
+        let Commands::Exec(args) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(args.instance, "demo/web/0");
+        assert_eq!(args.cmd, ["/bin/sh", "-c", "x"]);
+    }
+
+    /// clap keeps `--help`/`-V` for `mc2` itself even after the instance ref
+    /// (standard CLI behaviour), so a *guest* `--help` needs `--`.
+    #[test]
+    fn exec_forwards_a_guest_help_after_the_double_dash() {
+        let cli = Cli::try_parse_from(["mc2", "exec", "demo/web/0", "--", "ls", "--help"]).unwrap();
+        let Commands::Exec(args) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(args.cmd, ["ls", "--help"]);
+    }
+
+    /// MC2's own global flags are recognised only before the instance ref; after
+    /// it they belong to the guest command.
+    #[test]
+    fn exec_global_flags_only_before_the_instance_ref() {
+        let cli = Cli::try_parse_from(["mc2", "--token", "mc2at_x", "exec", "demo/web/0", "env"])
+            .unwrap();
+        assert_eq!(cli.token.as_deref(), Some("mc2at_x"));
+        let Commands::Exec(args) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(args.cmd, ["env"]);
+
+        // After the instance ref it is a guest token, not MC2's `--token`
+        // (asserted via inequality so an ambient MC2_API_KEY cannot skew it).
+        let cli = Cli::try_parse_from(["mc2", "exec", "demo/web/0", "printenv", "--token=leaked"])
+            .unwrap();
+        assert_ne!(cli.token.as_deref(), Some("leaked"));
+        let Commands::Exec(args) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(args.cmd, ["printenv", "--token=leaked"]);
+    }
+
+    /// A missing command is still a clap error.
+    #[test]
+    fn exec_requires_a_command() {
+        assert!(Cli::try_parse_from(["mc2", "exec", "demo/web/0"]).is_err());
     }
 }

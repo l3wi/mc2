@@ -104,6 +104,25 @@ pub struct SshObserved {
     pub message: String,
 }
 
+/// Observed disk usage for one sandbox's writable root disk (msb metrics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// Guest-visible bytes used on the OCI upper (root) filesystem, in MiB.
+    pub used_mib: u64,
+    /// Guest-visible capacity (used + free), in MiB, when reported. The
+    /// filesystem overhead makes this smaller than the declared root-disk
+    /// size, so "full" must be judged against it.
+    pub capacity_mib: Option<u64>,
+}
+
+impl DiskUsage {
+    /// Capacity to judge usage against: the guest-visible size when known,
+    /// else the declared root-disk size.
+    pub fn limit_mib(&self, declared_mib: u64) -> u64 {
+        self.capacity_mib.unwrap_or(declared_mib)
+    }
+}
+
 /// One instance's reconcile report (phase + observed ssh/network).
 #[derive(Debug, Clone)]
 pub struct InstanceReport {
@@ -165,6 +184,7 @@ mod tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -190,6 +210,7 @@ mod tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -214,7 +235,7 @@ mod tests {
     #[test]
     fn work_item_carries_secrets_and_runtime_id() {
         let work = build_work_item();
-        assert_eq!(work.runtime_id, "demo-web-0");
+        assert_eq!(work.runtime_id, "demo--web--0");
         assert_eq!(work.secrets.len(), 1);
         assert_eq!(work.secrets[0].env, "API_TOKEN");
         assert_eq!(work.secrets[0].value, "plaintext-for-agent");
@@ -222,25 +243,36 @@ mod tests {
     }
 
     #[test]
-    fn volume_mount_plan_maps_spec_order() {
+    fn volume_bind_plan_maps_spec_order_and_sizes() {
         let mut work = build_work_item();
         work.stack = "demo".into();
         work.spec.volumes = vec![
             mc2_api::VolumeMount {
                 name: "data".into(),
                 mount: "/data".into(),
+                size_mib: 10 * 1024,
             },
             mc2_api::VolumeMount {
                 name: "cache".into(),
                 mount: "/var/cache".into(),
+                size_mib: 512,
             },
         ];
-        let plan = crate::volume_mount_plan(&work);
+        let usage = std::collections::HashMap::from([("mc2-demo--data".to_string(), 24u64)]);
+        let plan = crate::volume_bind_plan(&work, std::path::Path::new("/vols"), &usage);
         assert_eq!(
             plan,
             vec![
-                ("/data".to_string(), "mc2-demo--data".to_string()),
-                ("/var/cache".to_string(), "mc2-demo--cache".to_string()),
+                crate::VolumeMountPlan {
+                    guest: "/data".to_string(),
+                    host: std::path::PathBuf::from("/vols/mc2-demo--data"),
+                    quota_mib: 10 * 1024 - 24,
+                },
+                crate::VolumeMountPlan {
+                    guest: "/var/cache".to_string(),
+                    host: std::path::PathBuf::from("/vols/mc2-demo--cache"),
+                    quota_mib: 512,
+                },
             ]
         );
     }

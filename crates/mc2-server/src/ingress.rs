@@ -281,6 +281,7 @@ mod tests {
             node_name: None,
             node_selector: Default::default(),
             ssh: None,
+            storage_opt: None,
             expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
@@ -320,6 +321,7 @@ mod tests {
                 message: None,
                 spec_json: "{}".into(),
                 healthy: false,
+                applied_hash: None,
                 updated_at: String::new(),
             },
             InstanceRecord {
@@ -333,6 +335,7 @@ mod tests {
                 message: None,
                 spec_json: "{}".into(),
                 healthy: false,
+                applied_hash: None,
                 updated_at: String::new(),
             },
         ];
@@ -381,6 +384,7 @@ ingress:
             message: None,
             spec_json: "{}".into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
@@ -401,6 +405,7 @@ ingress:
             message: None,
             spec_json: "{}".into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let routes = build_ingress_routes_for_node("n1", &[("demo".into(), yaml)], &instances);
@@ -444,6 +449,7 @@ ingress:
             message: None,
             spec_json: "{}".into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let routes =
@@ -478,6 +484,7 @@ services:
             message: None,
             spec_json: "{}".into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let routes =
@@ -506,6 +513,7 @@ services:
             message: None,
             spec_json: "{}".into(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         }];
         let routes =
@@ -545,6 +553,7 @@ services:
             })
             .to_string(),
             healthy: false,
+            applied_hash: None,
             updated_at: String::new(),
         };
         let by_service: HashMap<String, Vec<&InstanceRecord>> =

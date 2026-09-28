@@ -51,7 +51,9 @@ pub async fn set_secret(
             "secret value must not be empty".into(),
         ));
     }
-    let (nonce, ciphertext) = key.encrypt(value.as_bytes()).context("encrypt secret")?;
+    let (nonce, ciphertext) = key
+        .encrypt(name, value.as_bytes())
+        .context("encrypt secret")?;
     Ok(store
         .put_secret_blob(name, &nonce, &ciphertext)
         .await
@@ -67,7 +69,7 @@ pub async fn decrypt_secret(store: Arc<dyn Store>, key: &SecretsKey, name: &str)
         .context("load secret")?
         .with_context(|| format!("secret not found: {name}"))?;
     let plain = key
-        .decrypt(&blob.nonce, &blob.ciphertext)
+        .decrypt(name, &blob.nonce, &blob.ciphertext)
         .context("decrypt secret")?;
     String::from_utf8(plain).context("secret is not valid utf-8")
 }
@@ -153,5 +155,29 @@ mod tests {
         let (to_inject, dropped) = filter_secret_refs(&r, &env);
         assert!(dropped.is_empty());
         assert_eq!(to_inject.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stored_secret_is_bound_to_its_name() {
+        use mc2_store::MemoryStore;
+        let store = MemoryStore::new();
+        let key = SecretsKey::from_bytes([3u8; 32]);
+        set_secret(store.clone(), &key, "DB_PASS", "s3cret")
+            .await
+            .unwrap();
+        assert_eq!(
+            decrypt_secret(store.clone(), &key, "DB_PASS")
+                .await
+                .unwrap(),
+            "s3cret"
+        );
+
+        // The same ciphertext stored under another name no longer authenticates.
+        let blob = store.get_secret_blob("DB_PASS").await.unwrap().unwrap();
+        store
+            .put_secret_blob("OTHER", &blob.nonce, &blob.ciphertext)
+            .await
+            .unwrap();
+        assert!(decrypt_secret(store.clone(), &key, "OTHER").await.is_err());
     }
 }

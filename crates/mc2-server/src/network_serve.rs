@@ -1,30 +1,40 @@
 //! Same-node mediated service network dataplane (D13).
 //!
 //! - **expose**: track msb loopback publish host ports (allocated at create).
-//! - **edges**: one shared user-space L4 splice per exposed `(service, port)`
-//!   on `127.0.0.1:<port>`; each connection **round-robins** across the Ready
-//!   backend replicas (read per connection, so no restart on phase churn).
-//!   All consumers route through the injected DNS gateway → the shared splice.
+//! - **listeners**: one **held** user-space L4 splice per exposed guest port `P`
+//!   on `127.0.0.1:P`, bound at the start of every reconcile pass — before any
+//!   backend exists — and kept for as long as `P` is exposed by any desired
+//!   instance. With no Ready backend a connection is accepted and closed.
+//! - **edges**: each connection **round-robins** across the Ready backends of
+//!   the port's owning `(stack, service)` (read per connection, so no restart on
+//!   phase churn). All consumers route through the injected DNS gateway → the
+//!   shared splice, so `P` is the whole identity of the edge.
 //! - DNS names injected into guest `/etc/hosts` → gateway IP.
 //! - Never enables full Host/Private profiles (policy is create-time narrow rules).
 //!
-//! Port collision note: splices share the host loopback, so exposed guest
-//! ports must be unique (validated within a stack; a cross-stack collision
-//! makes the late splice report `Failed`).
+//! Port claims are exclusive server-wide (enforced at apply), so a splice is
+//! keyed by port alone. A **bind failure** is recorded and reported per port; a
+//! consumer whose allowed port has no listener is failed closed by the node loop
+//! (its create-time `Host:tcp:P` rule must never reach a foreign process).
 
 use mc2_runtime::{
-    DesiredSandbox, InstanceReport, NetworkEdgeStatus, NetworkExposeStatus, NetworkObserved,
-    NetworkPhase,
+    DesiredSandbox, InstanceReport, NetworkAllowDesired, NetworkEdgeStatus, NetworkExposeStatus,
+    NetworkObserved, NetworkPhase,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+/// Consecutive accept failures before a splice task gives up; the next pass
+/// re-binds it (see [`NetworkTable::ensure_listeners`]).
+const MAX_ACCEPT_ERRORS: u32 = 8;
 
 #[derive(Debug, Clone)]
 struct ExposeBinding {
@@ -32,8 +42,8 @@ struct ExposeBinding {
     host_port: u16,
 }
 
-/// Shared backend registry: (service, guest_port) → ready host sockets.
-type BackendRegistry = Arc<Mutex<HashMap<(String, u16), Vec<SocketAddr>>>>;
+/// Shared backend registry: exposed guest port → ready host sockets.
+type BackendRegistry = Arc<Mutex<HashMap<u16, Vec<SocketAddr>>>>;
 
 /// Per-node network state.
 pub struct NetworkTable {
@@ -43,11 +53,11 @@ pub struct NetworkTable {
     publish_index: Arc<Mutex<HashMap<String, HashMap<u16, u16>>>>,
     /// instance_id → last successful hosts inject key (names+gw).
     hosts_key: HashMap<String, String>,
-    /// (service, guest_port) → shared splice task (one per exposed port).
-    splices: HashMap<(String, u16), JoinHandle<()>>,
-    /// (service, guest_port) whose splice failed to bind (port collision).
-    failed_splices: HashSet<(String, u16)>,
-    /// Ready backend host sockets per (service, guest_port); read per connection.
+    /// exposed guest port → held splice task (ports are exclusive server-wide).
+    splices: HashMap<u16, JoinHandle<()>>,
+    /// exposed guest port → why its splice could not bind (fail-closed signal).
+    failed_splices: HashMap<u16, String>,
+    /// Ready backend host sockets per exposed guest port; read per connection.
     backends: BackendRegistry,
     /// Round-robin cursor across the table.
     rr_counter: Arc<AtomicUsize>,
@@ -60,7 +70,7 @@ impl NetworkTable {
             publish_index: Arc::new(Mutex::new(HashMap::new())),
             hosts_key: HashMap::new(),
             splices: HashMap::new(),
-            failed_splices: HashSet::new(),
+            failed_splices: HashMap::new(),
             backends: Arc::new(Mutex::new(HashMap::new())),
             rr_counter: Arc::new(AtomicUsize::new(0)),
         }
@@ -133,13 +143,67 @@ impl NetworkTable {
         Ok(())
     }
 
-    /// Rebuild the shared backend registry and reconcile splice tasks.
+    /// Bind (and hold) one splice listener per exposed port in the desired set.
     ///
-    /// Called once per reconcile after every instance's exposes are prepared
-    /// and observed. One splice per exposed (service, port); stale splices are
-    /// aborted, new ones started, and the backends map is swapped so running
-    /// splices re-target without restarting.
-    pub async fn reconcile_splices(
+    /// Runs **before** the per-instance loop and regardless of backend phase:
+    /// an exposed port is claimed from apply until the stack is removed, so a
+    /// client sees accept-then-close while no backend is Ready rather than
+    /// connection-refused (and a foreign host process can never take the port
+    /// while the claim lives). Stale listeners are aborted; a listener whose
+    /// task finished is re-bound. A bind failure is recorded per port and makes
+    /// consumers fail closed in the node loop.
+    pub async fn ensure_listeners(&mut self, desired: &[DesiredSandbox]) {
+        let mut wanted: BTreeSet<u16> = BTreeSet::new();
+        for d in desired {
+            for ex in &d.network.exposes {
+                wanted.insert(ex.guest_port);
+            }
+        }
+
+        // Abort listeners for ports no longer exposed by any desired instance.
+        let stale: Vec<u16> = self
+            .splices
+            .keys()
+            .copied()
+            .filter(|p| !wanted.contains(p))
+            .collect();
+        for port in stale {
+            if let Some(h) = self.splices.remove(&port) {
+                h.abort();
+                info!(port, "network splice stopped (port no longer exposed)");
+            }
+        }
+        self.failed_splices.retain(|port, _| wanted.contains(port));
+
+        for &port in &wanted {
+            // Keep a live listener; re-bind when the task gave up earlier.
+            if self.splices.get(&port).is_some_and(|h| !h.is_finished()) {
+                continue;
+            }
+            self.splices.remove(&port);
+            match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
+                Ok(listener) => {
+                    let backends = self.backends.clone();
+                    let counter = self.rr_counter.clone();
+                    let handle = tokio::spawn(splice_loop(listener, port, backends, counter));
+                    self.splices.insert(port, handle);
+                    self.failed_splices.remove(&port);
+                    info!(port, "network shared splice listening");
+                }
+                Err(e) => {
+                    let cause = format!("bind 127.0.0.1:{port} failed: {e}");
+                    warn!(port, error = %e, "network splice bind failed");
+                    self.failed_splices.insert(port, cause);
+                }
+            }
+        }
+    }
+
+    /// Rebuild the shared backend registry from the current desired set and the
+    /// phases observed this pass. Running backends only; a port with no backend
+    /// stays listening but accepts-and-closes. Swapping the map re-targets live
+    /// splices without restarting them.
+    pub async fn update_backends(
         &mut self,
         desired: &[DesiredSandbox],
         reports: &[InstanceReport],
@@ -149,7 +213,7 @@ impl NetworkTable {
             .map(|r| (r.instance_id.as_str(), r.phase.as_str()))
             .collect();
 
-        let mut new_backends: HashMap<(String, u16), Vec<SocketAddr>> = HashMap::new();
+        let mut new_backends: HashMap<u16, Vec<SocketAddr>> = HashMap::new();
         {
             let idx = self.publish_index.lock().await;
             for d in desired {
@@ -165,7 +229,7 @@ impl NetworkTable {
                 for ex in &d.network.exposes {
                     if let Some(host) = hosts.get(&ex.guest_port) {
                         new_backends
-                            .entry((d.service.clone(), ex.guest_port))
+                            .entry(ex.guest_port)
                             .or_default()
                             .push(SocketAddr::from(([127, 0, 0, 1], *host)));
                     }
@@ -177,47 +241,29 @@ impl NetworkTable {
             v.sort_by_key(|a| a.port());
         }
 
-        // Abort splices whose (service, port) is no longer served.
-        let keep: HashSet<(String, u16)> = new_backends.keys().cloned().collect();
-        let stale: Vec<(String, u16)> = self
-            .splices
-            .keys()
-            .filter(|k| !keep.contains(k))
-            .cloned()
-            .collect();
-        for k in stale {
-            if let Some(h) = self.splices.remove(&k) {
-                h.abort();
-            }
-        }
+        let mut b = self.backends.lock().await;
+        *b = new_backends;
+    }
 
-        // Start missing splices.
-        for key in new_backends.keys() {
-            if self.splices.contains_key(key) {
-                continue;
-            }
-            let (service, port) = key.clone();
-            match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
-                Ok(listener) => {
-                    let backends = self.backends.clone();
-                    let counter = self.rr_counter.clone();
-                    let handle =
-                        tokio::spawn(splice_loop(listener, key.clone(), backends, counter));
-                    self.splices.insert(key.clone(), handle);
-                    self.failed_splices.remove(key);
-                    info!(service, port, "network shared splice started");
+    /// Allowed ports with no live listener we bound, with the reason.
+    ///
+    /// The node loop refuses to create such an instance: a create-time
+    /// `Host:tcp:P` egress rule cannot be narrowed later, so a VM whose rule
+    /// could reach a foreign process on `P` must never start (A3, fail closed).
+    pub fn listener_gaps(&self, allows: &[NetworkAllowDesired]) -> Vec<(u16, String)> {
+        let ports: BTreeSet<u16> = allows.iter().map(|a| a.port).collect();
+        ports
+            .into_iter()
+            .filter_map(|port| {
+                if self.splices.get(&port).is_some_and(|h| !h.is_finished()) {
+                    return None;
                 }
-                Err(e) => {
-                    warn!(service, port, error = %e, "network splice bind failed (port collision?)");
-                    self.failed_splices.insert(key.clone());
-                }
-            }
-        }
-
-        {
-            let mut b = self.backends.lock().await;
-            *b = new_backends;
-        }
+                let cause = self.failed_splices.get(&port).cloned().unwrap_or_else(|| {
+                    format!("no service exposing port {port} is scheduled on this node")
+                });
+                Some((port, cause))
+            })
+            .collect()
     }
 
     /// After sandbox is Running: inject DNS hosts + report network status.
@@ -250,15 +296,14 @@ impl NetworkTable {
 
         let backends = self.backends.lock().await;
         for a in &desired.network.allows {
-            let key = (a.to_service.clone(), a.port);
-            let (phase, message) = if self.failed_splices.contains(&key) {
-                (
-                    NetworkPhase::Failed.as_str(),
-                    "network splice could not bind port (collision?)".to_string(),
-                )
+            let (phase, message) = if let Some(cause) = self.failed_splices.get(&a.port) {
+                (NetworkPhase::Failed.as_str(), cause.clone())
             } else {
-                let has = self.splices.contains_key(&key);
-                let up = backends.get(&key).map(|v| !v.is_empty()).unwrap_or(false);
+                let has = self.splices.get(&a.port).is_some_and(|h| !h.is_finished());
+                let up = backends
+                    .get(&a.port)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
                 if has && up {
                     (NetworkPhase::Ready.as_str(), String::new())
                 } else {
@@ -327,8 +372,8 @@ impl NetworkTable {
             .map(|v| v.iter().map(|b| b.host_port).collect())
     }
 
-    /// Clear per-instance expose state before force-recreate. Shared splices
-    /// are untouched; `reconcile_splices` re-targets on the next cycle.
+    /// Clear per-instance expose state before force-recreate. Shared listeners
+    /// are untouched; `update_backends` re-targets on the next cycle.
     pub async fn drop_instance(&mut self, instance_id: &str) {
         self.hosts_key.remove(instance_id);
         self.exposes.remove(instance_id);
@@ -424,37 +469,55 @@ impl NetworkTable {
 }
 
 /// Shared splice task: bind once, forward each connection round-robin across
-/// the current Ready backends for `key`. Reads the registry per connection so
-/// replica changes take effect without restarting the listener.
+/// the current Ready backends for `port`. Reads the registry per connection so
+/// replica changes take effect without restarting the listener. With no backend
+/// the connection is accepted and closed. A transient accept error is retried
+/// with backoff; after `MAX_ACCEPT_ERRORS` in a row the task ends so the next
+/// reconcile re-binds a fresh listener.
 async fn splice_loop(
     listener: TcpListener,
-    key: (String, u16),
+    port: u16,
     backends: BackendRegistry,
     counter: Arc<AtomicUsize>,
 ) {
+    let mut consecutive_errors = 0u32;
     loop {
-        let Ok((inbound, _)) = listener.accept().await else {
-            break;
-        };
-        let key = key.clone();
-        let backends = backends.clone();
-        let counter = counter.clone();
-        tokio::spawn(async move {
-            let dest = {
-                let b = backends.lock().await;
-                match b.get(&key) {
-                    Some(v) if !v.is_empty() => {
-                        let idx = counter.fetch_add(1, Ordering::Relaxed) % v.len();
-                        v[idx]
+        match listener.accept().await {
+            Ok((inbound, _)) => {
+                consecutive_errors = 0;
+                let backends = backends.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let dest = {
+                        let b = backends.lock().await;
+                        match b.get(&port) {
+                            Some(v) if !v.is_empty() => {
+                                let idx = counter.fetch_add(1, Ordering::Relaxed) % v.len();
+                                v[idx]
+                            }
+                            _ => return,
+                        }
+                    };
+                    if let Ok(mut outbound) = TcpStream::connect(dest).await {
+                        let mut inbound = inbound;
+                        let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
-                    _ => return,
-                }
-            };
-            if let Ok(mut outbound) = TcpStream::connect(dest).await {
-                let mut inbound = inbound;
-                let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
             }
-        });
+            Err(e) => {
+                consecutive_errors += 1;
+                warn!(
+                    port,
+                    error = %e,
+                    attempt = consecutive_errors,
+                    "network splice accept failed"
+                );
+                if consecutive_errors >= MAX_ACCEPT_ERRORS {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50u64 << consecutive_errors.min(5))).await;
+            }
+        }
     }
 }
 
@@ -473,27 +536,24 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn allow(to: &str, port: u16) -> NetworkAllowDesired {
+        NetworkAllowDesired {
+            to_service: to.into(),
+            port,
+            protocol: "tcp".into(),
+            fqdn: format!("{to}.shop.svc.mc2"),
+            short_name: to.into(),
+        }
+    }
+
     fn desired(
         instance_id: &str,
         service: &str,
         guest_port: u16,
-        allow: Option<(&str, u16)>,
+        allow_edge: Option<(&str, u16)>,
     ) -> DesiredSandbox {
         use mc2_api::ServiceSpec;
-        let mut allows = Vec::new();
-        if let Some((to, port)) = allow {
-            allows.push(NetworkAllowDesired {
-                to_service: to.into(),
-                port,
-                protocol: "tcp".into(),
-                fqdn: format!("{to}.shop.svc.mc2"),
-                short_name: to.into(),
-                backend_instance_id: String::new(),
-                backend_node_id: String::new(),
-                backend_local: true,
-                backend_ordinal: 0,
-            });
-        }
+        let allows = allow_edge.map(|(to, p)| allow(to, p)).into_iter().collect();
         DesiredSandbox {
             instance_id: instance_id.into(),
             stack: "shop".into(),
@@ -517,6 +577,7 @@ mod tests {
                 node_name: None,
                 node_selector: Default::default(),
                 ssh: None,
+                storage_opt: None,
                 expose: vec![mc2_api::ExposeSpec {
                     port: guest_port,
                     protocol: "tcp".into(),
@@ -534,6 +595,17 @@ mod tests {
                 }],
                 allows,
             },
+        }
+    }
+
+    fn report(instance_id: &str, phase: &str) -> InstanceReport {
+        InstanceReport {
+            instance_id: instance_id.into(),
+            phase: phase.into(),
+            message: String::new(),
+            runtime_id: String::new(),
+            ssh: None,
+            network: None,
         }
     }
 
@@ -559,6 +631,41 @@ mod tests {
         port
     }
 
+    /// Connect and read; returns the bytes received (empty = accepted then closed).
+    async fn read_from(port: u16) -> Vec<u8> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 8];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+            Ok(Ok(n)) => buf[..n].to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_listeners_binds_without_backend_and_connection_is_closed() {
+        let mut table = NetworkTable::new();
+        let guest_port = reserve_ephemeral().await.unwrap();
+        let d = desired("i-db-0", "db", guest_port, Some(("db", guest_port)));
+
+        // Bound before any backend exists (phase Pending).
+        table.ensure_listeners(std::slice::from_ref(&d)).await;
+        assert!(
+            table.splices.contains_key(&guest_port),
+            "listener held with no Running backend"
+        );
+        assert!(table.failed_splices.is_empty());
+        assert!(table.listener_gaps(&d.network.allows).is_empty());
+
+        // A connection is accepted and closed (no backend to forward to).
+        assert_eq!(read_from(guest_port).await.len(), 0);
+
+        // Still accepted-and-closed after a non-Running report.
+        table
+            .update_backends(std::slice::from_ref(&d), &[report("i-db-0", "Creating")])
+            .await;
+        assert_eq!(read_from(guest_port).await.len(), 0);
+    }
+
     #[tokio::test]
     async fn shared_splice_round_robins_across_ready_replicas() {
         let mut table = NetworkTable::new();
@@ -582,41 +689,20 @@ mod tests {
         table.exposes.remove("i-db-0");
         table.exposes.remove("i-db-1");
 
-        let reports = vec![
-            InstanceReport {
-                instance_id: "i-db-0".into(),
-                phase: "Running".into(),
-                message: String::new(),
-                runtime_id: String::new(),
-                ssh: None,
-                network: None,
-            },
-            InstanceReport {
-                instance_id: "i-db-1".into(),
-                phase: "Running".into(),
-                message: String::new(),
-                runtime_id: String::new(),
-                ssh: None,
-                network: None,
-            },
-        ];
-        table.reconcile_splices(&[d1, d2], &reports).await;
+        table.ensure_listeners(&[d1.clone(), d2.clone()]).await;
+        table
+            .update_backends(
+                &[d1, d2],
+                &[report("i-db-0", "Running"), report("i-db-1", "Running")],
+            )
+            .await;
         assert!(table.failed_splices.is_empty());
 
         // Two connections → each lands on a different backend.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..2 {
-            let mut stream = TcpStream::connect(("127.0.0.1", guest_port)).await.unwrap();
-            let mut buf = [0u8; 8];
-            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
-            let port: u16 = std::str::from_utf8(&buf[..n])
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let buf = read_from(guest_port).await;
+            let port: u16 = std::str::from_utf8(&buf).unwrap().trim().parse().unwrap();
             seen.insert(port);
         }
         assert_eq!(
@@ -631,20 +717,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_splice_when_no_ready_backend() {
+    async fn stale_listener_aborted_when_port_no_longer_exposed() {
         let mut table = NetworkTable::new();
-        let d = desired("i-db-0", "db", 5432, None);
-        table.prepare_exposes(&mut d.clone()).await.unwrap();
-        let reports = vec![InstanceReport {
-            instance_id: "i-db-0".into(),
-            phase: "Creating".into(),
-            message: String::new(),
-            runtime_id: String::new(),
-            ssh: None,
-            network: None,
-        }];
-        table.reconcile_splices(&[d], &reports).await;
+        let guest_port = reserve_ephemeral().await.unwrap();
+        let d = desired("i-db-0", "db", guest_port, None);
+
+        table.ensure_listeners(&[d]).await;
+        assert!(table.splices.contains_key(&guest_port));
+
+        // Nothing exposes the port any more → listener aborted, port released.
+        table.ensure_listeners(&[]).await;
         assert!(table.splices.is_empty());
+        let mut released = false;
+        for _ in 0..50 {
+            if std::net::TcpListener::bind(("127.0.0.1", guest_port)).is_ok() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
+            "the held port must be released once no instance exposes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_listener_is_rebound_on_next_pass() {
+        let mut table = NetworkTable::new();
+        let guest_port = reserve_ephemeral().await.unwrap();
+        let d = desired("i-db-0", "db", guest_port, None);
+
+        table.ensure_listeners(std::slice::from_ref(&d)).await;
+        table.splices.get(&guest_port).unwrap().abort();
+        for _ in 0..50 {
+            if table
+                .splices
+                .get(&guest_port)
+                .is_some_and(|h| h.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(table.splices.get(&guest_port).unwrap().is_finished());
+
+        // Next pass re-binds a fresh listener rather than leaving the port dead.
+        table.ensure_listeners(&[d]).await;
+        assert!(!table.splices.get(&guest_port).unwrap().is_finished());
+        assert_eq!(read_from(guest_port).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bind_failure_is_recorded_and_reported_as_a_listener_gap() {
+        let mut table = NetworkTable::new();
+        let guest_port = reserve_ephemeral().await.unwrap();
+        // A foreign process holds the loopback port.
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", guest_port)).unwrap();
+
+        let d = desired("i-app-0", "app", guest_port, Some(("db", guest_port)));
+        table.ensure_listeners(std::slice::from_ref(&d)).await;
+        assert!(
+            table.failed_splices.contains_key(&guest_port),
+            "bind failure recorded"
+        );
+        let gaps = table.listener_gaps(&d.network.allows);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, guest_port);
+        assert!(gaps[0].1.contains("bind"), "{}", gaps[0].1);
+
+        // Once the port is free the next pass binds it and clears the failure.
+        drop(squatter);
+        table.ensure_listeners(std::slice::from_ref(&d)).await;
         assert!(table.failed_splices.is_empty());
+        assert!(table.listener_gaps(&d.network.allows).is_empty());
+    }
+
+    #[tokio::test]
+    async fn listener_gap_reported_for_a_port_no_instance_exposes() {
+        let table = NetworkTable::new();
+        let d = desired("i-app-0", "app", 8080, Some(("db", 5432)));
+        let gaps = table.listener_gaps(&d.network.allows);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].0, 5432);
+        assert!(gaps[0].1.contains("no service exposing"), "{}", gaps[0].1);
     }
 }

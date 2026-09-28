@@ -180,15 +180,85 @@ fn server_init_only_writes_data_dir() {
     );
     assert!(dir.path().join("mc2.db").is_file());
     assert!(dir.path().join("secrets.key").is_file());
+
+    // Non-TTY stderr: the token is written to a 0600 file, never to the logs.
+    let token_path = dir.path().join("bootstrap-token");
+    assert!(
+        token_path.is_file(),
+        "expected bootstrap token file at {}",
+        token_path.display()
+    );
+    let token = std::fs::read_to_string(&token_path).unwrap();
+    let token = token.trim();
+    assert!(token.starts_with("mc2at_"), "token file: {token}");
+    assert!(token.len() > 20, "token file: {token}");
+
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        combined.contains("API token") || combined.contains("mc2at_"),
-        "expected bootstrap credentials in output: {combined}"
+        !combined.contains(token),
+        "token value must not be logged/written to output: {combined}"
     );
+    assert!(
+        combined.contains("bootstrap-token"),
+        "expected the token file path to be logged: {combined}"
+    );
+}
+
+#[test]
+fn server_token_rotate_replaces_the_token() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    let init = mc2()
+        .args(["server", "--data-dir", path, "--init-only"])
+        .output()
+        .expect("init");
+    assert!(init.status.success());
+    let first = std::fs::read_to_string(dir.path().join("bootstrap-token"))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let rotate = mc2()
+        .args(["server", "token", "rotate", "--data-dir", path])
+        .output()
+        .expect("rotate");
+    assert!(
+        rotate.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&rotate.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&rotate.stdout);
+    let new_token = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("mc2at_"))
+        .unwrap_or_else(|| panic!("no token in rotate output: {stdout}"));
+    assert_ne!(new_token, first, "rotate must mint a new token");
+    assert!(
+        stdout.contains("mc2 context set"),
+        "rotate should tell the operator to update contexts: {stdout}"
+    );
+}
+
+#[test]
+fn server_token_rotate_without_data_dir_fails() {
+    let dir = tempdir().unwrap();
+    let out = mc2()
+        .args([
+            "server",
+            "token",
+            "rotate",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("rotate");
+    assert!(!out.status.success(), "rotate on an empty dir must fail");
 }
 
 #[test]
@@ -439,7 +509,9 @@ fn exec_and_logs_reach_server_or_clean_error() {
         vec!["logs", "demo/web/0", "--tail", "5", "--follow"],
     ] {
         let mut cmd = mc2();
-        cmd.args(&args).args(["--api", "http://127.0.0.1:1"]);
+        // `--api` must precede the subcommand: after `exec`'s instance ref every
+        // token is guest argv.
+        cmd.args(["--api", "http://127.0.0.1:1"]).args(&args);
         let out = cmd.output().expect("run");
         assert!(!out.status.success(), "expected failure for {args:?}");
     }
@@ -471,6 +543,18 @@ struct LiveServer {
 
 impl LiveServer {
     fn start() -> LiveServer {
+        // Picking a free port and handing it to the server races with other
+        // tests binding ephemeral ports; retry on a fresh port if the server
+        // exits (bind failure) or something else answers there.
+        for _ in 0..5 {
+            if let Some(srv) = Self::try_start() {
+                return srv;
+            }
+        }
+        panic!("mc2 server did not start after 5 attempts");
+    }
+
+    fn try_start() -> Option<LiveServer> {
         let dir = tempdir().unwrap();
         let volumes_dir = dir.path().join("volumes");
         std::fs::create_dir_all(&volumes_dir).unwrap();
@@ -502,19 +586,36 @@ impl LiveServer {
             _dir: dir,
             volumes_dir,
         };
-        srv.wait_ready();
-        srv
+        srv.wait_ready().then_some(srv)
     }
 
-    fn wait_ready(&mut self) {
+    /// True once *our* server answers `/health`; false if it exited or never
+    /// answered (the caller retries on a new port).
+    fn wait_ready(&mut self) -> bool {
+        use std::io::{Read, Write};
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
-            if TcpStream::connect(self.addr()).is_ok() {
-                return;
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            if let Ok(mut s) = TcpStream::connect(self.addr()) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let req = format!(
+                    "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    self.addr()
+                );
+                let mut body = String::new();
+                if s.write_all(req.as_bytes()).is_ok()
+                    && s.read_to_string(&mut body).is_ok()
+                    && body.contains("mc2-server")
+                    && matches!(self.child.try_wait(), Ok(None))
+                {
+                    return true;
+                }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("server did not become ready at {}", self.base);
+        false
     }
 
     fn addr(&self) -> String {
@@ -523,7 +624,9 @@ impl LiveServer {
 
     fn run(&self, args: &[&str]) -> std::process::Output {
         let mut c = mc2();
-        c.args(args).args(["--api", self.base.as_str()]);
+        // `--api` goes first: after an `exec` instance ref every token is guest
+        // argv, so a trailing `--api` would be forwarded into the sandbox.
+        c.args(["--api", self.base.as_str()]).args(args);
         c.output().expect("run cli")
     }
 

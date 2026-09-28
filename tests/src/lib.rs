@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use mc2_server::{router, AppState, Bootstrap};
-use mc2_store::{NodeJoin, SecretsKey, SqliteStore, Store};
+use mc2_store::{NodeJoin, SqliteStore, Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,8 +48,27 @@ impl TestCluster {
         Self::start_with_opts(with_node, Some(volume_dir)).await
     }
 
+    /// Start with an explicit resource budget (`--limit-*`) and optional
+    /// volume root — for apply-time disk-reservation tests.
+    pub async fn start_with_limits(
+        with_node: bool,
+        volume_dir: Option<PathBuf>,
+        limits: mc2_server::ResourceLimits,
+    ) -> Result<Self> {
+        Self::start_with_opts_and_limits(with_node, volume_dir, limits).await
+    }
+
     /// Shared start: bootstrap + REST server + (optional) auto local node.
     pub async fn start_with_opts(with_node: bool, volume_dir: Option<PathBuf>) -> Result<Self> {
+        Self::start_with_opts_and_limits(with_node, volume_dir, Default::default()).await
+    }
+
+    /// Shared start with an explicit resource budget.
+    pub async fn start_with_opts_and_limits(
+        with_node: bool,
+        volume_dir: Option<PathBuf>,
+        limits: mc2_server::ResourceLimits,
+    ) -> Result<Self> {
         let dir = tempfile::tempdir().context("tempdir")?;
         let data_dir = dir.path().to_path_buf();
         let secrets_key_path = data_dir.join("secrets.key");
@@ -57,7 +76,6 @@ impl TestCluster {
         let boot = Bootstrap {
             data_dir: data_dir.clone(),
             secrets_key_path,
-            no_auth: false,
         }
         .ensure()
         .await
@@ -71,8 +89,7 @@ impl TestCluster {
             .await
             .context("open store")?;
 
-        let secrets_key =
-            Arc::new(SecretsKey::load_file(&boot.secrets_key_path).context("load secrets key")?);
+        let secrets_key = Arc::new(boot.secrets_key);
 
         let state = AppState {
             store: store.clone() as Arc<dyn Store>,
@@ -81,7 +98,14 @@ impl TestCluster {
             secrets_key,
             volume_dir,
             runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
-            limits: Default::default(),
+            limits,
+            http_limits: mc2_server::HttpLimits::default(),
+            no_auth: false,
+            rest_port: 0,
+            allow_host_profile: false,
+            // Hermetic: no real host-port probing in integration tests.
+            port_probe: |_p| Ok(()),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

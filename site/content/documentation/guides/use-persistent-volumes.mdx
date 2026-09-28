@@ -33,21 +33,21 @@ is the only kind in v1.
 
 ```bash
 mc2 up -f stack.yaml
-mc2 exec smoke-volumes/keep/0 'echo durable > /data/marker.txt'
+mc2 exec smoke-volumes/keep/0 /bin/sh -c 'echo durable > /data/marker.txt'
 ```
 
 Now make the sandbox be recreated — change the command (a spec change forces
 recreate) or trigger a `restart`:
 
 ```bash
-mc2 exec smoke-volumes/keep/0 'kill 1'   # restart: no → will not recreate; use spec change instead
+mc2 exec smoke-volumes/keep/0 /bin/sh -c 'kill 1'   # restart: no → will not recreate; use spec change instead
 ```
 
 For the reliable path, edit the stack (e.g. add a label) and re-apply:
 
 ```bash
 mc2 up -f stack.yaml     # idempotent, but a spec change recreates the sandbox
-mc2 exec smoke-volumes/keep/0 'cat /data/marker.txt'
+mc2 exec smoke-volumes/keep/0 cat /data/marker.txt
 # durable
 ```
 
@@ -58,7 +58,7 @@ The marker survived because the volume lives on the node
 
 ```bash
 mc2 down smoke-volumes          # volume retained
-ls ~/.microsandbox/volumes      # mc2-smoke-volumes--data still there
+ls ~/.mc2/volumes               # mc2-smoke-volumes--data still there
 
 mc2 down smoke-volumes --volumes   # now the volume is deleted
 ```
@@ -66,7 +66,7 @@ mc2 down smoke-volumes --volumes   # now the volume is deleted
 ## Key behaviors
 
 - **Node-local named directory volumes.** Stored under
-  `mc2 server --volume-dir` (default `~/.microsandbox/volumes`).
+  `mc2 server --volume-dir` (default `~/.mc2/volumes`).
 - **Retained on remove, deleted on `--volumes`.** Think of `down` as
   stopping, `down --volumes` as destroying.
 - **Name-namespaced.** `mc2-<stack>--<volume>` means two stacks can each

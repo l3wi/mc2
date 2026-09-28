@@ -3,17 +3,16 @@
 use crate::{
     ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
     InstanceNetworkRecord, InstanceRecord, InstanceSshRecord, NodeHeartbeat, NodeJoin, NodeRecord,
-    SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store, StoreError,
+    SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan, StackRecord, Store, StoreError,
 };
 use anyhow::{Context, Result as AnyResult};
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 /// SQLite implementation of [`Store`].
@@ -102,6 +101,7 @@ impl SqliteStore {
             message: row.get("message"),
             spec_json: row.get("spec_json"),
             healthy: row.get::<i64, _>("healthy") != 0,
+            applied_hash: row.get("applied_hash"),
             updated_at: row.get("updated_at"),
         }
     }
@@ -156,21 +156,22 @@ impl Store for SqliteStore {
         let Some(meta) = self.get_cluster_meta().await? else {
             return Ok(false);
         };
-        if meta.api_token_hash.is_empty() {
-            return Ok(true);
-        }
         if token.is_empty() {
             return Ok(false);
         }
         Ok(verify_token(token, &meta.api_token_hash))
     }
 
-    async fn api_auth_required(&self) -> Result<bool, StoreError> {
-        Ok(self
-            .get_cluster_meta()
-            .await?
-            .map(|m| !m.api_token_hash.is_empty())
-            .unwrap_or(true))
+    async fn replace_api_token_hash(&self, api_token_hash: &str) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE cluster_meta SET api_token_hash = ?1 WHERE id = 1")
+            .bind(api_token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotInitialized);
+        }
+        Ok(())
     }
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {
@@ -228,68 +229,79 @@ impl Store for SqliteStore {
     }
 
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
-        let existing = sqlx::query(
-            r#"SELECT id, name, labels_json, arch, cpus, memory_mib, status,
-                      last_heartbeat, created_at
-               FROM nodes WHERE name = ?1"#,
-        )
-        .bind(&join.name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
+        // Singleton: the node id is persisted under a settings key and reused
+        // for every later start, so renaming the node keeps its placements.
+        let stored_id = self.get_setting(crate::SETTING_LOCAL_NODE_ID).await?;
+        let existing_id = match stored_id.filter(|id| !id.is_empty()) {
+            Some(id) => Some(id),
+            None => {
+                // Pre-existing row for this display name (or first ever start):
+                // adopt its id so placements survive regardless.
+                let row = sqlx::query("SELECT id FROM nodes WHERE name = ?1")
+                    .bind(&join.name)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| StoreError::Other(e.into()))?;
+                row.map(|r| r.get::<String, _>("id"))
+            }
+        };
 
         let now = Utc::now().to_rfc3339();
+        // A known id wins even if its row is gone (the row is recreated with the
+        // same id, so placements stay attached); otherwise adopt the row with
+        // this display name, else mint a fresh id.
+        let id = match existing_id {
+            Some(id) => id,
+            None => Uuid::new_v4().to_string(),
+        };
 
-        if let Some(row) = existing {
-            let id: String = row.get("id");
-            sqlx::query(
-                r#"
-                UPDATE nodes SET
-                  labels_json = ?1,
-                  arch = ?2,
-                  cpus = ?3,
-                  memory_mib = ?4,
-                  status = 'Ready',
-                  last_heartbeat = ?5
-                WHERE id = ?6
-                "#,
-            )
-            .bind(&join.labels_json)
-            .bind(&join.arch)
-            .bind(join.cpus as i64)
-            .bind(join.memory_mib as i64)
-            .bind(&now)
-            .bind(&id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-
-            return self
-                .get_node(&id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound(id));
-        }
-
-        let id = Uuid::new_v4().to_string();
-        sqlx::query(
+        let res = sqlx::query(
             r#"
-            INSERT INTO nodes (
-              id, name, labels_json, arch, cpus, memory_mib, status,
-              last_heartbeat, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Ready', ?7, ?8)
+            UPDATE nodes SET
+              name = ?1,
+              labels_json = ?2,
+              arch = ?3,
+              cpus = ?4,
+              memory_mib = ?5,
+              status = 'Ready',
+              last_heartbeat = ?6
+            WHERE id = ?7
             "#,
         )
-        .bind(&id)
         .bind(&join.name)
         .bind(&join.labels_json)
         .bind(&join.arch)
         .bind(join.cpus as i64)
         .bind(join.memory_mib as i64)
         .bind(&now)
-        .bind(&now)
+        .bind(&id)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Other(e.into()))?;
+
+        if res.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO nodes (
+                  id, name, labels_json, arch, cpus, memory_mib, status,
+                  last_heartbeat, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Ready', ?7, ?8)
+                "#,
+            )
+            .bind(&id)
+            .bind(&join.name)
+            .bind(&join.labels_json)
+            .bind(&join.arch)
+            .bind(join.cpus as i64)
+            .bind(join.memory_mib as i64)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        }
+
+        self.set_setting(crate::SETTING_LOCAL_NODE_ID, &id).await?;
 
         self.get_node(&id)
             .await?
@@ -353,61 +365,132 @@ impl Store for SqliteStore {
         Ok(row.as_ref().map(Self::map_node))
     }
 
-    async fn mark_stale_nodes(&self, grace: Duration) -> Result<u32, StoreError> {
-        let cutoff =
-            Utc::now() - ChronoDuration::from_std(grace).unwrap_or(ChronoDuration::seconds(30));
-        let cutoff_s = cutoff.to_rfc3339();
-        let res = sqlx::query(
-            r#"
-            UPDATE nodes
-            SET status = 'NotReady'
-            WHERE status = 'Ready'
-              AND (last_heartbeat IS NULL OR last_heartbeat < ?1)
-            "#,
-        )
-        .bind(&cutoff_s)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
-        Ok(res.rows_affected() as u32)
-    }
-
-    async fn upsert_stack(
-        &self,
-        name: &str,
-        labels_json: &str,
-        raw_yaml: &str,
-    ) -> Result<StackRecord, StoreError> {
+    async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError> {
         let now = Utc::now().to_rfc3339();
-        let existing = self.get_stack(name).await?;
-        if existing.is_some() {
-            sqlx::query(
-                r#"UPDATE stacks SET labels_json = ?1, raw_yaml = ?2, updated_at = ?3 WHERE name = ?4"#,
-            )
-            .bind(labels_json)
-            .bind(raw_yaml)
-            .bind(&now)
-            .bind(name)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
-        } else {
-            sqlx::query(
-                r#"INSERT INTO stacks (name, labels_json, raw_yaml, created_at, updated_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
-            )
-            .bind(name)
-            .bind(labels_json)
-            .bind(raw_yaml)
-            .bind(&now)
-            .bind(&now)
-            .execute(&self.pool)
+
+        // The stack row: update in place (keeping created_at) or insert.
+        let created: Option<String> = sqlx::query("SELECT created_at FROM stacks WHERE name = ?1")
+            .bind(&plan.stack)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StoreError::Other(e.into()))?;
+            .map_err(|e| StoreError::Other(e.into()))?
+            .map(|r| r.get("created_at"));
+        match created {
+            Some(_) => {
+                sqlx::query(
+                    r#"UPDATE stacks SET labels_json = ?1, raw_yaml = ?2, updated_at = ?3 WHERE name = ?4"#,
+                )
+                .bind(&plan.labels_json)
+                .bind(&plan.raw_yaml)
+                .bind(&now)
+                .bind(&plan.stack)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            }
+            None => {
+                sqlx::query(
+                    r#"INSERT INTO stacks (name, labels_json, raw_yaml, created_at, updated_at)
+                       VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                )
+                .bind(&plan.stack)
+                .bind(&plan.labels_json)
+                .bind(&plan.raw_yaml)
+                .bind(&now)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+            }
         }
-        self.get_stack(name)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(name.into()))
+
+        // Drop every instance the plan does not keep: a service removed from the
+        // YAML, or an ordinal past a scale-down. ssh/network rows cascade.
+        let keep: std::collections::BTreeSet<(&str, u32)> = plan
+            .instances
+            .iter()
+            .map(|i| (i.service.as_str(), i.ordinal))
+            .collect();
+        let stored = sqlx::query("SELECT id, service, ordinal FROM instances WHERE stack = ?1")
+            .bind(&plan.stack)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        for row in &stored {
+            let service: String = row.get("service");
+            let ordinal = row.get::<i64, _>("ordinal") as u32;
+            if keep.contains(&(service.as_str(), ordinal)) {
+                continue;
+            }
+            let id: String = row.get("id");
+            sqlx::query("DELETE FROM instances WHERE id = ?1")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+        }
+
+        // Create or refresh each planned instance. An update touches only
+        // spec_json/updated_at: placement, runtime id, observed phase and the
+        // applied-config hash stay put so the node can decide on a recreate.
+        for pi in &plan.instances {
+            let existing = sqlx::query(
+                r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
+            )
+            .bind(&plan.stack)
+            .bind(&pi.service)
+            .bind(pi.ordinal as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+
+            match existing {
+                Some(row) => {
+                    let id: String = row.get("id");
+                    sqlx::query(
+                        r#"UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3"#,
+                    )
+                    .bind(&pi.spec_json)
+                    .bind(&now)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| StoreError::Other(e.into()))?;
+                }
+                None => {
+                    sqlx::query(
+                        r#"INSERT INTO instances
+                           (id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at)
+                           VALUES (?1, ?2, ?3, ?4, NULL, 'Pending', NULL, NULL, ?5, ?6)"#,
+                    )
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(&plan.stack)
+                    .bind(&pi.service)
+                    .bind(pi.ordinal as i64)
+                    .bind(&pi.spec_json)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| StoreError::Other(e.into()))?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(|e| StoreError::Other(e.into()))?;
+
+        // `SELECT *` so this readback never goes stale as columns are added.
+        let rows =
+            sqlx::query(r#"SELECT * FROM instances WHERE stack = ?1 ORDER BY service, ordinal"#)
+                .bind(&plan.stack)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(rows.iter().map(Self::map_instance).collect())
     }
 
     async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError> {
@@ -447,107 +530,31 @@ impl Store for SqliteStore {
     }
 
     async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
-        // Instances first (no FK from instances→stacks); cascades to
-        // instance_ssh / instance_network. services cascade via stacks.
+        // One transaction: instances first (no FK from instances→stacks), then
+        // the stack row. ssh/network rows cascade; a mid-way failure rolls both
+        // statements back so a down never leaves a half-deleted stack.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
         sqlx::query("DELETE FROM instances WHERE stack = ?1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
         let res = sqlx::query("DELETE FROM stacks WHERE name = ?1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Other(e.into()))?;
+        tx.commit().await.map_err(|e| StoreError::Other(e.into()))?;
         Ok(res.rows_affected() > 0)
-    }
-
-    async fn reconcile_service_replicas(
-        &self,
-        stack: &str,
-        service: &str,
-        replicas: u32,
-        spec_json: &str,
-    ) -> Result<Vec<InstanceRecord>, StoreError> {
-        let specs: Vec<String> = (0..replicas).map(|_| spec_json.to_string()).collect();
-        self.reconcile_service_replicas_multi(stack, service, &specs)
-            .await
-    }
-
-    async fn reconcile_service_replicas_multi(
-        &self,
-        stack: &str,
-        service: &str,
-        spec_jsons: &[String],
-    ) -> Result<Vec<InstanceRecord>, StoreError> {
-        let replicas = spec_jsons.len() as u32;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(r#"DELETE FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal >= ?3"#)
-            .bind(stack)
-            .bind(service)
-            .bind(replicas as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-
-        for (ord, spec_json) in spec_jsons.iter().enumerate() {
-            let ord = ord as u32;
-            let existing = sqlx::query(
-                r#"SELECT id FROM instances WHERE stack = ?1 AND service = ?2 AND ordinal = ?3"#,
-            )
-            .bind(stack)
-            .bind(service)
-            .bind(ord as i64)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
-
-            if let Some(row) = existing {
-                let id: String = row.get("id");
-                sqlx::query(
-                    r#"UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3"#,
-                )
-                .bind(spec_json)
-                .bind(&now)
-                .bind(&id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StoreError::Other(e.into()))?;
-            } else {
-                let id = Uuid::new_v4().to_string();
-                sqlx::query(
-                    r#"INSERT INTO instances
-                       (id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, updated_at)
-                       VALUES (?1, ?2, ?3, ?4, NULL, 'Pending', NULL, NULL, ?5, ?6)"#,
-                )
-                .bind(&id)
-                .bind(stack)
-                .bind(service)
-                .bind(ord as i64)
-                .bind(spec_json)
-                .bind(&now)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StoreError::Other(e.into()))?;
-            }
-        }
-
-        let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
-               FROM instances WHERE stack = ?1 AND service = ?2 ORDER BY ordinal"#,
-        )
-        .bind(stack)
-        .bind(service)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
-
-        Ok(rows.iter().map(Self::map_instance).collect())
     }
 
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, applied_hash, updated_at
                FROM instances ORDER BY stack, service, ordinal"#,
         )
         .fetch_all(&self.pool)
@@ -561,7 +568,7 @@ impl Store for SqliteStore {
         node_id: &str,
     ) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, applied_hash, updated_at
                FROM instances WHERE node_id = ?1"#,
         )
         .bind(node_id)
@@ -573,7 +580,7 @@ impl Store for SqliteStore {
 
     async fn list_pending_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
         let rows = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, applied_hash, updated_at
                FROM instances WHERE phase = 'Pending' AND node_id IS NULL"#,
         )
         .fetch_all(&self.pool)
@@ -605,23 +612,33 @@ impl Store for SqliteStore {
             .ok_or_else(|| StoreError::NotFound(instance_id.into()))
     }
 
-    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError> {
-        let now = Utc::now().to_rfc3339();
-        let res = sqlx::query(
-            r#"UPDATE instances SET node_id = NULL, phase = 'Pending', runtime_id = NULL,
-                message = NULL, updated_at = ?1 WHERE id = ?2"#,
-        )
-        .bind(&now)
-        .bind(instance_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StoreError::Other(e.into()))?;
+    async fn set_instance_applied_hash(
+        &self,
+        instance_id: &str,
+        applied_hash: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let res = sqlx::query("UPDATE instances SET applied_hash = ?1 WHERE id = ?2")
+            .bind(applied_hash)
+            .bind(instance_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(instance_id.into()));
         }
-        self.get_instance(instance_id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(instance_id.into()))
+        Ok(())
+    }
+
+    async fn get_instance_applied_hash(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT applied_hash FROM instances WHERE id = ?1")
+            .bind(instance_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Other(e.into()))?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("applied_hash")))
     }
 
     async fn update_instance_status(
@@ -651,7 +668,7 @@ impl Store for SqliteStore {
 
     async fn get_instance(&self, instance_id: &str) -> Result<Option<InstanceRecord>, StoreError> {
         let row = sqlx::query(
-            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, updated_at
+            r#"SELECT id, stack, service, ordinal, node_id, phase, runtime_id, message, spec_json, healthy, applied_hash, updated_at
                FROM instances WHERE id = ?1"#,
         )
         .bind(instance_id)
@@ -1060,6 +1077,19 @@ mod tests {
     use crate::{hash_token, NodeStatus, SecretsKey};
     use tempfile::tempdir;
 
+    /// Seed `demo` with `replicas` copies of `spec` and return the instances.
+    async fn seed(store: &SqliteStore, replicas: u32, spec: &str) -> Vec<InstanceRecord> {
+        store
+            .commit_stack_plan(&StackPlan::replicas(
+                "demo",
+                "{}",
+                "yaml",
+                vec![("web", vec![spec.to_string(); replicas as usize])],
+            ))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn sqlite_upsert_local_node_and_touch() {
         let dir = tempdir().unwrap();
@@ -1101,28 +1131,115 @@ mod tests {
         assert_eq!(counts.nodes_ready, 1);
     }
 
+    /// B8: the node id is persisted, so a restart under a different
+    /// `--node-name` reuses it and keeps placements.
     #[tokio::test]
-    async fn unbind_instance_clears_placement() {
+    async fn local_node_id_and_placements_survive_restart_and_rename() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("mc2.db");
         let store = SqliteStore::open(&db).await.unwrap();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
-        let inst = store
-            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+
+        let first = store
+            .upsert_local_node(NodeJoin {
+                name: "host-a".into(),
+                labels_json: "{}".into(),
+                arch: "aarch64".into(),
+                cpus: 4,
+                memory_mib: 8192,
+            })
             .await
             .unwrap();
+        let inst = seed(&store, 1, r#"{"image":"x"}"#).await;
         let id = inst[0].id.clone();
-        store.bind_instance_to_node(&id, "n1").await.unwrap();
-        store
-            .update_instance_status(&id, "Running", Some("demo-web-0"), Some("ok"))
+        store.bind_instance_to_node(&id, &first.id).await.unwrap();
+
+        // Restart: same DB, new process, new display name.
+        let reopened = SqliteStore::open(&db).await.unwrap();
+        let renamed = reopened
+            .upsert_local_node(NodeJoin {
+                name: "host-b".into(),
+                labels_json: "{}".into(),
+                arch: "aarch64".into(),
+                cpus: 8,
+                memory_mib: 16384,
+            })
             .await
             .unwrap();
-        let unbound = store.unbind_instance(&id).await.unwrap();
-        assert_eq!(unbound.phase, "Pending");
-        assert!(unbound.node_id.is_none());
-        assert!(unbound.runtime_id.is_none());
-        assert!(store.list_pending_instances().await.unwrap().len() == 1);
+
+        assert_eq!(renamed.id, first.id, "stable node id across restart");
+        assert_eq!(renamed.name, "host-b");
+        assert_eq!(reopened.list_nodes().await.unwrap().len(), 1);
+        let after = reopened.get_instance(&id).await.unwrap().unwrap();
+        assert_eq!(
+            after.node_id.as_deref(),
+            Some(first.id.as_str()),
+            "placement kept"
+        );
+    }
+
+    /// B3: the applied config hash is a column, so it survives a restart.
+    #[tokio::test]
+    async fn applied_hash_round_trips_through_reopen() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mc2.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.init_cluster("").await.unwrap();
+        let inst = seed(&store, 1, r#"{"image":"x"}"#).await;
+        let id = inst[0].id.clone();
+        assert_eq!(store.get_instance_applied_hash(&id).await.unwrap(), None);
+
+        store
+            .set_instance_applied_hash(&id, Some("hash-v1"))
+            .await
+            .unwrap();
+
+        let reopened = SqliteStore::open(&db).await.unwrap();
+        assert_eq!(
+            reopened.get_instance_applied_hash(&id).await.unwrap(),
+            Some("hash-v1".into())
+        );
+        let rec = reopened.get_instance(&id).await.unwrap().unwrap();
+        assert_eq!(rec.applied_hash.as_deref(), Some("hash-v1"));
+
+        assert!(reopened
+            .set_instance_applied_hash("missing", Some("x"))
+            .await
+            .is_err());
+        assert_eq!(
+            reopened.get_instance_applied_hash("missing").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_api_token_hash_swaps_the_credential() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mc2.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        store.init_cluster(&hash_token("old")).await.unwrap();
+        assert!(store.verify_api_token("old").await.unwrap());
+
+        store
+            .replace_api_token_hash(&hash_token("new"))
+            .await
+            .unwrap();
+        assert!(!store.verify_api_token("old").await.unwrap());
+        assert!(store.verify_api_token("new").await.unwrap());
+
+        // Survives reopen (the rotate is a plain update).
+        let reopened = SqliteStore::open(&db).await.unwrap();
+        assert!(reopened.verify_api_token("new").await.unwrap());
+        assert!(!reopened.verify_api_token("old").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn replace_api_token_hash_requires_initialized_cluster() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mc2.db");
+        let store = SqliteStore::open(&db).await.unwrap();
+        assert!(store.replace_api_token_hash("h").await.is_err());
+        assert!(!store.verify_api_token("anything").await.unwrap());
     }
 
     #[tokio::test]
@@ -1132,10 +1249,16 @@ mod tests {
         let store = SqliteStore::open(&db).await.unwrap();
         store.init_cluster("").await.unwrap();
         let key = SecretsKey::from_bytes([9u8; 32]);
-        let (n, c) = key.encrypt(b"p@ss").unwrap();
+        let (n, c) = key.encrypt("DB_PASS", b"p@ss").unwrap();
         store.put_secret_blob("DB_PASS", &n, &c).await.unwrap();
         let blob = store.get_secret_blob("DB_PASS").await.unwrap().unwrap();
-        assert_eq!(key.decrypt(&blob.nonce, &blob.ciphertext).unwrap(), b"p@ss");
+        assert_eq!(
+            key.decrypt("DB_PASS", &blob.nonce, &blob.ciphertext)
+                .unwrap(),
+            b"p@ss"
+        );
+        // The stored blob does not decrypt under another secret name.
+        assert!(key.decrypt("OTHER", &blob.nonce, &blob.ciphertext).is_err());
         let list = store.list_secret_meta().await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "DB_PASS");
@@ -1148,11 +1271,7 @@ mod tests {
         let db = dir.path().join("mc2.db");
         let store = SqliteStore::open(&db).await.unwrap();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
-        let inst = store
-            .reconcile_service_replicas("demo", "web", 2, r#"{"image":"x"}"#)
-            .await
-            .unwrap();
+        let inst = seed(&store, 2, r#"{"image":"x"}"#).await;
         let id = inst[0].id.clone();
         store
             .put_instance_ssh_desired(&crate::InstanceSshRecord {

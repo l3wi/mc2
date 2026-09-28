@@ -30,12 +30,17 @@ kernel inside the hypervisor.
 ## Network boundaries: profiles
 
 Each sandbox attaches to networks through a network profile that fixes its
-network boundary:
+network boundary. The profile set is closed — `network.profiles` accepts only
+`public`, `private`, `host`, or `none`; any other value (including the former
+`local`/`any` spellings) is rejected at apply rather than falling back to
+`public`, and `none` must be the only entry:
 
 - **`public`** — internet egress through the host-side network stack, plus
   service-to-service traffic on shared networks.
 - **`private`** — service-to-service connectivity only; no internet egress.
-- **`host`** — shares the host network stack.
+- **`host`** — shares the host network stack: the whole host loopback,
+  including the control API and every published port. Refused at apply unless
+  the server runs with `--allow-host-profile`.
 - **`none`** — guest networking is disabled entirely. The microVM has no
   network device and no route off the box.
 

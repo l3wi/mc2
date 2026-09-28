@@ -3,14 +3,13 @@
 use crate::{
     ssh_fingerprint, validate_public_key, verify_token, ClusterCounts, ClusterMeta,
     InstanceNetworkRecord, InstancePhase, InstanceRecord, InstanceSshRecord, NodeHeartbeat,
-    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackRecord, Store,
-    StoreError,
+    NodeJoin, NodeRecord, NodeStatus, SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan,
+    StackRecord, Store, StoreError,
 };
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
-use std::collections::HashMap;
+use chrono::Utc;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -18,7 +17,6 @@ use uuid::Uuid;
 struct Inner {
     meta: Option<ClusterMeta>,
     nodes: HashMap<String, NodeRecord>,
-    by_name: HashMap<String, String>,
     stacks: HashMap<String, StackRecord>,
     instances: HashMap<String, InstanceRecord>,
     secrets: HashMap<String, SecretBlob>,
@@ -64,24 +62,19 @@ impl Store for MemoryStore {
         let Some(meta) = &g.meta else {
             return Ok(false);
         };
-        if meta.api_token_hash.is_empty() {
-            return Ok(true);
-        }
         if token.is_empty() {
             return Ok(false);
         }
         Ok(verify_token(token, &meta.api_token_hash))
     }
 
-    async fn api_auth_required(&self) -> Result<bool, StoreError> {
-        Ok(self
-            .inner
-            .read()
-            .await
-            .meta
-            .as_ref()
-            .map(|m| !m.api_token_hash.is_empty())
-            .unwrap_or(true))
+    async fn replace_api_token_hash(&self, api_token_hash: &str) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let Some(meta) = g.meta.as_mut() else {
+            return Err(StoreError::NotInitialized);
+        };
+        meta.api_token_hash = api_token_hash.to_string();
+        Ok(())
     }
 
     async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {
@@ -114,30 +107,37 @@ impl Store for MemoryStore {
     async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
-        if let Some(id) = g.by_name.get(&join.name).cloned() {
-            let node = g.nodes.get_mut(&id).expect("consistent");
-            node.labels_json = join.labels_json;
-            node.arch = join.arch;
-            node.cpus = join.cpus;
-            node.memory_mib = join.memory_mib;
-            node.status = NodeStatus::Ready.as_str().into();
-            node.last_heartbeat = Some(now);
-            return Ok(node.clone());
-        }
-        let id = Uuid::new_v4().to_string();
+        // Singleton: the id is persisted under a settings key and reused for
+        // every later start, so renaming the node keeps its placements.
+        let stored = g.settings.get(crate::SETTING_LOCAL_NODE_ID).cloned();
+        let existing = stored.filter(|id| !id.is_empty()).or_else(|| {
+            // First start (or a row adopted from before the id was stored).
+            g.nodes
+                .values()
+                .find(|n| n.name == join.name)
+                .map(|n| n.id.clone())
+        });
+
+        let id = existing.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let created_at = g
+            .nodes
+            .get(&id)
+            .map(|n| n.created_at.clone())
+            .unwrap_or_else(|| now.clone());
         let rec = NodeRecord {
             id: id.clone(),
-            name: join.name.clone(),
+            name: join.name,
             labels_json: join.labels_json,
             arch: join.arch,
             cpus: join.cpus,
             memory_mib: join.memory_mib,
             status: NodeStatus::Ready.as_str().into(),
-            last_heartbeat: Some(now.clone()),
-            created_at: now,
+            last_heartbeat: Some(now),
+            created_at,
         };
-        g.by_name.insert(join.name, id.clone());
-        g.nodes.insert(id, rec.clone());
+        g.nodes.insert(id.clone(), rec.clone());
+        g.settings
+            .insert(crate::SETTING_LOCAL_NODE_ID.to_string(), id);
         Ok(rec)
     }
 
@@ -165,56 +165,98 @@ impl Store for MemoryStore {
         Ok(self.inner.read().await.nodes.get(node_id).cloned())
     }
 
-    async fn mark_stale_nodes(&self, grace: Duration) -> Result<u32, StoreError> {
-        let mut g = self.inner.write().await;
-        let cutoff =
-            Utc::now() - ChronoDuration::from_std(grace).unwrap_or(ChronoDuration::seconds(30));
-        let mut n = 0u32;
-        for node in g.nodes.values_mut() {
-            if node.status != NodeStatus::Ready.as_str() {
-                continue;
-            }
-            let stale = match &node.last_heartbeat {
-                None => true,
-                Some(hb) => chrono::DateTime::parse_from_rfc3339(hb)
-                    .map(|ts| ts.with_timezone(&Utc) < cutoff)
-                    .unwrap_or(true),
-            };
-            if stale {
-                node.status = NodeStatus::NotReady.as_str().into();
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
-
-    async fn upsert_stack(
-        &self,
-        name: &str,
-        labels_json: &str,
-        raw_yaml: &str,
-    ) -> Result<StackRecord, StoreError> {
+    async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError> {
+        // One write lock for the whole plan: the stack row plus every instance
+        // create/update/delete. Readers never observe a half-applied stack, and
+        // no operation here can fail, so there is nothing to roll back.
         let mut g = self.inner.write().await;
         let now = Utc::now().to_rfc3339();
-        let rec = if let Some(existing) = g.stacks.get(name) {
+
+        // Stack row: update in place (keeping created_at) or insert.
+        let created_at = g
+            .stacks
+            .get(&plan.stack)
+            .map(|s| s.created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        g.stacks.insert(
+            plan.stack.clone(),
             StackRecord {
-                name: name.into(),
-                labels_json: labels_json.into(),
-                raw_yaml: raw_yaml.into(),
-                created_at: existing.created_at.clone(),
-                updated_at: now,
+                name: plan.stack.clone(),
+                labels_json: plan.labels_json.clone(),
+                raw_yaml: plan.raw_yaml.clone(),
+                created_at,
+                updated_at: now.clone(),
+            },
+        );
+
+        // Drop every instance the plan does not keep — a service removed from
+        // the YAML, or an ordinal past a scale-down — cascading ssh/network
+        // rows exactly like SQLite's ON DELETE CASCADE (D5).
+        let keep: BTreeSet<(&str, u32)> = plan
+            .instances
+            .iter()
+            .map(|i| (i.service.as_str(), i.ordinal))
+            .collect();
+        let doomed: Vec<String> = g
+            .instances
+            .values()
+            .filter(|i| i.stack == plan.stack && !keep.contains(&(i.service.as_str(), i.ordinal)))
+            .map(|i| i.id.clone())
+            .collect();
+        for id in doomed {
+            g.instances.remove(&id);
+            g.instance_ssh.remove(&id);
+            g.instance_network.remove(&id);
+        }
+
+        // Create or refresh each planned instance. An update touches only
+        // spec_json/updated_at: placement, runtime id, observed phase and the
+        // applied-config hash stay put so the node can decide on a recreate.
+        for pi in &plan.instances {
+            let existing_id = g
+                .instances
+                .values()
+                .find(|i| {
+                    i.stack == plan.stack && i.service == pi.service && i.ordinal == pi.ordinal
+                })
+                .map(|i| i.id.clone());
+            match existing_id {
+                Some(id) => {
+                    let inst = g.instances.get_mut(&id).expect("instance just matched");
+                    inst.spec_json = pi.spec_json.clone();
+                    inst.updated_at = now.clone();
+                }
+                None => {
+                    let id = Uuid::new_v4().to_string();
+                    g.instances.insert(
+                        id.clone(),
+                        InstanceRecord {
+                            id,
+                            stack: plan.stack.clone(),
+                            service: pi.service.clone(),
+                            ordinal: pi.ordinal,
+                            node_id: None,
+                            phase: InstancePhase::Pending.as_str().into(),
+                            runtime_id: None,
+                            message: None,
+                            spec_json: pi.spec_json.clone(),
+                            healthy: false,
+                            applied_hash: None,
+                            updated_at: now.clone(),
+                        },
+                    );
+                }
             }
-        } else {
-            StackRecord {
-                name: name.into(),
-                labels_json: labels_json.into(),
-                raw_yaml: raw_yaml.into(),
-                created_at: now.clone(),
-                updated_at: now,
-            }
-        };
-        g.stacks.insert(name.into(), rec.clone());
-        Ok(rec)
+        }
+
+        let mut out: Vec<InstanceRecord> = g
+            .instances
+            .values()
+            .filter(|i| i.stack == plan.stack)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (&a.service, a.ordinal).cmp(&(&b.service, b.ordinal)));
+        Ok(out)
     }
 
     async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError> {
@@ -243,78 +285,6 @@ impl Store for MemoryStore {
             g.instance_network.remove(id);
         }
         Ok(existed)
-    }
-
-    async fn reconcile_service_replicas(
-        &self,
-        stack: &str,
-        service: &str,
-        replicas: u32,
-        spec_json: &str,
-    ) -> Result<Vec<InstanceRecord>, StoreError> {
-        let specs: Vec<String> = (0..replicas).map(|_| spec_json.to_string()).collect();
-        self.reconcile_service_replicas_multi(stack, service, &specs)
-            .await
-    }
-
-    async fn reconcile_service_replicas_multi(
-        &self,
-        stack: &str,
-        service: &str,
-        spec_jsons: &[String],
-    ) -> Result<Vec<InstanceRecord>, StoreError> {
-        let replicas = spec_jsons.len() as u32;
-        let mut g = self.inner.write().await;
-        let now = Utc::now().to_rfc3339();
-        let mut by_ord: HashMap<u32, InstanceRecord> = g
-            .instances
-            .values()
-            .filter(|i| i.stack == stack && i.service == service)
-            .cloned()
-            .map(|i| (i.ordinal, i))
-            .collect();
-
-        // scale down
-        let remove: Vec<String> = by_ord
-            .values()
-            .filter(|i| i.ordinal >= replicas)
-            .map(|i| i.id.clone())
-            .collect();
-        for id in remove {
-            g.instances.remove(&id);
-            by_ord.retain(|_, i| i.id != id);
-        }
-
-        // scale up / refresh spec
-        for (ord, spec_json) in spec_jsons.iter().enumerate() {
-            let ord = ord as u32;
-            if let Some(existing) = by_ord.get_mut(&ord) {
-                existing.spec_json = spec_json.clone();
-                existing.updated_at = now.clone();
-                g.instances.insert(existing.id.clone(), existing.clone());
-            } else {
-                let id = Uuid::new_v4().to_string();
-                let rec = InstanceRecord {
-                    id: id.clone(),
-                    stack: stack.into(),
-                    service: service.into(),
-                    ordinal: ord,
-                    node_id: None,
-                    phase: InstancePhase::Pending.as_str().into(),
-                    runtime_id: None,
-                    message: None,
-                    spec_json: spec_json.clone(),
-                    healthy: false,
-                    updated_at: now.clone(),
-                };
-                g.instances.insert(id, rec.clone());
-                by_ord.insert(ord, rec);
-            }
-        }
-
-        let mut out: Vec<_> = by_ord.into_values().collect();
-        out.sort_by_key(|i| i.ordinal);
-        Ok(out)
     }
 
     async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
@@ -361,18 +331,31 @@ impl Store for MemoryStore {
         Ok(inst.clone())
     }
 
-    async fn unbind_instance(&self, instance_id: &str) -> Result<InstanceRecord, StoreError> {
+    async fn set_instance_applied_hash(
+        &self,
+        instance_id: &str,
+        applied_hash: Option<&str>,
+    ) -> Result<(), StoreError> {
         let mut g = self.inner.write().await;
         let inst = g
             .instances
             .get_mut(instance_id)
             .ok_or_else(|| StoreError::NotFound(instance_id.into()))?;
-        inst.node_id = None;
-        inst.phase = InstancePhase::Pending.as_str().into();
-        inst.runtime_id = None;
-        inst.message = None;
-        inst.updated_at = Utc::now().to_rfc3339();
-        Ok(inst.clone())
+        inst.applied_hash = applied_hash.map(str::to_string);
+        Ok(())
+    }
+
+    async fn get_instance_applied_hash(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .await
+            .instances
+            .get(instance_id)
+            .and_then(|i| i.applied_hash.clone()))
     }
 
     async fn update_instance_status(
@@ -650,41 +633,99 @@ mod tests {
     use super::*;
     use crate::hash_token;
 
+    /// Seed `demo` with `replicas` copies of `spec` and return the instances.
+    async fn seed(store: &MemoryStore, replicas: u32, spec: &str) -> Vec<InstanceRecord> {
+        let specs = vec![spec.to_string(); replicas as usize];
+        store
+            .commit_stack_plan(&StackPlan::replicas(
+                "demo",
+                "{}",
+                "yaml",
+                vec![("web", specs)],
+            ))
+            .await
+            .unwrap()
+    }
+
+    /// B8: the local node is a singleton — a rename must not strand placements.
     #[tokio::test]
-    async fn replicas_scale() {
+    async fn local_node_id_survives_a_rename() {
         let store = MemoryStore::new();
         store.init_cluster(&hash_token("a")).await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
-        let inst = store
-            .reconcile_service_replicas("demo", "web", 2, r#"{"image":"x"}"#)
+        let first = store
+            .upsert_local_node(NodeJoin {
+                name: "host-a".into(),
+                labels_json: "{}".into(),
+                arch: "aarch64".into(),
+                cpus: 4,
+                memory_mib: 8192,
+            })
             .await
             .unwrap();
-        assert_eq!(inst.len(), 2);
-        let inst = store
-            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+
+        let renamed = store
+            .upsert_local_node(NodeJoin {
+                name: "host-b".into(),
+                labels_json: r#"{"zone":"b"}"#.into(),
+                arch: "aarch64".into(),
+                cpus: 8,
+                memory_mib: 16384,
+            })
             .await
             .unwrap();
-        assert_eq!(inst.len(), 1);
-        assert_eq!(inst[0].ordinal, 0);
+
+        assert_eq!(renamed.id, first.id, "same node, new display name");
+        assert_eq!(renamed.name, "host-b");
+        assert_eq!(renamed.cpus, 8);
+        let nodes = store.list_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 1, "one embedded node");
+    }
+
+    /// B3: the applied config hash round-trips and can be cleared.
+    #[tokio::test]
+    async fn applied_hash_round_trip() {
+        let store = MemoryStore::new();
+        store.init_cluster(&hash_token("a")).await.unwrap();
+        let inst = seed(&store, 1, r#"{"image":"x"}"#).await;
+        let id = inst[0].id.clone();
+
+        assert_eq!(store.get_instance_applied_hash(&id).await.unwrap(), None);
+        store
+            .set_instance_applied_hash(&id, Some("abc123"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_instance_applied_hash(&id).await.unwrap(),
+            Some("abc123".into())
+        );
+        store.set_instance_applied_hash(&id, None).await.unwrap();
+        assert_eq!(store.get_instance_applied_hash(&id).await.unwrap(), None);
+
+        assert!(store
+            .set_instance_applied_hash("missing", Some("x"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
-    async fn unbind_returns_to_pending() {
+    async fn replace_api_token_hash_swaps_the_credential() {
         let store = MemoryStore::new();
-        store.init_cluster(&hash_token("a")).await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
-        let inst = store
-            .reconcile_service_replicas("demo", "web", 1, r#"{"image":"x"}"#)
+        store.init_cluster(&hash_token("old")).await.unwrap();
+        assert!(store.verify_api_token("old").await.unwrap());
+
+        store
+            .replace_api_token_hash(&hash_token("new"))
             .await
             .unwrap();
-        let id = inst[0].id.clone();
-        store.bind_instance_to_node(&id, "node-a").await.unwrap();
-        let unbound = store.unbind_instance(&id).await.unwrap();
-        assert_eq!(unbound.phase, "Pending");
-        assert!(unbound.node_id.is_none());
-        assert!(unbound.runtime_id.is_none());
-        let pending = store.list_pending_instances().await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, id);
+        assert!(!store.verify_api_token("old").await.unwrap());
+        assert!(store.verify_api_token("new").await.unwrap());
+        assert!(!store.verify_api_token("").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn verify_without_cluster_meta_is_false() {
+        let store = MemoryStore::new();
+        assert!(!store.verify_api_token("anything").await.unwrap());
+        assert!(store.replace_api_token_hash("h").await.is_err());
     }
 }

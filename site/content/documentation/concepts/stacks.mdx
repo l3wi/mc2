@@ -58,6 +58,18 @@ services:
 `mc2 up` fills the missing `name` from the sanitized file name, and defaults
 `scale`, `cpus`, `mem_limit`, `restart`, `command`, and the network profile.
 
+## Names
+
+Stack, service and network names are lowercase
+`[a-z0-9]([a-z0-9_-]*[a-z0-9])?` — no `--`, no `.`, no uppercase, no spaces —
+capped at 40 characters (stack) and 63 (service, network). Volume names allow
+`.` as well, cap at 63, and must not contain `--` or end with `-`. An invalid
+name is rejected at apply (or `mc2 config`) with a suggested replacement.
+
+Names are also the runtime identity: MC2 derives each sandbox as
+`{stack}--{service}--{ordinal}` and each volume directory as
+`mc2-{stack}--{volume}`, so two stacks can never collide on the same name.
+
 ## Canonical parsing
 
 MC2 does not silently ignore what it does not understand. Unknown keys —
@@ -69,13 +81,14 @@ applying anything.
 
 ## Validation
 
-Apply returns `400` for: empty services; a missing `name` or one containing
-`--`; undeclared volume mounts or invalid volume names; non-`dir` volume
-kinds; relative or duplicate mount targets; `scale: 0`; unknown `restart`
-values; non-mediated networks; zero or duplicate `expose` ports; ingress
-without routes or with non-tcp backends; TCP ingress without a fixed SSH
-port; and `depends_on` references to unknown services, unknown conditions,
-or cycles.
+Apply returns `400` for: empty services; a missing `name` or one violating the
+[name grammar](#names); service, network or volume names that violate theirs;
+undeclared volume mounts; non-`dir` volume kinds; relative or duplicate mount
+targets; `scale: 0`; unknown `restart` values; non-mediated networks; unknown
+or duplicated `network.profiles` values; zero or duplicate `expose` ports;
+ingress with invalid hosts, paths or Traefik identifiers, duplicate routers, a
+non-tcp backend, or TCP routes without a fixed SSH port; and `depends_on`
+references to unknown services, unknown conditions, or cycles.
 
 ## Key behaviors
 

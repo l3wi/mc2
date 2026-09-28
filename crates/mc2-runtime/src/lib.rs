@@ -10,7 +10,10 @@ mod spec;
 mod spec_hash;
 
 pub use msb_sdk::MicrosandboxRuntime;
-pub use naming::{parse_volume_name, sandbox_name, volume_mount_plan, volume_name};
+pub use naming::{
+    default_volume_root, dir_size_bytes, dir_size_mib, ensure_volume_dir, parse_volume_name,
+    remaining_quota_mib, sandbox_name, volume_bind_plan, volume_name, volume_root, VolumeMountPlan,
+};
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod networks;
 pub use networks::{
@@ -24,12 +27,15 @@ pub use ingress_render::{
     render_catalog_json, render_traefik_dynamic, DesiredIngressRoute, ReadyIngressRoute,
 };
 pub use spec::{
-    DesiredSandbox, DesiredSsh, InjectedSecret, InstanceReport, SandboxPhase, SshObserved, SshPhase,
+    DesiredSandbox, DesiredSsh, DiskUsage, InjectedSecret, InstanceReport, SandboxPhase,
+    SshObserved, SshPhase,
 };
 pub use spec_hash::desired_recreate_hash;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Execution backend on a node (microsandbox SDK only).
 #[async_trait]
@@ -43,8 +49,15 @@ pub trait NodeRuntime: Send + Sync {
     /// Observe current phase without mutating.
     async fn status(&self, runtime_id: &str) -> Result<SandboxStatus>;
 
-    /// List runtime ids known to this backend (best-effort).
-    async fn list(&self) -> Result<Vec<String>>;
+    /// Runtime ids of the sandboxes this **install** owns.
+    ///
+    /// Every sandbox MC2 creates is labelled `mc2.install=<install_id>`; the
+    /// backend must return exactly the sandboxes carrying that label, so the
+    /// node can recover ownership after a restart and never touch a foreign
+    /// workload (B2). Best-effort in the same sense as the rest of the trait:
+    /// an error means the pass fails rather than anything being removed on a
+    /// guess.
+    async fn list_owned(&self, install_id: &str) -> Result<Vec<String>>;
 
     /// Run a guest command (health probes). Returns process exit code.
     async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32>;
@@ -57,14 +70,33 @@ pub trait NodeRuntime: Send + Sync {
         argv: &[String],
         stdin: &[u8],
     ) -> Result<ExecResult>;
+
+    /// Directory holding MC2-owned volume directories (bind-mount sources).
+    ///
+    /// Defaults to `~/.mc2/volumes` when the backend has no explicit
+    /// `--volume-dir`.
+    fn volume_root(&self) -> PathBuf {
+        naming::volume_root(None)
+    }
+
+    /// Observed root-disk usage per running sandbox, keyed by runtime id.
+    ///
+    /// Best-effort: a backend without metrics returns an empty map (the default
+    /// implementation), and disk conditions are simply not reported.
+    async fn root_disk_usage(&self) -> Result<HashMap<String, DiskUsage>> {
+        Ok(HashMap::new())
+    }
 }
 
 /// Captured guest command output.
+///
+/// Both streams are raw bytes: a guest process is free to emit invalid UTF-8,
+/// and the `mc2 exec` wire format keeps it byte-exact (base64 over JSON).
 #[derive(Debug, Clone, Default)]
 pub struct ExecResult {
     pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Observed sandbox state.

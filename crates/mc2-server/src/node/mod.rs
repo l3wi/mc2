@@ -2,16 +2,23 @@
 //! the store's desired set, and write observed phases back to the store.
 //!
 //! Replaces the former `mc2-agent` gRPC client/server pair with direct calls.
+//!
+//! The embedded node is a **singleton**: it is registered (with a stable id)
+//! before the REST listener accepts, stays Ready for as long as the process
+//! runs, and owns its sandboxes through the `mc2.install` label rather than
+//! through in-memory state, so a restart adopts or cleans up exactly what this
+//! install left behind (B2/B8).
 
+mod disk;
 mod health;
+mod lifecycle;
+mod report;
 mod state;
 
-use crate::desired::build_desired_set;
+use crate::desired::{build_desired_set, DesiredSet};
 use crate::ingress_files::{warn_ingress_dir_unset, SelfIngressRoute};
 use anyhow::{Context, Result};
-use mc2_runtime::{
-    desired_recreate_hash, InstanceReport, NetworkObserved, NetworkPhase, NodeRuntime, SandboxPhase,
-};
+use mc2_runtime::{InstanceReport, NodeRuntime};
 use mc2_store::{InstancePhase, NodeHeartbeat, SecretsKey, Store};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,13 +26,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use self::health::run_healthcheck;
-use self::state::{NodeRuntimeState, ServiceLive};
+use self::lifecycle::apply_live;
+use self::report::persist_instance_report;
+use self::state::{NodeRuntimeState, PassErrors, ServiceLive};
 
 /// Configuration for the local node loop.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
+    /// Display name (hostname / `--node-name`). Changing it must not change the
+    /// node's identity — that lives in the store (B8).
     pub name: String,
+    /// This install's random id: labels every sandbox and scopes ownership
+    /// recovery to sandboxes this install created (B2).
+    pub install_id: String,
     pub labels_json: String,
     pub cpus: u32,
     pub memory_mib: u64,
@@ -40,6 +53,9 @@ pub struct NodeConfig {
 }
 
 /// Register/refresh the local node row; returns its stable node_id.
+///
+/// Called before the REST listener serves, so an apply can never see a node
+/// list without the embedded node in it.
 pub async fn ensure_local_node(store: Arc<dyn Store>, cfg: &NodeConfig) -> Result<String> {
     let rec = store
         .upsert_local_node(mc2_store::NodeJoin {
@@ -59,11 +75,10 @@ pub async fn run(
     store: Arc<dyn Store>,
     secrets_key: Arc<SecretsKey>,
     runtime: Arc<dyn NodeRuntime>,
+    node_id: String,
     cfg: NodeConfig,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
-    let node_id = ensure_local_node(store.clone(), &cfg).await?;
-
     let self_route = cfg.public_hostname.as_ref().map(|host| SelfIngressRoute {
         host: host.clone(),
         port: cfg.rest_port,
@@ -73,13 +88,15 @@ pub async fn run(
     info!(
         node = %cfg.name,
         node_id = %node_id,
+        install_id = %cfg.install_id,
         runtime = "microsandbox-sdk",
         ssh = "sdk",
         ingress_dir = ?cfg.ingress_config_dir,
         api = mc2_api::API_VERSION,
-        "local node starting"
+        "local node reconcile loop starting"
     );
 
+    let mut node_id = node_id;
     let interval = cfg.reconcile_interval.max(Duration::from_secs(1));
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -98,23 +115,31 @@ pub async fn run(
                 break;
             }
             _ = ticker.tick() => {
-                // Heartbeat: keep the node row Ready.
-                let _ = store
-                    .touch_node(
-                        &node_id,
-                        NodeHeartbeat {
-                            cpus: cfg.cpus,
-                            memory_mib: cfg.memory_mib,
-                            status: "Ready".into(),
-                        },
-                    )
-                    .await;
+                // The node is Ready for as long as this process runs; the
+                // heartbeat keeps the row's capacity and timestamp current.
+                let heartbeat = NodeHeartbeat {
+                    cpus: cfg.cpus,
+                    memory_mib: cfg.memory_mib,
+                    status: "Ready".into(),
+                };
+                if let Err(e) = store.touch_node(&node_id, heartbeat).await {
+                    warn!(node_id = %node_id, error = %e, "node heartbeat failed; re-registering");
+                    match ensure_local_node(store.clone(), &cfg).await {
+                        Ok(id) => node_id = id,
+                        Err(e) => {
+                            mc2_metrics::record_reconcile(false);
+                            warn!(error = %e, "re-registering the local node failed");
+                            continue;
+                        }
+                    }
+                }
 
                 match reconcile(
                     store.clone(),
                     secrets_key.as_ref(),
                     &node_id,
-                    runtime.as_ref(),
+                    &cfg,
+                    &runtime,
                     &mut rt_state,
                 )
                 .await
@@ -122,7 +147,7 @@ pub async fn run(
                     Ok(()) => mc2_metrics::record_reconcile(true),
                     Err(e) => {
                         mc2_metrics::record_reconcile(false);
-                        warn!(error = %e, "reconcile failed");
+                        warn!(error = %e, error_full = format!("{e:#}"), "reconcile failed");
                     }
                 }
             }
@@ -132,29 +157,49 @@ pub async fn run(
     Ok(())
 }
 
-/// Build desired set, ensure sandboxes running, remove extras, persist phases.
+/// One reconcile pass: recover ownership, build the desired set, GC, reconcile
+/// every instance, then publish the observed state.
 async fn reconcile(
     store: Arc<dyn Store>,
     secrets_key: &SecretsKey,
     node_id: &str,
-    runtime: &dyn NodeRuntime,
+    cfg: &NodeConfig,
+    runtime: &Arc<dyn NodeRuntime>,
     rt: &mut NodeRuntimeState,
 ) -> Result<()> {
-    let (mut desired, ingress_routes) =
-        build_desired_set(store.clone(), secrets_key, node_id).await?;
+    // B2: ownership comes from the install label, never from an empty in-memory
+    // set. A pass that cannot recover it does nothing at all.
+    ensure_owned_seeded(runtime, &cfg.install_id, rt).await?;
 
-    let desired_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
+    let DesiredSet {
+        sandboxes: mut desired,
+        failures,
+        ingress_routes,
+    } = build_desired_set(store.clone(), secrets_key, node_id).await?;
 
-    // Scale down / GC
-    let stale: Vec<String> = rt.owned.difference(&desired_ids).cloned().collect();
-    for rid in stale {
-        if let Err(e) = runtime.ensure_removed(&rid).await {
-            warn!(runtime_id = %rid, error = %e, "ensure_removed failed");
-        }
-        rt.owned.remove(&rid);
+    // GC keep-set: desired instances plus the ones whose desired state could not
+    // be resolved — a resolution failure must never delete a running sandbox
+    // (B4).
+    let mut keep_ids: HashSet<String> = desired.iter().map(|d| d.runtime_id.clone()).collect();
+    keep_ids.extend(failures.iter().map(|f| f.runtime_id.clone()));
+
+    gc_orphans(runtime, rt, &keep_ids).await;
+
+    // B13/B2: per-sandbox runtime state is kept only for instances we still
+    // desire or still own (a failed removal is retried until it succeeds);
+    // everything else is pruned so it cannot grow without bound or leak stale
+    // restart backoff into a later instance reusing the name.
+    let stale_state: Vec<String> = rt
+        .rt_state
+        .keys()
+        .filter(|rid| !keep_ids.contains(*rid) && !rt.owned.contains(*rid))
+        .cloned()
+        .collect();
+    for rid in stale_state {
         rt.rt_state.remove(&rid);
     }
 
+    let mut errors = PassErrors::default();
     let mut reports: Vec<InstanceReport> = Vec::new();
     let now = Instant::now();
 
@@ -168,241 +213,167 @@ async fn reconcile(
 
     // Seed per-(stack, service) liveness from the store; updated live below as
     // this cycle reports phases / health, so in-cycle dependencies start fast.
+    let mut live = live_from_store(&store).await?;
+
+    // B4: an instance whose desired state could not be resolved is reported
+    // Failed with the message and is not started; dependents see it as not
+    // running. Its sandbox (if any) stays owned — see `keep_ids` above.
+    for f in &failures {
+        warn!(
+            instance_id = %f.instance_id,
+            error = %f.message,
+            "desired state unresolved; reporting Failed"
+        );
+        reports.push(f.failure_report());
+        apply_live(
+            &mut live,
+            &f.stack,
+            &f.service,
+            InstancePhase::Failed.as_str(),
+            false,
+        );
+    }
+
+    // Hold one splice listener per exposed port in the desired set — before any
+    // backend exists and regardless of phase — so the exclusive port claim is
+    // real for the stack's whole lifetime (accept-then-close instead of
+    // connection-refused, and no foreign process can take the port).
+    rt.network_table.ensure_listeners(desired.as_slice()).await;
+
+    for d in &mut desired {
+        match rt
+            .reconcile_instance(&store, runtime, d, now, &mut live, &mut errors)
+            .await
+        {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                warn!(
+                    instance_id = %d.instance_id,
+                    error = %e,
+                    "instance reconcile aborted; retrying next pass"
+                );
+                errors.record(e);
+            }
+        }
+    }
+
+    let keep_instances: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
+    rt.ssh_table.close_missing(&keep_instances).await;
+    // Rebuild the shared backend registry from the current desired set + observed
+    // phases (Running backends only); listeners stay held across phase churn.
+    rt.network_table
+        .update_backends(desired.as_slice(), &reports)
+        .await;
+    rt.network_table.close_missing(&keep_instances).await;
+
+    publish_observed(
+        &store,
+        rt,
+        &desired,
+        &ingress_routes,
+        runtime,
+        &mut reports,
+        &mut errors,
+    )
+    .await;
+
+    errors.into_result()
+}
+
+/// B2: seed `rt.owned` from the sandboxes carrying this install's label.
+///
+/// Errors abort the pass: adopting or removing sandboxes on an incomplete view
+/// of what we own is exactly the failure this exists to prevent.
+async fn ensure_owned_seeded(
+    runtime: &Arc<dyn NodeRuntime>,
+    install_id: &str,
+    rt: &mut NodeRuntimeState,
+) -> Result<()> {
+    if rt.owned_seeded {
+        return Ok(());
+    }
+    let owned = runtime
+        .list_owned(install_id)
+        .await
+        .context("list sandboxes owned by this install")?;
+    info!(
+        install_id,
+        count = owned.len(),
+        "recovered sandbox ownership from the install label"
+    );
+    rt.owned.extend(owned);
+    rt.owned_seeded = true;
+    Ok(())
+}
+
+/// B2: remove owned sandboxes that are no longer desired (scale-down, delete,
+/// orphans from an earlier run).
+///
+/// Ownership is dropped only after `ensure_removed` succeeds — the runtime
+/// treats an already-gone sandbox as success — so a transient failure keeps the
+/// id owned and retried on every later pass.
+async fn gc_orphans(
+    runtime: &Arc<dyn NodeRuntime>,
+    rt: &mut NodeRuntimeState,
+    keep_ids: &HashSet<String>,
+) {
+    let stale: Vec<String> = rt.owned.difference(keep_ids).cloned().collect();
+    for rid in stale {
+        match runtime.ensure_removed(&rid).await {
+            Ok(()) => {
+                info!(runtime_id = %rid, "removed sandbox that is no longer desired");
+                rt.owned.remove(&rid);
+                rt.rt_state.remove(&rid);
+            }
+            Err(e) => {
+                warn!(
+                    runtime_id = %rid,
+                    error = %e,
+                    "ensure_removed failed; keeping ownership and retrying next pass"
+                );
+            }
+        }
+    }
+}
+
+/// Seed the `depends_on` liveness map from the stored observed phases.
+async fn live_from_store(store: &Arc<dyn Store>) -> Result<HashMap<(String, String), ServiceLive>> {
     let mut live: HashMap<(String, String), ServiceLive> = HashMap::new();
     for inst in store
         .list_instances()
         .await
         .context("list instances for deps")?
     {
-        let key = (inst.stack, inst.service);
-        let entry = live.entry(key).or_default();
+        let entry = live.entry((inst.stack, inst.service)).or_default();
         if inst.phase == InstancePhase::Running.as_str() {
             entry.running = true;
             entry.healthy = entry.healthy || inst.healthy;
         }
     }
+    Ok(live)
+}
 
-    for d in &mut desired {
-        let policy = mc2_runtime::RestartPolicy::parse(&d.spec.restart);
-        let state = rt.rt_state.entry(d.runtime_id.clone()).or_default();
-
-        // Compose `depends_on` startup gate: skip ensure_running until every
-        // dependency is Running (service_started) or Running+healthy
-        // (service_healthy). Deps live in the same stack.
-        if !d.spec.depends_on.is_empty() {
-            if let Some(waiting) = waiting_deps(d, &live) {
-                reports.push(InstanceReport {
-                    instance_id: d.instance_id.clone(),
-                    phase: InstancePhase::Pending.as_str().into(),
-                    message: format!("depends_on: waiting for {waiting}"),
-                    runtime_id: d.runtime_id.clone(),
-                    ssh: None,
-                    network: None,
-                });
-                continue;
-            }
-        }
-
-        // Backoff gate before ensure_running when we recently recreated.
-        if let Some(next) = state.next_restart_ok {
-            if now < next {
-                let ssh = rt.ssh_table.reconcile(d, false).await;
-                let network = rt.network_table.reconcile_not_running(d).await;
-                reports.push(InstanceReport {
-                    instance_id: d.instance_id.clone(),
-                    phase: InstancePhase::Creating.as_str().into(),
-                    message: format!(
-                        "restart backoff {}s",
-                        next.saturating_duration_since(now).as_secs()
-                    ),
-                    runtime_id: d.runtime_id.clone(),
-                    ssh: Some(ssh),
-                    network: Some(network),
-                });
-                apply_live(&mut live, d, InstancePhase::Creating.as_str(), false);
-                continue;
-            }
-        }
-
-        if let Err(e) = rt.network_table.prepare_exposes(d).await {
-            warn!(instance_id = %d.instance_id, error = %e, "network prepare_exposes failed");
-            let ssh = rt.ssh_table.reconcile(d, false).await;
-            let network = rt.network_table.reconcile_not_running(d).await;
-            reports.push(InstanceReport {
-                instance_id: d.instance_id.clone(),
-                phase: InstancePhase::Failed.as_str().into(),
-                message: e,
-                runtime_id: d.runtime_id.clone(),
-                ssh: Some(ssh),
-                network: Some(network),
-            });
-            apply_live(&mut live, d, InstancePhase::Failed.as_str(), false);
-            continue;
-        }
-
-        // Recreate when create-time config changes (image, command, ports, network…).
-        let want_hash = desired_recreate_hash(d);
-        let mut force_recreate = false;
-        if let Some(prev) = state.spec_hash.as_ref() {
-            if prev != &want_hash {
-                force_recreate = true;
-                info!(
-                    runtime_id = %d.runtime_id,
-                    "desired spec changed; removing sandbox for recreate"
-                );
-            }
-        }
-        // Expose host ports are only bound at msb create. If we inherited a
-        // Running sandbox without live publish (server restart / orphan), recreate.
-        if !force_recreate {
-            if let Some(ports) = rt.network_table.expose_host_ports(&d.instance_id) {
-                if !ports.is_empty() && !host_ports_accepting(&ports).await {
-                    force_recreate = true;
-                    info!(
-                        runtime_id = %d.runtime_id,
-                        ?ports,
-                        "network expose host ports not live; recreating sandbox"
-                    );
-                }
-            }
-        }
-        if force_recreate {
-            rt.network_table.drop_instance(&d.instance_id).await;
-            // Re-prepare after drop so publish_index stays correct for this cycle.
-            if let Err(e) = rt.network_table.prepare_exposes(d).await {
-                warn!(instance_id = %d.instance_id, error = %e, "network re-prepare after drop");
-            }
-            if let Err(e) = runtime.ensure_removed(&d.runtime_id).await {
-                warn!(runtime_id = %d.runtime_id, error = %e, "remove before recreate");
-            }
-            rt.owned.remove(&d.runtime_id);
-            state.spec_hash = None;
-            state.running_since = None;
-            state.health_ok = false;
-            state.health_failures = 0;
-            state.last_health = None;
-        }
-
-        match runtime.ensure_running(d).await {
-            Ok(mut st) => {
-                rt.owned.insert(d.runtime_id.clone());
-                state.spec_hash = Some(want_hash);
-
-                // Reset restart counter after sustained Running.
-                if st.phase == SandboxPhase::Running {
-                    match state.running_since {
-                        None => state.running_since = Some(now),
-                        Some(since) if now.duration_since(since) >= Duration::from_secs(60) => {
-                            state.restart_count = 0;
-                            state.next_restart_ok = None;
-                        }
-                        Some(_) => {}
-                    }
-                } else {
-                    state.running_since = None;
-                }
-
-                // Exec health when Running (compose `healthcheck` semantics:
-                // interval / timeout / retries / start_period / disable).
-                if st.phase == SandboxPhase::Running {
-                    if let Some(new_st) = run_healthcheck(runtime, d, policy, state, now).await {
-                        st = new_st;
-                    }
-                }
-
-                let phase = match st.phase {
-                    SandboxPhase::Running => InstancePhase::Running.as_str(),
-                    SandboxPhase::Creating => InstancePhase::Creating.as_str(),
-                    SandboxPhase::Failed => InstancePhase::Failed.as_str(),
-                    SandboxPhase::Stopped => InstancePhase::Stopped.as_str(),
-                    SandboxPhase::Pending | SandboxPhase::Unknown => {
-                        InstancePhase::Creating.as_str()
-                    }
-                };
-                let running = st.phase == SandboxPhase::Running;
-                let ssh = rt.ssh_table.reconcile(d, running).await;
-                let network = if running {
-                    rt.network_table.reconcile_running(d).await
-                } else {
-                    rt.network_table.reconcile_not_running(d).await
-                };
-                let mut message = st.message.unwrap_or_default();
-                if !network.message.is_empty() {
-                    if !message.is_empty() {
-                        message.push_str("; ");
-                    }
-                    message.push_str(&network.message);
-                }
-                for e in &network.edges {
-                    if e.phase == "Failed" {
-                        if !message.is_empty() {
-                            message.push_str("; ");
-                        }
-                        message.push_str(&e.message);
-                    }
-                }
-                info!(
-                    instance_id = %d.instance_id,
-                    runtime_id = %st.runtime_id,
-                    phase,
-                    "runtime reconciled"
-                );
-                reports.push(InstanceReport {
-                    instance_id: d.instance_id.clone(),
-                    phase: phase.into(),
-                    message,
-                    runtime_id: st.runtime_id,
-                    ssh: Some(ssh),
-                    network: Some(network),
-                });
-                apply_live(&mut live, d, phase, state.health_ok);
-            }
-            Err(e) => {
-                warn!(
-                    instance_id = %d.instance_id,
-                    error = %e,
-                    error_full = format!("{e:#}"),
-                    "ensure_running failed"
-                );
-                // Schedule backoff for next attempt if policy allows restart.
-                if policy != mc2_runtime::RestartPolicy::Never {
-                    state.restart_count = state.restart_count.saturating_add(1);
-                    state.next_restart_ok = Some(
-                        now + Duration::from_secs(mc2_runtime::backoff_secs(state.restart_count)),
-                    );
-                    state.running_since = None;
-                }
-                let ssh = rt.ssh_table.reconcile(d, false).await;
-                let network = rt.network_table.reconcile_not_running(d).await;
-                reports.push(InstanceReport {
-                    instance_id: d.instance_id.clone(),
-                    phase: InstancePhase::Failed.as_str().into(),
-                    message: format!("{e:#}"),
-                    runtime_id: d.runtime_id.clone(),
-                    ssh: Some(ssh),
-                    network: Some(network),
-                });
-                apply_live(&mut live, d, InstancePhase::Failed.as_str(), false);
-            }
-        }
-    }
-
-    let keep_ids: HashSet<String> = desired.iter().map(|d| d.instance_id.clone()).collect();
-    rt.ssh_table.close_missing(&keep_ids).await;
-    // Rebuild shared network splices from the current desired set + observed phases.
-    rt.network_table
-        .reconcile_splices(desired.as_slice(), &reports)
-        .await;
-    rt.network_table.close_missing(&keep_ids).await;
-
+/// Ingress catalog, disk-limit annotations and the observed-state writes.
+///
+/// Split out of the pass body so the reshape of `reports` (disk conditions) and
+/// the persistence of it (D4) stay in one place.
+async fn publish_observed(
+    store: &Arc<dyn Store>,
+    rt: &mut NodeRuntimeState,
+    desired: &[mc2_runtime::DesiredSandbox],
+    ingress_routes: &[mc2_runtime::DesiredIngressRoute],
+    runtime: &Arc<dyn NodeRuntime>,
+    reports: &mut [InstanceReport],
+    errors: &mut PassErrors,
+) {
     // Ingress file catalog (same-node BYO Traefik).
     let mut phases: HashMap<String, String> = HashMap::new();
-    for r in &reports {
+    for r in reports.iter() {
         phases.insert(r.instance_id.clone(), r.phase.clone());
     }
     if let Some(writer) = rt.ingress_writer.as_mut() {
         match writer
-            .reconcile(&ingress_routes, &phases, rt.self_route.as_ref())
+            .reconcile(ingress_routes, &phases, rt.self_route.as_ref())
             .await
         {
             Ok(st) if st.wrote => {
@@ -419,165 +390,47 @@ async fn reconcile(
         warn_ingress_dir_unset(ingress_routes.len());
     }
 
-    // Persist observed phases directly to the store.
-    for r in &reports {
-        let _ = store
-            .update_instance_status(
-                &r.instance_id,
-                &r.phase,
-                if r.runtime_id.is_empty() {
-                    None
-                } else {
-                    Some(r.runtime_id.as_str())
-                },
-                if r.message.is_empty() {
-                    None
-                } else {
-                    Some(r.message.as_str())
-                },
-            )
-            .await;
-
-        // Healthcheck signal (drives depends_on: service_healthy).
-        if let Some(hstate) = rt.rt_state.get(&r.runtime_id) {
-            let _ = store
-                .update_instance_health(&r.instance_id, hstate.health_ok)
-                .await;
-        }
-
-        if let Some(ref ssh) = r.ssh {
-            let _ = store
-                .update_instance_ssh_observed(
-                    &r.instance_id,
-                    &ssh.phase,
-                    if ssh.bind.is_empty() {
-                        None
-                    } else {
-                        Some(ssh.bind.as_str())
-                    },
-                    if ssh.port == 0 { None } else { Some(ssh.port) },
-                    if ssh.message.is_empty() {
-                        None
-                    } else {
-                        Some(ssh.message.as_str())
-                    },
-                )
-                .await;
-        }
-
-        if let Some(ref network) = r.network {
-            let phase = network_summary_phase(network);
-            let json = network_observed_json(network);
-            let msg = if network.message.is_empty() {
-                None
-            } else {
-                Some(network.message.as_str())
-            };
-            let _ = store
-                .update_instance_network_observed(&r.instance_id, &phase, &json, msg)
-                .await;
-        }
+    // Disk-limit conditions (A9): root-disk usage from msb metrics plus cached
+    // volume-directory walks, appended to each report's message (short NOTES in
+    // `mc2 ps`, full text + fix printed by `mc2 exec`/`ssh`/`logs`).
+    {
+        let root_disk_usage = runtime.root_disk_usage().await.unwrap_or_default();
+        disk::annotate_reports(reports, desired, &root_disk_usage, &runtime.volume_root());
     }
 
-    Ok(())
-}
-
-/// Compose `depends_on` gate: `Some(...)` lists the unsatisfied dependencies
-/// (and their conditions); `None` means all are satisfied and the instance may start.
-fn waiting_deps(
-    d: &mc2_runtime::DesiredSandbox,
-    live: &HashMap<(String, String), ServiceLive>,
-) -> Option<String> {
-    let mut waiting: Vec<String> = Vec::new();
-    for (dep, spec) in &d.spec.depends_on {
-        let key = (d.stack.clone(), dep.clone());
-        let state = live.get(&key);
-        let cond = spec.condition.trim().to_ascii_lowercase();
-        let satisfied = match cond.as_str() {
-            "service_healthy" => state.is_some_and(|s| s.running && s.healthy),
-            _ => state.is_some_and(|s| s.running),
-        };
-        if !satisfied {
-            waiting.push(format!("{dep} ({cond})"));
-        }
-    }
-    if waiting.is_empty() {
-        None
-    } else {
-        Some(waiting.join(", "))
-    }
-}
-
-/// Reflect an instance's observed phase into the service-liveness map.
-fn apply_live(
-    live: &mut HashMap<(String, String), ServiceLive>,
-    d: &mc2_runtime::DesiredSandbox,
-    phase: &str,
-    healthy: bool,
-) {
-    let entry = live
-        .entry((d.stack.clone(), d.service.clone()))
-        .or_default();
-    entry.running = phase == InstancePhase::Running.as_str();
-    entry.healthy = healthy;
-}
-
-/// True if every host port accepts a TCP connect (msb publish live).
-async fn host_ports_accepting(ports: &[u16]) -> bool {
-    use tokio::net::TcpStream;
-    use tokio::time::timeout;
-    for &p in ports {
-        let ok = timeout(
-            Duration::from_millis(200),
-            TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], p))),
-        )
-        .await;
-        match ok {
-            Ok(Ok(_stream)) => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn network_observed_json(f: &NetworkObserved) -> String {
-    serde_json::to_string(f).unwrap_or_else(|_| "{}".into())
-}
-
-fn network_summary_phase(f: &NetworkObserved) -> String {
-    let mut has_ready = false;
-    let mut has_failed = false;
-    let mut has_pending = false;
-    for e in &f.exposes {
-        match NetworkPhase::parse(&e.phase) {
-            NetworkPhase::Ready => has_ready = true,
-            NetworkPhase::Failed => has_failed = true,
-            _ => has_pending = true,
-        }
-    }
-    for e in &f.edges {
-        match NetworkPhase::parse(&e.phase) {
-            NetworkPhase::Ready => has_ready = true,
-            NetworkPhase::Failed => has_failed = true,
-            _ => has_pending = true,
-        }
-    }
-    if f.exposes.is_empty() && f.edges.is_empty() {
-        return NetworkPhase::Pending.as_str().into();
-    }
-    match (has_failed, has_pending, has_ready) {
-        (true, _, true) => NetworkPhase::Mixed.as_str().into(),
-        (true, _, false) => NetworkPhase::Failed.as_str().into(),
-        (false, true, _) => NetworkPhase::Pending.as_str().into(),
-        (false, false, true) => NetworkPhase::Ready.as_str().into(),
-        _ => NetworkPhase::Pending.as_str().into(),
+    // D4: every observed-state write is checked; a failure is logged with the
+    // instance and operation and makes the pass count as failed.
+    for r in reports.iter() {
+        persist_instance_report(store, &rt.rt_state, r, errors).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::lifecycle::{apply_live, waiting_deps};
+    use mc2_store::{
+        ClusterCounts, ClusterMeta, InstanceNetworkRecord, InstanceRecord, InstanceSshRecord,
+        MemoryStore, NodeJoin, NodeRecord, SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan,
+        StackRecord, StoreError,
+    };
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn node_cfg(install_id: &str) -> NodeConfig {
+        NodeConfig {
+            name: "n1".into(),
+            install_id: install_id.into(),
+            labels_json: "{}".into(),
+            cpus: 8,
+            memory_mib: 8192,
+            reconcile_interval: Duration::from_secs(10),
+            ingress_config_dir: None,
+            public_hostname: None,
+            public_tls_cert_resolver: "le".into(),
+            rest_port: 0,
+        }
+    }
 
     fn sandbox(
         depends_on: BTreeMap<String, mc2_api::DependsOnSpec>,
@@ -587,7 +440,7 @@ mod tests {
             stack: "demo".into(),
             service: "web".into(),
             ordinal: 0,
-            runtime_id: "demo-web-0".into(),
+            runtime_id: "demo--web--0".into(),
             spec: mc2_api::ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
@@ -605,6 +458,7 @@ mod tests {
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
+                storage_opt: None,
                 expose: vec![],
                 networks: vec![],
                 depends_on,
@@ -666,12 +520,847 @@ mod tests {
     #[test]
     fn apply_live_tracks_running_and_healthy() {
         let mut m = HashMap::new();
-        let d = sandbox(BTreeMap::new());
-        apply_live(&mut m, &d, "Running", true);
+        apply_live(&mut m, "demo", "web", "Running", true);
         assert!(m[&("demo".into(), "web".into())].running);
         assert!(m[&("demo".into(), "web".into())].healthy);
-        apply_live(&mut m, &d, "Failed", false);
+        apply_live(&mut m, "demo", "web", "Failed", false);
         assert!(!m[&("demo".into(), "web".into())].running);
         assert!(!m[&("demo".into(), "web".into())].healthy);
+    }
+
+    fn plain_spec() -> String {
+        spec_json(&[], None, None)
+    }
+
+    fn spec_json(
+        expose: &[u16],
+        healthcheck: Option<mc2_api::HealthcheckSpec>,
+        secret: Option<(&str, &str)>,
+    ) -> String {
+        let spec = mc2_api::ServiceSpec {
+            image: "alpine".into(),
+            scale: 1,
+            cpus: 1.0,
+            mem_limit_mib: 512,
+            ports: vec![],
+            network: Default::default(),
+            env: BTreeMap::new(),
+            secrets: secret
+                .map(|(name, env)| {
+                    vec![mc2_api::SecretRef {
+                        name: name.into(),
+                        env: env.into(),
+                        allow_hosts: vec!["api.example.com".into()],
+                    }]
+                })
+                .unwrap_or_default(),
+            volumes: vec![],
+            restart: "no".into(),
+            healthcheck,
+            labels: BTreeMap::new(),
+            command: None,
+            node_name: None,
+            node_selector: BTreeMap::new(),
+            ssh: None,
+            storage_opt: None,
+            expose: expose
+                .iter()
+                .map(|&p| mc2_api::ExposeSpec {
+                    port: p,
+                    protocol: "tcp".into(),
+                    name: None,
+                })
+                .collect(),
+            networks: vec![],
+            depends_on: BTreeMap::new(),
+        };
+        serde_json::to_string(&spec).unwrap()
+    }
+
+    /// A `NodeRuntime` that records what the node does to it.
+    #[derive(Default)]
+    struct FakeRuntime {
+        /// Sandboxes listed as owned (as if recovered from `mc2.install`).
+        owned: Vec<String>,
+        /// `ensure_removed` fails this many times per id, then succeeds.
+        remove_failures: tokio::sync::Mutex<HashMap<String, u32>>,
+        removed: tokio::sync::Mutex<Vec<String>>,
+        created: AtomicUsize,
+        /// `exec_command` never returns when set.
+        hang_exec: bool,
+    }
+
+    impl FakeRuntime {
+        fn with_owned(owned: &[&str]) -> Self {
+            Self {
+                owned: owned.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        async fn fail_removals(&self, id: &str, times: u32) {
+            self.remove_failures
+                .lock()
+                .await
+                .insert(id.to_string(), times);
+        }
+
+        async fn removed(&self) -> Vec<String> {
+            self.removed.lock().await.clone()
+        }
+
+        fn created_count(&self) -> usize {
+            self.created.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeRuntime for FakeRuntime {
+        async fn ensure_running(
+            &self,
+            d: &mc2_runtime::DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            Ok(mc2_runtime::SandboxStatus {
+                runtime_id: d.runtime_id.clone(),
+                phase: mc2_runtime::SandboxPhase::Running,
+                message: None,
+            })
+        }
+        async fn ensure_removed(&self, id: &str) -> anyhow::Result<()> {
+            self.removed.lock().await.push(id.to_string());
+            let mut failures = self.remove_failures.lock().await;
+            if let Some(left) = failures.get_mut(id) {
+                if *left > 0 {
+                    *left -= 1;
+                    anyhow::bail!("injected remove failure for {id}");
+                }
+            }
+            Ok(())
+        }
+        async fn status(&self, _id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            anyhow::bail!("unused")
+        }
+        async fn list_owned(&self, _install_id: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self.owned.clone())
+        }
+        async fn exec_command(&self, _id: &str, _argv: &[String]) -> anyhow::Result<i32> {
+            if self.hang_exec {
+                return std::future::pending::<anyhow::Result<i32>>().await;
+            }
+            Ok(0)
+        }
+        async fn exec_with_output(
+            &self,
+            _id: &str,
+            _argv: &[String],
+            _stdin: &[u8],
+        ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    async fn store_with_node() -> (Arc<MemoryStore>, String) {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        let node = store
+            .upsert_local_node(NodeJoin {
+                name: "n1".into(),
+                labels_json: "{}".into(),
+                arch: "aarch64".into(),
+                cpus: 8,
+                memory_mib: 8192,
+            })
+            .await
+            .unwrap();
+        (store, node.id)
+    }
+
+    /// Seed a stack's instances and bind them to `node_id`.
+    ///
+    /// One plan per stack: `commit_stack_plan` removes every stored instance the
+    /// plan does not mention, so seeding a service on its own would prune its
+    /// siblings.
+    async fn seed_stack(
+        store: &MemoryStore,
+        node_id: &str,
+        stack: &str,
+        services: &[(&str, String)],
+    ) -> Vec<mc2_store::InstanceRecord> {
+        let plan = StackPlan::replicas(
+            stack,
+            "{}",
+            "yaml",
+            services.iter().map(|(s, spec)| (*s, vec![spec.clone()])),
+        );
+        let insts = store.commit_stack_plan(&plan).await.unwrap();
+        for i in &insts {
+            store.bind_instance_to_node(&i.id, node_id).await.unwrap();
+        }
+        insts
+    }
+
+    /// Seed exactly one instance for `service` in `stack` and bind it.
+    async fn bound_instance(
+        store: &MemoryStore,
+        node_id: &str,
+        stack: &str,
+        service: &str,
+        spec: &str,
+    ) -> mc2_store::InstanceRecord {
+        let mut insts = seed_stack(store, node_id, stack, &[(service, spec.to_string())]).await;
+        insts.remove(0)
+    }
+
+    fn key() -> SecretsKey {
+        SecretsKey::from_bytes([1u8; 32])
+    }
+
+    async fn pass(
+        store: &Arc<MemoryStore>,
+        node_id: &str,
+        install_id: &str,
+        runtime: &Arc<dyn NodeRuntime>,
+        rt: &mut NodeRuntimeState,
+    ) -> Result<()> {
+        reconcile(
+            store.clone() as Arc<dyn Store>,
+            &key(),
+            node_id,
+            &node_cfg(install_id),
+            runtime,
+            rt,
+        )
+        .await
+    }
+
+    /// A3/B7: a consumer whose allowed port has no listener (a foreign process
+    /// holds it) is reported Failed and never created.
+    #[tokio::test]
+    async fn consumer_with_unbindable_allowed_port_fails_closed() {
+        let (store, node_id) = store_with_node().await;
+
+        // A foreign process holds the guest port `db` exposes.
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        let insts = seed_stack(
+            &store,
+            &node_id,
+            "shop",
+            &[
+                ("db", spec_json(&[port], None, None)),
+                ("app", plain_spec()),
+            ],
+        )
+        .await;
+        let app = insts.iter().find(|i| i.service == "app").unwrap();
+
+        let runtime = Arc::new(FakeRuntime::default());
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.created_count(),
+            0,
+            "no VM may be created while an allowed port has no listener"
+        );
+        let app_rec = store.get_instance(&app.id).await.unwrap().unwrap();
+        assert_eq!(app_rec.phase, "Failed");
+        let msg = app_rec.message.unwrap_or_default();
+        assert!(msg.contains(&port.to_string()), "{msg}");
+        assert!(msg.contains("no listener"), "{msg}");
+    }
+
+    /// B6b: a guest exec that never returns must not stall the reconcile pass —
+    /// the probe runs in its own task, so the other instances still reconcile.
+    #[tokio::test]
+    async fn hung_health_probe_does_not_block_reconcile() {
+        let (store, node_id) = store_with_node().await;
+
+        let health = mc2_api::HealthcheckSpec {
+            test: Some(vec!["/bin/sh".into(), "-c".into(), "true".into()]),
+            interval_seconds: 30,
+            timeout_seconds: 1,
+            retries: 3,
+            start_period_seconds: 0,
+            disable: false,
+        };
+        let insts = seed_stack(
+            &store,
+            &node_id,
+            "shop",
+            &[
+                ("web", spec_json(&[], Some(health), None)),
+                ("solo", plain_spec()),
+            ],
+        )
+        .await;
+        let web = insts.iter().find(|i| i.service == "web").unwrap();
+        let solo = insts.iter().find(|i| i.service == "solo").unwrap();
+        assert!(insts.len() == 2, "both instances are seeded");
+
+        let runtime: Arc<dyn NodeRuntime> = Arc::new(FakeRuntime {
+            hang_exec: true,
+            ..Default::default()
+        });
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        // The probe's own deadline is 1s, so an inline (blocking) probe would
+        // take at least that long: a 900ms budget proves the pass returned
+        // before the probe did.
+        let fut = pass(&store, &node_id, "install-1", &runtime, &mut rt_state);
+        tokio::time::timeout(Duration::from_millis(900), fut)
+            .await
+            .expect("reconcile must not wait for the health probe")
+            .unwrap();
+
+        for inst in [web, solo] {
+            let rec = store.get_instance(&inst.id).await.unwrap().unwrap();
+            assert_eq!(rec.phase, "Running", "instance {}", inst.id);
+        }
+        let in_flight = rt_state
+            .rt_state
+            .values()
+            .filter(|s| s.health_probe.is_some())
+            .count();
+        assert_eq!(in_flight, 1, "the hung probe is in flight, not awaited");
+    }
+
+    /// B2: a labelled orphan sandbox (owned, no desired row) is removed, but
+    /// ownership is dropped only once the removal actually succeeded.
+    #[tokio::test]
+    async fn orphan_removal_retries_until_it_succeeds() {
+        let (store, node_id) = store_with_node().await;
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        runtime.fail_removals("shop--web--0", 1).await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        // First pass: the removal fails, so the sandbox stays owned.
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert!(
+            rt_state.owned.contains("shop--web--0"),
+            "a failed removal must keep ownership"
+        );
+
+        // Second pass: the retry succeeds and ownership is dropped.
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert!(rt_state.owned.is_empty(), "removed after the retry");
+        assert_eq!(
+            runtime.removed().await,
+            vec!["shop--web--0".to_string(), "shop--web--0".to_string()],
+            "exactly the owned orphan was attempted twice"
+        );
+    }
+
+    /// B2: a sandbox this install does not own (no `mc2.install` label, so it is
+    /// never listed) is never removed, and a desired instance keeps its
+    /// placement across passes and a node rename.
+    #[tokio::test]
+    async fn foreign_sandboxes_are_never_touched_and_placements_survive() {
+        let (store, node_id) = store_with_node().await;
+        let inst = bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+
+        // The runtime lists nothing (this install owns nothing yet); the
+        // foreign sandbox exists in the hypervisor but is invisible here.
+        let runtime = Arc::new(FakeRuntime::default());
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        for _ in 0..2 {
+            pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+                .await
+                .unwrap();
+        }
+        assert!(
+            runtime.removed().await.is_empty(),
+            "no sandbox may be removed by guesswork"
+        );
+        assert!(rt_state.owned.contains("shop--web--0"));
+
+        let after = store.get_instance(&inst.id).await.unwrap().unwrap();
+        assert_eq!(after.phase, "Running");
+        assert_eq!(after.node_id.as_deref(), Some(node_id.as_str()));
+
+        // Renaming the node (hostname / --node-name change) reuses its id, so
+        // the placement is untouched.
+        let renamed = store
+            .upsert_local_node(NodeJoin {
+                name: "n1-renamed".into(),
+                labels_json: "{}".into(),
+                arch: "aarch64".into(),
+                cpus: 8,
+                memory_mib: 8192,
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, node_id);
+        pass(
+            &store,
+            &renamed.id,
+            "install-1",
+            &dyn_runtime,
+            &mut rt_state,
+        )
+        .await
+        .unwrap();
+        let after = store.get_instance(&inst.id).await.unwrap().unwrap();
+        assert_eq!(after.node_id.as_deref(), Some(node_id.as_str()));
+        assert_eq!(after.phase, "Running");
+    }
+
+    /// B2/B13: per-sandbox runtime state is pruned once an instance leaves the
+    /// desired set and its sandbox is gone.
+    #[tokio::test]
+    async fn runtime_state_is_pruned_with_the_instance() {
+        let (store, node_id) = store_with_node().await;
+        bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+        let runtime = Arc::new(FakeRuntime::default());
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert!(rt_state.rt_state.contains_key("shop--web--0"));
+
+        // The stack is deleted: desired shrinks to nothing, the sandbox is
+        // removed, and its bookkeeping goes with it.
+        store.delete_stack("shop").await.unwrap();
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert!(rt_state.owned.is_empty());
+        assert!(
+            rt_state.rt_state.is_empty(),
+            "stale restart bookkeeping must not be inherited by a reused name"
+        );
+    }
+
+    /// B3: a restart adopts running sandboxes only when the persisted applied
+    /// hash matches the desired config; a mismatch (or no hash at all) recreates.
+    #[tokio::test]
+    async fn stale_applied_hash_forces_a_recreate() {
+        let (store, node_id) = store_with_node().await;
+        let inst = bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+        store
+            .set_instance_applied_hash(&inst.id, Some("stale-config"))
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.removed().await,
+            vec!["shop--web--0".to_string()],
+            "the stale sandbox is removed before the new config is created"
+        );
+        assert_eq!(runtime.created_count(), 1, "then recreated");
+        let want = expected_recreate_hash(&store, &node_id).await;
+        assert_eq!(
+            store.get_instance_applied_hash(&inst.id).await.unwrap(),
+            Some(want),
+            "the new config hash is recorded only after a successful ensure_running"
+        );
+    }
+
+    /// B3: a matching persisted hash is adopted as-is (no recreate).
+    #[tokio::test]
+    async fn matching_applied_hash_is_adopted() {
+        let (store, node_id) = store_with_node().await;
+        let inst = bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+        let want = expected_recreate_hash(&store, &node_id).await;
+        store
+            .set_instance_applied_hash(&inst.id, Some(&want))
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert!(runtime.removed().await.is_empty(), "adopted, not recreated");
+        let rec = store.get_instance(&inst.id).await.unwrap().unwrap();
+        assert_eq!(rec.phase, "Running");
+    }
+
+    /// B3: an adopted sandbox with no recorded applied hash is recreated — an
+    /// unlabelled/unknown config must never be trusted just because it runs.
+    #[tokio::test]
+    async fn null_applied_hash_for_an_existing_sandbox_recreates() {
+        let (store, node_id) = store_with_node().await;
+        bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.removed().await, vec!["shop--web--0".to_string()]);
+        assert_eq!(runtime.created_count(), 1);
+    }
+
+    /// B3: a failed removal during recreate aborts the instance's pass — the old
+    /// hash is kept (it describes the VM that is still running) and the recreate
+    /// is retried next pass.
+    #[tokio::test]
+    async fn failed_removal_during_recreate_keeps_the_old_hash() {
+        let (store, node_id) = store_with_node().await;
+        let inst = bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+        store
+            .set_instance_applied_hash(&inst.id, Some("old-config"))
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        runtime.fail_removals("shop--web--0", 1).await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_instance_applied_hash(&inst.id).await.unwrap(),
+            Some("old-config".to_string()),
+            "the new config must never be recorded for the old VM"
+        );
+        assert_eq!(runtime.created_count(), 0, "no VM was created");
+        assert!(rt_state.owned.contains("shop--web--0"));
+        let rec = store.get_instance(&inst.id).await.unwrap().unwrap();
+        assert_eq!(rec.phase, "Failed");
+        assert!(rec.message.unwrap().contains("retrying next pass"));
+
+        // Retry: the removal now succeeds and the new hash is recorded.
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(runtime.created_count(), 1);
+        let want = expected_recreate_hash(&store, &node_id).await;
+        assert_eq!(
+            store.get_instance_applied_hash(&inst.id).await.unwrap(),
+            Some(want)
+        );
+    }
+
+    /// B4: one instance with a missing secret must not stop the node — the
+    /// healthy instance reconciles, the failing one is reported Failed, and its
+    /// existing sandbox is not garbage-collected.
+    #[tokio::test]
+    async fn one_unresolvable_instance_does_not_halt_the_pass() {
+        let (store, node_id) = store_with_node().await;
+        let plan = StackPlan::replicas(
+            "shop",
+            "{}",
+            "yaml",
+            [
+                (
+                    "web",
+                    vec![spec_json(&[], None, Some(("not-set-anywhere", "DB_PASS")))],
+                ),
+                ("solo", vec![plain_spec()]),
+            ],
+        );
+        let insts = store.commit_stack_plan(&plan).await.unwrap();
+        for i in &insts {
+            store.bind_instance_to_node(&i.id, &node_id).await.unwrap();
+        }
+        let web = insts.iter().find(|i| i.service == "web").unwrap();
+        let solo = insts.iter().find(|i| i.service == "solo").unwrap();
+
+        // The failing instance already has a sandbox; it must survive.
+        let runtime = Arc::new(FakeRuntime::with_owned(&["shop--web--0"]));
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        let solo_rec = store.get_instance(&solo.id).await.unwrap().unwrap();
+        assert_eq!(solo_rec.phase, "Running");
+
+        let web_rec = store.get_instance(&web.id).await.unwrap().unwrap();
+        assert_eq!(web_rec.phase, "Failed");
+        let msg = web_rec.message.unwrap_or_default();
+        assert!(msg.contains("not-set-anywhere"), "{msg}");
+
+        assert!(
+            runtime.removed().await.is_empty(),
+            "an instance whose desired state failed keeps its sandbox"
+        );
+        assert!(rt_state.owned.contains("shop--web--0"));
+    }
+
+    /// Desired hash the node should record for `shop/web/0`, computed through
+    /// the same builder the node uses.
+    async fn expected_recreate_hash(store: &Arc<MemoryStore>, node_id: &str) -> String {
+        let set = build_desired_set(store.clone() as Arc<dyn Store>, &key(), node_id)
+            .await
+            .unwrap();
+        let desired = set
+            .sandboxes
+            .iter()
+            .find(|d| d.service == "web")
+            .expect("web in desired set");
+        mc2_runtime::desired_recreate_hash(desired)
+    }
+
+    /// A store whose observed-state writes fail, to prove the pass fails with
+    /// them instead of silently keeping the last known state (D4).
+    /// Everything else delegates to the memory store.
+    struct FailingStatusStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl Store for FailingStatusStore {
+        async fn get_cluster_meta(&self) -> Result<Option<ClusterMeta>, StoreError> {
+            self.inner.get_cluster_meta().await
+        }
+        async fn init_cluster(&self, api_token_hash: &str) -> Result<ClusterMeta, StoreError> {
+            self.inner.init_cluster(api_token_hash).await
+        }
+        async fn verify_api_token(&self, token: &str) -> Result<bool, StoreError> {
+            self.inner.verify_api_token(token).await
+        }
+        async fn replace_api_token_hash(&self, api_token_hash: &str) -> Result<(), StoreError> {
+            self.inner.replace_api_token_hash(api_token_hash).await
+        }
+        async fn cluster_counts(&self) -> Result<ClusterCounts, StoreError> {
+            self.inner.cluster_counts().await
+        }
+        async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
+            self.inner.get_setting(key).await
+        }
+        async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError> {
+            self.inner.set_setting(key, value).await
+        }
+        async fn upsert_local_node(&self, join: NodeJoin) -> Result<NodeRecord, StoreError> {
+            self.inner.upsert_local_node(join).await
+        }
+        async fn touch_node(
+            &self,
+            node_id: &str,
+            hb: NodeHeartbeat,
+        ) -> Result<NodeRecord, StoreError> {
+            self.inner.touch_node(node_id, hb).await
+        }
+        async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
+            self.inner.list_nodes().await
+        }
+        async fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
+            self.inner.get_node(node_id).await
+        }
+        async fn list_stacks(&self) -> Result<Vec<StackRecord>, StoreError> {
+            self.inner.list_stacks().await
+        }
+        async fn get_stack(&self, name: &str) -> Result<Option<StackRecord>, StoreError> {
+            self.inner.get_stack(name).await
+        }
+        async fn commit_stack_plan(
+            &self,
+            plan: &StackPlan,
+        ) -> Result<Vec<InstanceRecord>, StoreError> {
+            self.inner.commit_stack_plan(plan).await
+        }
+        async fn delete_stack(&self, name: &str) -> Result<bool, StoreError> {
+            self.inner.delete_stack(name).await
+        }
+        async fn list_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+            self.inner.list_instances().await
+        }
+        async fn list_instances_for_node(
+            &self,
+            node_id: &str,
+        ) -> Result<Vec<InstanceRecord>, StoreError> {
+            self.inner.list_instances_for_node(node_id).await
+        }
+        async fn list_pending_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+            self.inner.list_pending_instances().await
+        }
+        async fn bind_instance_to_node(
+            &self,
+            instance_id: &str,
+            node_id: &str,
+        ) -> Result<InstanceRecord, StoreError> {
+            self.inner.bind_instance_to_node(instance_id, node_id).await
+        }
+        async fn set_instance_applied_hash(
+            &self,
+            instance_id: &str,
+            applied_hash: Option<&str>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .set_instance_applied_hash(instance_id, applied_hash)
+                .await
+        }
+        async fn get_instance_applied_hash(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<String>, StoreError> {
+            self.inner.get_instance_applied_hash(instance_id).await
+        }
+        async fn get_instance(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<InstanceRecord>, StoreError> {
+            self.inner.get_instance(instance_id).await
+        }
+        async fn update_instance_health(
+            &self,
+            instance_id: &str,
+            healthy: bool,
+        ) -> Result<InstanceRecord, StoreError> {
+            self.inner
+                .update_instance_health(instance_id, healthy)
+                .await
+        }
+        async fn put_secret_blob(
+            &self,
+            name: &str,
+            nonce: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<SecretMeta, StoreError> {
+            self.inner.put_secret_blob(name, nonce, ciphertext).await
+        }
+        async fn get_secret_blob(&self, name: &str) -> Result<Option<SecretBlob>, StoreError> {
+            self.inner.get_secret_blob(name).await
+        }
+        async fn list_secret_meta(&self) -> Result<Vec<SecretMeta>, StoreError> {
+            self.inner.list_secret_meta().await
+        }
+        async fn delete_secret(&self, name: &str) -> Result<bool, StoreError> {
+            self.inner.delete_secret(name).await
+        }
+        async fn put_ssh_key(
+            &self,
+            name: &str,
+            public_key: &str,
+        ) -> Result<SshAuthorizedKey, StoreError> {
+            self.inner.put_ssh_key(name, public_key).await
+        }
+        async fn get_ssh_key(&self, name: &str) -> Result<Option<SshAuthorizedKey>, StoreError> {
+            self.inner.get_ssh_key(name).await
+        }
+        async fn list_ssh_keys(&self) -> Result<Vec<SshAuthorizedKey>, StoreError> {
+            self.inner.list_ssh_keys().await
+        }
+        async fn delete_ssh_key(&self, name: &str) -> Result<bool, StoreError> {
+            self.inner.delete_ssh_key(name).await
+        }
+        async fn get_instance_ssh(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<InstanceSshRecord>, StoreError> {
+            self.inner.get_instance_ssh(instance_id).await
+        }
+        async fn put_instance_ssh_desired(
+            &self,
+            rec: &InstanceSshRecord,
+        ) -> Result<InstanceSshRecord, StoreError> {
+            self.inner.put_instance_ssh_desired(rec).await
+        }
+        async fn clear_instance_ssh_override(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<InstanceSshRecord>, StoreError> {
+            self.inner.clear_instance_ssh_override(instance_id).await
+        }
+        async fn update_instance_ssh_observed(
+            &self,
+            instance_id: &str,
+            phase: &str,
+            bind: Option<&str>,
+            port: Option<u16>,
+            message: Option<&str>,
+        ) -> Result<InstanceSshRecord, StoreError> {
+            self.inner
+                .update_instance_ssh_observed(instance_id, phase, bind, port, message)
+                .await
+        }
+        async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError> {
+            self.inner.list_instance_ssh().await
+        }
+        async fn update_instance_network_observed(
+            &self,
+            instance_id: &str,
+            phase: &str,
+            observed_json: &str,
+            message: Option<&str>,
+        ) -> Result<InstanceNetworkRecord, StoreError> {
+            self.inner
+                .update_instance_network_observed(instance_id, phase, observed_json, message)
+                .await
+        }
+        async fn get_instance_network(
+            &self,
+            instance_id: &str,
+        ) -> Result<Option<InstanceNetworkRecord>, StoreError> {
+            self.inner.get_instance_network(instance_id).await
+        }
+
+        async fn update_instance_status(
+            &self,
+            instance_id: &str,
+            phase: &str,
+            runtime_id: Option<&str>,
+            message: Option<&str>,
+        ) -> Result<InstanceRecord, StoreError> {
+            let _ = (instance_id, phase, runtime_id, message);
+            Err(StoreError::Other(anyhow::anyhow!(
+                "injected update_instance_status failure"
+            )))
+        }
+    }
+
+    /// D4: an observed-state write failure must be logged and make the pass
+    /// count as failed; the instance itself is still reconciled.
+    #[tokio::test]
+    async fn failing_status_writes_fail_the_pass() {
+        let (store, node_id) = store_with_node().await;
+        let inst = bound_instance(&store, &node_id, "shop", "web", &plain_spec()).await;
+
+        let failing: Arc<dyn Store> = Arc::new(FailingStatusStore {
+            inner: store.clone(),
+        });
+        let runtime = Arc::new(FakeRuntime::default());
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        let err = reconcile(
+            failing,
+            &key(),
+            &node_id,
+            &node_cfg("install-1"),
+            &dyn_runtime,
+            &mut rt_state,
+        )
+        .await
+        .expect_err("the pass must fail when observed state cannot be persisted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("update_instance_status"), "{msg}");
+        assert!(msg.contains(&inst.id), "{msg}");
+
+        assert_eq!(runtime.created_count(), 1, "the instance was reconciled");
+        assert!(rt_state.owned.contains("shop--web--0"));
     }
 }

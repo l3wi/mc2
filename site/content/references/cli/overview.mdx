@@ -26,7 +26,7 @@ loopback or a remote install over TLS. For the API it talks to, see the
 | `mc2 network [name \| inst-ref]` | Network membership summary |
 | `mc2 ingress` | Desired ingress routes |
 | `mc2 volume ls` | Named volumes retained on the node |
-| `mc2 exec <instance> <cmd...>` | Run a command inside a sandbox (piped stdin forwarded) |
+| `mc2 exec <instance> <cmd...>` | Run a command inside a sandbox (argv verbatim; raw stdin forwarded) |
 | `mc2 ssh` | SSH authorized keys + open/close endpoints |
 | `mc2 secret set\|ls\|rm` | Secrets (encrypted at rest; values never listed) |
 | `mc2 context set\|use\|ls` | Named API contexts (`~/.mc2/config.toml`, 0600) |

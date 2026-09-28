@@ -6,7 +6,7 @@
 use crate::networks::network_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
-use crate::{DesiredSandbox, ExecResult, NodeRuntime, SandboxPhase, SandboxStatus};
+use crate::{DesiredSandbox, DiskUsage, ExecResult, NodeRuntime, SandboxPhase, SandboxStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
@@ -14,10 +14,11 @@ use microsandbox::{set_default_backend, LocalBackend, NetworkPolicy, NetworkProf
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, PortRange, Protocol, Rule,
 };
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Ensure process-wide default is LocalBackend once per agent process.
 static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -25,47 +26,52 @@ static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Real microVM backend via the **microsandbox** crate (local libkrun only).
 #[derive(Debug)]
 pub struct MicrosandboxRuntime {
-    /// Named-volume root override (agent `--volume-dir`). `None` = msb default
-    /// (`~/.microsandbox/volumes`). Applied process-wide on first backend init.
+    /// MC2 volume root override (`--volume-dir` / `MC2_VOLUME_DIR`).
+    /// `None` → `~/.mc2/volumes`. MC2 owns the directories under it and mounts
+    /// `mc2-{stack}--{volume}` as a bind mount with an explicit quota.
     volume_dir: Option<PathBuf>,
+    /// This install's id (`mc2.install` label / `list_owned` filter). Empty
+    /// means "not configured" and refuses to create sandboxes, so a sandbox can
+    /// never be created without the label ownership recovery depends on.
+    install_id: String,
 }
 
 impl MicrosandboxRuntime {
     pub fn new(volume_dir: Option<PathBuf>) -> Self {
-        Self { volume_dir }
+        Self {
+            volume_dir,
+            install_id: String::new(),
+        }
+    }
+
+    /// Attach the install id that labels every sandbox this runtime creates.
+    pub fn with_install_id(mut self, install_id: impl Into<String>) -> Self {
+        self.install_id = install_id.into();
+        self
+    }
+
+    /// The install id this runtime labels sandboxes with.
+    pub fn install_id(&self) -> &str {
+        &self.install_id
     }
 }
 
-async fn ensure_local_backend(volume_dir: Option<&Path>) -> Result<()> {
+/// Install the local backend process-wide, once.
+///
+/// MC2 owns its volume directories as bind mounts, so microsandbox's own
+/// named-volume directory is unused and never overridden.
+async fn ensure_local_backend() -> Result<()> {
     if LOCAL_BACKEND_INSTALLED.load(Ordering::SeqCst) {
         return Ok(());
     }
     // Install local even if MSB_API_KEY / cloud profile would otherwise win.
-    let local = match volume_dir {
-        Some(dir) => LocalBackend::builder()
-            .volumes_dir(resolve_volume_dir(dir)?)
-            .build()
-            .await
-            .with_context(|| format!("LocalBackend builder with volumes_dir={dir:?}"))?,
-        None => LocalBackend::new()
-            .await
-            .context("LocalBackend::new (open microsandbox local DB)")?,
-    };
+    let local = LocalBackend::new()
+        .await
+        .context("LocalBackend::new (open microsandbox local DB)")?;
     set_default_backend(local);
     LOCAL_BACKEND_INSTALLED.store(true, Ordering::SeqCst);
-    info!(
-        volume_dir = volume_dir.map(|p| p.display().to_string()),
-        "microsandbox: forced LocalBackend (ignores MSB_API_KEY / cloud profiles)"
-    );
+    info!("microsandbox: forced LocalBackend (ignores MSB_API_KEY / cloud profiles)");
     Ok(())
-}
-
-/// Create the override volume root and resolve symlinks (e.g. macOS
-/// `/tmp` → `/private/tmp`): msb refuses to follow symlinks when mounting,
-/// so the backend must receive a canonical path.
-fn resolve_volume_dir(dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create volume dir {}", dir.display()))?;
-    std::fs::canonicalize(dir).with_context(|| format!("canonicalize volume dir {}", dir.display()))
 }
 
 fn map_status(s: MsbStatus) -> SandboxPhase {
@@ -77,20 +83,29 @@ fn map_status(s: MsbStatus) -> SandboxPhase {
     }
 }
 
+/// Map validated `network.profiles` values to msb profiles.
+///
+/// Closed set: `public` | `private` | `host` (stack validation rejects anything
+/// else, and `none` is handled by `disable_network`). An unrecognised value
+/// never becomes `Public` — it yields no profile at all, so the guest fails
+/// closed. `Public` is the default **only** for an empty list.
 fn network_profiles(desired: &DesiredSandbox) -> Vec<NetworkProfile> {
     let mut out = Vec::new();
     for p in &desired.spec.network.profiles {
         match p.as_str() {
             "public" => out.push(NetworkProfile::Public),
-            "private" | "local" => out.push(NetworkProfile::Private),
-            "host" | "any" => out.push(NetworkProfile::Host),
+            "private" => out.push(NetworkProfile::Private),
+            "host" => out.push(NetworkProfile::Host),
             "none" => {}
             other => {
-                warn!(profile = %other, "unknown network profile; ignoring");
+                error!(
+                    profile = %other,
+                    "unknown network profile; refusing egress (never treated as public)"
+                );
             }
         }
     }
-    if out.is_empty() && !desired.spec.network.profiles.iter().any(|p| p == "none") {
+    if desired.spec.network.profiles.is_empty() {
         out.push(NetworkProfile::Public);
     }
     out
@@ -125,16 +140,32 @@ fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
     policy
 }
 
-async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) -> Result<()> {
-    ensure_local_backend(volume_dir).await?;
+async fn create_detached(
+    desired: &DesiredSandbox,
+    volume_dir: Option<&Path>,
+    install_id: &str,
+) -> Result<()> {
+    if install_id.is_empty() {
+        anyhow::bail!(
+            "runtime has no install id; refusing to create {} \
+             (without the mc2.install label the node could never recover ownership of it)",
+            desired.runtime_id
+        );
+    }
+    ensure_local_backend().await?;
 
     let cpus = (desired.spec.cpus.clamp(1.0, 255.0)) as u8;
     let mem = desired.spec.mem_limit_mib.min(u32::MAX as u64) as u32;
+    let root_disk_mib = desired.spec.root_disk_mib().clamp(1, u32::MAX as u64) as u32;
 
     // Note: `.replace()` is not accepted by create_detached on local backend.
     // Callers must remove an existing sandbox first if recreation is needed.
     let mut b = Sandbox::builder(desired.runtime_id.clone())
         .image(desired.spec.image.as_str())
+        // Guest writable root disk (`services.<name>.storage_opt.size`). Always
+        // explicit, so a spec change is a deliberate recreate rather than a
+        // silent fallback to microsandbox's own 4 GiB default.
+        .root_disk(root_disk_mib)
         .cpus(cpus)
         .memory(mem)
         .detached(true);
@@ -152,15 +183,41 @@ async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) ->
     b = b
         .label("mc2.stack", &desired.stack)
         .label("mc2.service", &desired.service)
-        .label("mc2.ordinal", desired.ordinal.to_string());
+        .label("mc2.ordinal", desired.ordinal.to_string())
+        // Ownership marker: `list_owned` filters on it, so a node only ever
+        // adopts/removes sandboxes this install created (B2).
+        .label("mc2.install", install_id);
 
-    // Node-local named directory volumes: create-or-reuse under the backend
-    // volumes dir; data survives sandbox removal (msb retains named volumes).
-    let mounts = crate::volume_mount_plan(desired);
-    for (guest, msb_name) in mounts {
-        b = b.volume(guest, move |m| {
-            m.named_with(msb_name, |v| v.ensure_exists().directory())
-        });
+    // MC2-owned volume directories, mounted as bind mounts with an explicit
+    // per-start quota. microsandbox charges a bind mount's quota as growth
+    // *beyond* the directory's existing contents, so passing
+    // `size − current usage` makes the declared size an absolute cap that
+    // survives restarts and can be resized (`mc2 up`) with the data kept.
+    // A quota is never omitted: without one microsandbox would silently apply
+    // its own 4 GiB default. Usage is measured fresh before every create.
+    let root = crate::ensure_volume_dir(&crate::volume_root(volume_dir))
+        .with_context(|| format!("create volume root for {volume_dir:?}"))?;
+    let mut usage: HashMap<String, u64> = HashMap::new();
+    for m in &desired.spec.volumes {
+        let dir = crate::volume_name(&desired.stack, &m.name);
+        let used = crate::dir_size_mib(&root.join(&dir));
+        usage.insert(dir, used);
+    }
+    for plan in crate::volume_bind_plan(desired, &root, &usage) {
+        // The host directory must exist before canonicalizing: microsandbox
+        // refuses to follow symlinks on a bind-mount host path.
+        let host = crate::ensure_volume_dir(&plan.host)
+            .with_context(|| format!("create volume dir {}", plan.host.display()))?;
+        debug!(
+            runtime_id = %desired.runtime_id,
+            guest = %plan.guest,
+            host = %host.display(),
+            quota_mib = plan.quota_mib,
+            "volume: bind mount with guest-write quota"
+        );
+        let guest = plan.guest;
+        let quota = plan.quota_mib;
+        b = b.volume(guest, move |m| m.bind(host).quota(quota));
     }
     for p in &desired.spec.ports {
         // Ports always publish on loopback (network/ingress only, BYO Traefik).
@@ -202,6 +259,7 @@ async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) ->
         image = %desired.spec.image,
         cpus,
         memory_mib = mem,
+        root_disk_mib,
         secrets = desired.secrets.len(),
         volumes = desired.spec.volumes.len(),
     );
@@ -212,8 +270,8 @@ async fn create_detached(desired: &DesiredSandbox, volume_dir: Option<&Path>) ->
     Ok(())
 }
 
-async fn observe(name: &str, volume_dir: Option<&Path>) -> Result<Option<MsbStatus>> {
-    ensure_local_backend(volume_dir).await?;
+async fn observe(name: &str) -> Result<Option<MsbStatus>> {
+    ensure_local_backend().await?;
     match Sandbox::get(name).await {
         Ok(handle) => Ok(Some(handle.status_snapshot())),
         Err(e) => {
@@ -226,12 +284,12 @@ async fn observe(name: &str, volume_dir: Option<&Path>) -> Result<Option<MsbStat
 #[async_trait]
 impl NodeRuntime for MicrosandboxRuntime {
     async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus> {
-        ensure_local_backend(self.volume_dir.as_deref()).await?;
+        ensure_local_backend().await?;
         let name = desired.runtime_id.as_str();
 
         let policy = RestartPolicy::parse(&desired.spec.restart);
 
-        match observe(name, self.volume_dir.as_deref()).await? {
+        match observe(name).await? {
             Some(st) => {
                 let phase = map_status(st);
                 match phase {
@@ -264,7 +322,8 @@ impl NodeRuntime for MicrosandboxRuntime {
                         RestartAction::Recreate => {
                             warn!(%name, ?policy, "recreating sandbox per restartPolicy");
                             let _ = Sandbox::remove(name).await;
-                            create_detached(desired, self.volume_dir.as_deref()).await?;
+                            create_detached(desired, self.volume_dir.as_deref(), &self.install_id)
+                                .await?;
                         }
                         RestartAction::Start => {
                             info!(%name, ?other, "starting existing sandbox (detached)");
@@ -280,7 +339,12 @@ impl NodeRuntime for MicrosandboxRuntime {
                                     }
                                     warn!(%name, error = %e, "start_detached failed; recreating");
                                     let _ = Sandbox::remove(name).await;
-                                    create_detached(desired, self.volume_dir.as_deref()).await?;
+                                    create_detached(
+                                        desired,
+                                        self.volume_dir.as_deref(),
+                                        &self.install_id,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -288,11 +352,11 @@ impl NodeRuntime for MicrosandboxRuntime {
                 }
             }
             None => {
-                create_detached(desired, self.volume_dir.as_deref()).await?;
+                create_detached(desired, self.volume_dir.as_deref(), &self.install_id).await?;
             }
         }
 
-        let phase = match observe(name, self.volume_dir.as_deref()).await? {
+        let phase = match observe(name).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Creating,
         };
@@ -305,7 +369,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn ensure_removed(&self, runtime_id: &str) -> Result<()> {
-        ensure_local_backend(self.volume_dir.as_deref()).await?;
+        ensure_local_backend().await?;
         let name = runtime_id;
         info!(%name, "stopping/removing microsandbox via SDK");
 
@@ -337,8 +401,8 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn status(&self, runtime_id: &str) -> Result<SandboxStatus> {
-        ensure_local_backend(self.volume_dir.as_deref()).await?;
-        let phase = match observe(runtime_id, self.volume_dir.as_deref()).await? {
+        ensure_local_backend().await?;
+        let phase = match observe(runtime_id).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Stopped,
         };
@@ -349,14 +413,34 @@ impl NodeRuntime for MicrosandboxRuntime {
         })
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        ensure_local_backend(self.volume_dir.as_deref()).await?;
-        let page = Sandbox::list().await.context("Sandbox::list")?;
-        Ok(page
-            .sandboxes
-            .into_iter()
-            .map(|h| h.name().to_string())
-            .collect())
+    /// Only this install's sandboxes: the SDK matches the `mc2.install` label
+    /// server-side and paginates, so a foreign (unlabelled) workload is never
+    /// even returned.
+    async fn list_owned(&self, install_id: &str) -> Result<Vec<String>> {
+        if install_id.is_empty() {
+            anyhow::bail!("runtime has no install id; refusing to list sandboxes");
+        }
+        ensure_local_backend().await?;
+        let mut owned = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let after = cursor.clone();
+            let page = Sandbox::list_with(move |list| {
+                let list = list.label("mc2.install", install_id);
+                match after {
+                    Some(c) => list.cursor(c),
+                    None => list,
+                }
+            })
+            .await
+            .with_context(|| format!("Sandbox::list(mc2.install={install_id})"))?;
+            owned.extend(page.sandboxes.iter().map(|h| h.name().to_string()));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(owned)
     }
 
     async fn exec_command(&self, runtime_id: &str, argv: &[String]) -> Result<i32> {
@@ -372,7 +456,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         argv: &[String],
         stdin: &[u8],
     ) -> Result<ExecResult> {
-        ensure_local_backend(self.volume_dir.as_deref()).await?;
+        ensure_local_backend().await?;
         if argv.is_empty() {
             anyhow::bail!("exec: empty argv");
         }
@@ -396,9 +480,41 @@ impl NodeRuntime for MicrosandboxRuntime {
             .with_context(|| format!("Sandbox::exec collect({runtime_id})"))?;
         Ok(ExecResult {
             exit_code: output.status().code,
-            stdout: output.stdout().unwrap_or_default(),
-            stderr: output.stderr().unwrap_or_default(),
+            // Raw bytes, not `stdout()`/`stderr()`: those return
+            // `Result<String, FromUtf8Error>` and would drop non-UTF-8 output.
+            stdout: output.stdout_bytes().to_vec(),
+            stderr: output.stderr_bytes().to_vec(),
         })
+    }
+
+    fn volume_root(&self) -> PathBuf {
+        crate::volume_root(self.volume_dir.as_deref())
+    }
+
+    /// Root-disk usage from the microsandbox live metrics registry (one shared
+    /// memory read for every running sandbox).
+    ///
+    /// A sandbox whose sample has no `upper_used_bytes` (metrics disabled or
+    /// not yet sampled) is skipped rather than reported as empty.
+    async fn root_disk_usage(&self) -> Result<HashMap<String, DiskUsage>> {
+        ensure_local_backend().await?;
+        let all = microsandbox::all_sandbox_metrics()
+            .await
+            .context("microsandbox::all_sandbox_metrics")?;
+        Ok(all
+            .into_iter()
+            .filter_map(|(name, m)| {
+                let used = m.upper_used_bytes?;
+                let capacity = m.upper_free_bytes.map(|free| used.saturating_add(free));
+                Some((
+                    name,
+                    DiskUsage {
+                        used_mib: used / (1024 * 1024),
+                        capacity_mib: capacity.map(|b| b / (1024 * 1024)),
+                    },
+                ))
+            })
+            .collect())
     }
 }
 
@@ -415,7 +531,7 @@ mod tests {
             stack: "s".into(),
             service: "w".into(),
             ordinal: 0,
-            runtime_id: "s-w-0".into(),
+            runtime_id: "s--w--0".into(),
             spec: ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
@@ -435,6 +551,7 @@ mod tests {
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
+                storage_opt: None,
                 expose: vec![],
                 networks: vec![],
                 depends_on: BTreeMap::new(),
@@ -456,7 +573,7 @@ mod tests {
             stack: "shop".into(),
             service: "web".into(),
             ordinal: 0,
-            runtime_id: "shop-web-0".into(),
+            runtime_id: "shop--web--0".into(),
             spec: ServiceSpec {
                 image: "alpine".into(),
                 scale: 1,
@@ -476,6 +593,7 @@ mod tests {
                 node_name: None,
                 node_selector: BTreeMap::new(),
                 ssh: None,
+                storage_opt: None,
                 expose: vec![],
                 networks: vec![],
                 depends_on: BTreeMap::new(),
@@ -490,10 +608,6 @@ mod tests {
                     protocol: "tcp".into(),
                     fqdn: "db.shop.svc.mc2".into(),
                     short_name: "db".into(),
-                    backend_instance_id: "x".into(),
-                    backend_node_id: "n".into(),
-                    backend_local: true,
-                    backend_ordinal: 0,
                 }],
             },
         };
@@ -508,5 +622,87 @@ mod tests {
                 && r.ports.iter().any(|p| p.start == 5432 && p.end == 5432)
         }));
         d.network = Default::default();
+    }
+
+    fn profiled(profiles: &[&str]) -> DesiredSandbox {
+        DesiredSandbox {
+            instance_id: "i".into(),
+            stack: "s".into(),
+            service: "w".into(),
+            ordinal: 0,
+            runtime_id: "s--w--0".into(),
+            spec: ServiceSpec {
+                image: "alpine".into(),
+                scale: 1,
+                cpus: 1.0,
+                mem_limit_mib: 256,
+                ports: vec![],
+                network: mc2_api::stack::NetworkSpec {
+                    profiles: profiles.iter().map(|p| (*p).to_string()).collect(),
+                },
+                env: BTreeMap::new(),
+                secrets: vec![],
+                volumes: vec![],
+                restart: "on-failure".into(),
+                healthcheck: None,
+                labels: BTreeMap::new(),
+                command: None,
+                node_name: None,
+                node_selector: BTreeMap::new(),
+                ssh: None,
+                storage_opt: None,
+                expose: vec![],
+                networks: vec![],
+                depends_on: BTreeMap::new(),
+            },
+            secrets: vec![],
+            ssh: Default::default(),
+            network: Default::default(),
+        }
+    }
+
+    #[test]
+    fn empty_profiles_default_to_public() {
+        let p = network_profiles(&profiled(&[]));
+        assert_eq!(p.len(), 1);
+        assert!(p.contains(&NetworkProfile::Public));
+    }
+
+    #[test]
+    fn closed_profile_set_maps_without_aliases() {
+        let private = network_profiles(&profiled(&["private"]));
+        assert_eq!(private.len(), 1);
+        assert!(private.contains(&NetworkProfile::Private));
+
+        let host = network_profiles(&profiled(&["host"]));
+        assert_eq!(host.len(), 1);
+        assert!(host.contains(&NetworkProfile::Host));
+
+        // `none` contributes no profile at all (disable_network is separate).
+        assert!(network_profiles(&profiled(&["none"])).is_empty());
+    }
+
+    #[test]
+    fn unknown_profile_never_falls_back_to_public() {
+        // Aliases (`local`/`any`) and typos must not grant any egress.
+        for bad in ["local", "any", "privte"] {
+            let got = network_profiles(&profiled(&[bad]));
+            assert!(got.is_empty(), "{bad} must map to no profile");
+            assert!(
+                !got.contains(&NetworkProfile::Public),
+                "{bad} must never become Public"
+            );
+        }
+    }
+
+    /// B2: a runtime with no install id must not create or list sandboxes — an
+    /// unlabelled sandbox could never be recovered (or safely cleaned up) after
+    /// a restart, so this fails before any backend is touched.
+    #[tokio::test]
+    async fn refuses_to_create_or_list_without_an_install_id() {
+        let rt = MicrosandboxRuntime::new(None);
+        assert!(rt.list_owned("").await.is_err());
+        let d = profiled(&["public"]);
+        assert!(create_detached(&d, None, "").await.is_err());
     }
 }

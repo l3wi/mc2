@@ -24,9 +24,11 @@ Most endpoints require an operator bearer token:
 Authorization: Bearer mc2at_...
 ```
 
-The server prints the API token once on first bootstrap. Requests without a
-valid token return `401`. `GET /health` is the one exception — it requires no
-auth.
+The server shows the API token once on first bootstrap — stderr on a TTY,
+otherwise `<data-dir>/bootstrap-token` (mode 0600), with only the path logged.
+Recover a lost token with `mc2 server token rotate`. Requests without a valid
+token return `401`. `GET /health` is the one exception — it requires no auth.
+A server started with `--no-auth` skips the check for that run.
 
 ```bash
 curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/status

@@ -1,9 +1,10 @@
 //! Instance endpoints: list, network status, exec, logs.
 
 use crate::api::{ApiError, ApiResult};
+use crate::limits::SSE_KEEPALIVE_INTERVAL;
 use crate::AppState;
 use axum::extract::{Path, Query, State};
-use axum::response::sse::Event;
+use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
 use axum::Json;
 use futures::stream::{self, StreamExt};
@@ -13,8 +14,9 @@ use serde_json::json;
 #[derive(Debug, Deserialize)]
 pub struct ExecBody {
     pub cmd: Vec<String>,
-    #[serde(default)]
-    pub stdin: Option<String>,
+    /// Raw stdin bytes, base64-encoded (`mc2_api::exec::decode_bytes`).
+    #[serde(default, rename = "stdinBase64")]
+    pub stdin_base64: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,7 +29,6 @@ pub struct LogsQuery {
 
 pub async fn list_instances(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
 ) -> ApiResult<Vec<mc2_store::InstanceRecord>> {
     crate::apply::list_instance_views(state.store.clone())
         .await
@@ -36,15 +37,31 @@ pub async fn list_instances(
 }
 
 /// Observed network status for one instance (agent-reported).
+///
+/// Each observed `expose` is annotated with its owning `stack/service` — the
+/// server-wide owner of that port claim.
 pub async fn get_instance_network(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
+    let inst = state
+        .store
+        .get_instance(&id)
+        .await
+        .map_err(ApiError::store)?
+        .ok_or_else(|| ApiError::not_found(format!("instance not found: {id}")))?;
     match state.store.get_instance_network(&id).await {
         Ok(Some(rec)) => {
-            let observed: serde_json::Value =
+            let mut observed: serde_json::Value =
                 serde_json::from_str(&rec.observed_json).unwrap_or(json!({}));
+            let owner = format!("{}/{}", inst.stack, inst.service);
+            if let Some(exposes) = observed.get_mut("exposes").and_then(|v| v.as_array_mut()) {
+                for ex in exposes {
+                    if let Some(obj) = ex.as_object_mut() {
+                        obj.insert("owner".into(), json!(owner));
+                    }
+                }
+            }
             Ok(Json(json!({
                 "instanceId": rec.instance_id,
                 "phase": rec.phase,
@@ -61,7 +78,6 @@ pub async fn get_instance_network(
 /// Server-wide network membership summary (default + named networks).
 pub async fn list_networks(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
 ) -> ApiResult<crate::networks::NetworksView> {
     match crate::networks::build_networks_view(state.store.as_ref()).await {
         Ok(view) => Ok(Json(view)),
@@ -70,9 +86,14 @@ pub async fn list_networks(
 }
 
 /// Run a command inside the instance's sandbox and return captured output.
+///
+/// Exempt from the ordinary request deadline (a command can run for minutes).
+/// stdin/stdout/stderr are arbitrary bytes, so they travel base64-encoded
+/// (`stdinBase64`, `stdoutBase64`, `stderrBase64`); see `mc2_api::exec`.
+/// The request body is capped at 16 MiB (`limits::EXEC_BODY_LIMIT_BYTES`), so
+/// the largest raw stdin is ~12 MiB once base64 overhead is accounted for.
 pub async fn exec_instance(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
     Json(body): Json<ExecBody>,
 ) -> ApiResult<serde_json::Value> {
@@ -92,7 +113,11 @@ pub async fn exec_instance(
             "instance {id} has no sandbox runtime yet"
         )));
     };
-    let stdin = body.stdin.unwrap_or_default().into_bytes();
+    let stdin = match body.stdin_base64.as_deref() {
+        Some(encoded) => mc2_api::exec::decode_bytes(encoded)
+            .map_err(|_| ApiError::bad_request("stdinBase64 is not valid base64"))?,
+        None => Vec::new(),
+    };
     match state
         .runtime
         .exec_with_output(runtime_id, &body.cmd, &stdin)
@@ -101,8 +126,8 @@ pub async fn exec_instance(
         Ok(out) => Ok(Json(json!({
             "instanceId": id,
             "exitCode": out.exit_code,
-            "stdout": out.stdout,
-            "stderr": out.stderr,
+            "stdoutBase64": mc2_api::exec::encode_bytes(&out.stdout),
+            "stderrBase64": mc2_api::exec::encode_bytes(&out.stderr),
         }))),
         Err(e) => Err(ApiError::internal(e.to_string())),
     }
@@ -111,9 +136,13 @@ pub async fn exec_instance(
 /// Recent sandbox logs (runtime / exec / kernel) for an instance. With
 /// `follow=true`, returns an SSE stream (tail snapshot first, then new entries
 /// as they arrive).
+///
+/// The follow stream has **no total timeout** (the route is not wrapped in the
+/// request deadline) and sends a comment keepalive every
+/// [`SSE_KEEPALIVE_INTERVAL`] so an idle client or proxy can tell the stream is
+/// still alive.
 pub async fn get_instance_logs(
     State(state): State<AppState>,
-    _auth: crate::auth::AuthUser,
     Path(id): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> Result<Response, ApiError> {
@@ -188,7 +217,9 @@ pub async fn get_instance_logs(
                     .map(|e| Ok::<Event, std::convert::Infallible>(entry_event(&e)))
             }))
             .boxed();
-    Ok(Sse::new(entries).into_response())
+    Ok(Sse::new(entries)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+        .into_response())
 }
 
 fn entry_json(e: &microsandbox::logs::LogEntry) -> serde_json::Value {
@@ -208,19 +239,23 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use mc2_store::{MemoryStore, Store};
+    use mc2_store::{MemoryStore, StackPlan, Store};
     use tower::ServiceExt;
 
     use crate::api::router;
-    use crate::api::testing::{test_state, MockRuntime};
+    use crate::api::testing::{test_state_open, MockRuntime};
 
     #[tokio::test]
     async fn exec_runs_command_and_reports_errors() {
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
-            .reconcile_service_replicas("demo", "web", 1, r#"{}"#)
+            .commit_stack_plan(&StackPlan::replicas(
+                "demo",
+                "{}",
+                "yaml",
+                vec![("web", vec![r#"{}"#.to_string()])],
+            ))
             .await
             .unwrap();
         store
@@ -228,10 +263,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut state = test_state(store.clone());
-        state.runtime = std::sync::Arc::new(MockRuntime);
+        let runtime = std::sync::Arc::new(MockRuntime::default());
+        let mut state = test_state_open(store.clone());
+        state.runtime = runtime.clone();
         let app = router(state);
 
+        // Non-UTF-8 stdin must reach the runtime byte-exact.
+        let raw_stdin: Vec<u8> = vec![0x00, 0xff, 0xfe, 0x80, b'o', b'k'];
         let res = app
             .clone()
             .oneshot(
@@ -240,7 +278,11 @@ mod tests {
                     .uri(format!("/v1/instances/{}/exec", inst[0].id))
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({ "cmd": ["echo", "hi"] })).unwrap(),
+                        serde_json::to_vec(&serde_json::json!({
+                            "cmd": ["/bin/sh", "-c", "cat"],
+                            "stdinBase64": mc2_api::exec::encode_bytes(&raw_stdin),
+                        }))
+                        .unwrap(),
                     ))
                     .unwrap(),
             )
@@ -250,7 +292,42 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["exitCode"], 7);
-        assert_eq!(v["stdout"], "hello out");
+        assert_eq!(
+            mc2_api::exec::decode_bytes(v["stdoutBase64"].as_str().unwrap()).unwrap(),
+            b"hello out"
+        );
+        // The runtime's invalid-UTF-8 stderr survives the wire format.
+        assert_eq!(
+            mc2_api::exec::decode_bytes(v["stderrBase64"].as_str().unwrap()).unwrap(),
+            vec![0xff, 0xfe]
+        );
+
+        let calls = runtime.exec_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].argv, ["/bin/sh", "-c", "cat"]);
+        assert_eq!(calls[0].stdin, raw_stdin);
+        drop(calls);
+
+        // Malformed base64 → 400, not a 500 or a silently empty stdin.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/instances/{}/exec", inst[0].id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "cmd": ["cat"],
+                            "stdinBase64": "not base64!!",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         // Empty command → 400.
         let res = app
@@ -287,9 +364,13 @@ mod tests {
 
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
-        store.upsert_stack("demo", "{}", "yaml").await.unwrap();
         let inst = store
-            .reconcile_service_replicas("demo", "web", 1, r#"{}"#)
+            .commit_stack_plan(&StackPlan::replicas(
+                "demo",
+                "{}",
+                "yaml",
+                vec![("web", vec![r#"{}"#.to_string()])],
+            ))
             .await
             .unwrap();
         store
@@ -297,7 +378,7 @@ mod tests {
             .await
             .unwrap();
 
-        let app = router(test_state(store));
+        let app = router(test_state_open(store));
         let res = app
             .oneshot(
                 Request::builder()
@@ -321,5 +402,48 @@ mod tests {
         );
 
         std::env::remove_var("MSB_HOME");
+    }
+
+    #[tokio::test]
+    async fn instance_network_view_names_the_port_owner() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        let inst = store
+            .commit_stack_plan(&StackPlan::replicas(
+                "shop",
+                "{}",
+                "yaml",
+                vec![("db", vec![r#"{}"#.to_string()])],
+            ))
+            .await
+            .unwrap();
+        store
+            .update_instance_network_observed(
+                &inst[0].id,
+                "Ready",
+                r#"{"exposes":[{"guestPort":5432,"hostPort":41000,"phase":"Ready","message":""}],"edges":[],"message":""}"#,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = router(test_state_open(store));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/instances/{}/network", inst[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["observed"]["exposes"][0]["guestPort"], 5432);
+        assert_eq!(
+            v["observed"]["exposes"][0]["owner"], "shop/db",
+            "each exposed port names its owning stack/service: {v}"
+        );
     }
 }

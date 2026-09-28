@@ -53,7 +53,7 @@ Everywhere an instance ID is accepted, you can use
 `stack`):
 
 ```bash
-mc2 exec 01-hello-service/web/0 'echo inside the vm'
+mc2 exec 01-hello-service/web/0 /bin/sh -c 'echo inside the vm'
 mc2 logs 01-hello-service/web/0 --tail 20
 ```
 

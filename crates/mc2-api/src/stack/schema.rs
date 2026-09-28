@@ -4,11 +4,33 @@
 //! lives in [`super::validate`].
 
 use crate::stack::decode::{
-    de_command, de_depends_on, de_duration, de_env, de_expose, de_healthcheck_test, de_interval,
-    de_mem_limit, de_ports, de_ssh, se_mem_limit,
+    de_command, de_depends_on, de_disk_size_mib, de_duration, de_env, de_expose,
+    de_healthcheck_test, de_healthcheck_timeout, de_interval, de_mem_limit, de_ports, de_ssh,
+    se_disk_size_mib, se_mem_limit,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Default `volumes.<name>.size`: 10 GiB.
+pub const DEFAULT_VOLUME_SIZE_MIB: u64 = 10 * 1024;
+
+/// Default `services.<name>.storage_opt.size` (and microsandbox's own default
+/// writable-root size): 4 GiB.
+pub const DEFAULT_ROOT_DISK_MIB: u64 = 4 * 1024;
+
+/// Upper bound for a declared disk size: 1 TiB.
+///
+/// Keeps a declared size inside the range microsandbox's `u32`-MiB quota can
+/// express, and catches unit mistakes (`size: 10t`).
+pub const MAX_DISK_SIZE_MIB: u64 = 1024 * 1024;
+
+pub(crate) fn default_volume_size_mib() -> u64 {
+    DEFAULT_VOLUME_SIZE_MIB
+}
+
+pub(crate) fn default_root_disk_mib() -> u64 {
+    DEFAULT_ROOT_DISK_MIB
+}
 
 /// Top-level stack document (Docker Compose-shaped).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,6 +179,11 @@ pub struct ServiceSpec {
     /// (auth from every registered key).
     #[serde(default, deserialize_with = "de_ssh")]
     pub ssh: Option<SshSpec>,
+    /// Compose `storage_opt`: the guest's writable root-disk size. Absent →
+    /// [`DEFAULT_ROOT_DISK_MIB`] (microsandbox's own default). Changing it
+    /// recreates the VM; files outside volumes are not kept.
+    #[serde(default, rename = "storage_opt")]
+    pub storage_opt: Option<StorageOptSpec>,
     /// Cluster-internal listeners (loopback publish; not LAN). D13 network.
     #[serde(default, deserialize_with = "de_expose")]
     pub expose: Vec<ExposeSpec>,
@@ -228,13 +255,14 @@ fn default_memory_mib() -> u64 {
     512
 }
 
-/// Port mapping (compose `ports`), north-south. `published: 0` = auto host
-/// port (allocated server-side at apply). `hostname` = sugar: route that
-/// hostname to `target` via ingress.
+/// Port mapping (compose `ports`), north-south. Omitting `published` (or the
+/// target-only short form) = auto host port, allocated server-side at apply;
+/// the long form rejects an explicit `published: 0` so the intent is clear.
+/// `hostname` = sugar: route that hostname to `target` via ingress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PortSpec {
-    /// Host port; `0` = auto-allocate.
+    /// Host port; `0` = auto-allocate (set by the decoder when omitted).
     #[serde(default)]
     pub published: u16,
     /// In-guest port.
@@ -274,6 +302,16 @@ pub struct VolumeMount {
     /// Guest mount path (compose `target`).
     #[serde(rename = "target")]
     pub mount: String,
+    /// Declared size (MiB) copied from the stack's `volumes.<name>.size` at
+    /// apply time, so node-side mount/quota planning needs no stack lookup.
+    /// Not a user-facing YAML key on the mount itself.
+    #[serde(
+        rename = "sizeMib",
+        default = "default_volume_size_mib",
+        deserialize_with = "de_disk_size_mib",
+        serialize_with = "se_disk_size_mib"
+    )]
+    pub size_mib: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +319,52 @@ pub struct VolumeMount {
 pub struct VolumeSpec {
     #[serde(default = "default_vol_kind")]
     pub kind: String,
+    /// Byte-size limit for this volume's directory (compose-style `size`:
+    /// `10GiB`, `512m`, or bytes). Default 10 GiB. Resizable — the data is
+    /// kept — but never below the directory's current usage.
+    #[serde(
+        rename = "size",
+        default = "default_volume_size_mib",
+        deserialize_with = "de_disk_size_mib",
+        serialize_with = "se_disk_size_mib"
+    )]
+    pub size_mib: u64,
+}
+
+/// Compose `storage_opt` (`services.<name>.storage_opt`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageOptSpec {
+    /// Root-disk size (compose-style `size`: `8GiB`, `512m`, or bytes).
+    /// Default 4 GiB.
+    #[serde(
+        rename = "size",
+        default = "default_root_disk_mib",
+        deserialize_with = "de_disk_size_mib",
+        serialize_with = "se_disk_size_mib"
+    )]
+    pub size_mib: u64,
+}
+
+impl ServiceSpec {
+    /// Root-disk size (MiB) for this service: `storage_opt.size` or the
+    /// microsandbox default.
+    pub fn root_disk_mib(&self) -> u64 {
+        self.storage_opt
+            .as_ref()
+            .map(|s| s.size_mib)
+            .unwrap_or(DEFAULT_ROOT_DISK_MIB)
+    }
+
+    /// Copy each mount's declared volume size (`volumes.<name>.size`) into this
+    /// spec, so the persisted per-replica spec carries the mount budget.
+    pub fn with_volume_sizes(&mut self, volumes: &BTreeMap<String, VolumeSpec>) {
+        for mount in &mut self.volumes {
+            if let Some(vol) = volumes.get(&mount.name) {
+                mount.size_mib = vol.size_mib;
+            }
+        }
+    }
 }
 
 fn default_vol_kind() -> String {
@@ -291,7 +375,8 @@ fn default_vol_kind() -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthcheckSpec {
-    /// Probe command (CMD / CMD-SHELL prefix stripped). None → disabled.
+    /// Probe command (CMD / CMD-SHELL prefix resolved to an argv; a bare string
+    /// becomes `/bin/sh -c <string>`; `NONE` / `null` → disabled).
     #[serde(default, deserialize_with = "de_healthcheck_test")]
     pub test: Option<Vec<String>>,
     /// Probe interval in seconds (compose `interval`, e.g. `30s`).
@@ -301,14 +386,20 @@ pub struct HealthcheckSpec {
         deserialize_with = "de_interval"
     )]
     pub interval_seconds: u32,
-    /// Per-probe timeout in seconds (compose `timeout`, e.g. `5s`). 0 = no timeout.
-    #[serde(default, rename = "timeout", deserialize_with = "de_duration")]
+    /// Per-probe deadline in seconds (compose `timeout`, e.g. `5s`), rounded up
+    /// to whole seconds. Defaults to 30s (compose) when omitted; an explicit
+    /// `0` is rejected — probes always have a finite deadline.
+    #[serde(
+        default = "default_health_timeout",
+        rename = "timeout",
+        deserialize_with = "de_healthcheck_timeout"
+    )]
     pub timeout_seconds: u32,
     /// Consecutive failures before the service is marked unhealthy (compose `retries`).
     #[serde(default = "default_health_retries")]
     pub retries: u32,
     /// Startup grace period in seconds (compose `start_period`): probe failures
-    /// within this window after start do not count toward `retries`.
+    /// within this window after start are not counted toward `retries`.
     #[serde(default, rename = "start_period", deserialize_with = "de_duration")]
     pub start_period_seconds: u32,
     /// Compose `disable: true` → no healthcheck runs.
@@ -317,6 +408,10 @@ pub struct HealthcheckSpec {
 }
 
 fn default_health_interval() -> u32 {
+    30
+}
+
+fn default_health_timeout() -> u32 {
     30
 }
 
