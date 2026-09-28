@@ -1,37 +1,156 @@
 ---
 title: Changelog
-description: What is shipping in the current development cycle.
+description: What is shipping in the current development cycle (Unreleased).
 ---
 
-MC2 is pre-release (0.x). Full `vX.Y.Z` entries appear here as releases are
-cut from `main`; the canonical, complete changelog lives in
-[`CHANGELOG.md`](https://github.com/l3wi/mc2/blob/main/CHANGELOG.md) in the
-repo.
+MC2 is pre-release (0.x), so the current cycle mixes new features with
+intentional breaking changes. This page condenses the `## Unreleased` section
+of the repository changelog; the canonical, complete entry — including
+internal-only work — lives in
+[`CHANGELOG.md`](https://github.com/l3wi/mc2/blob/main/CHANGELOG.md).
 
 ## Unreleased
 
-### Resource limits (opt-in; unlimited by default)
+### Breaking before 1.0
 
-- Configurable cluster budgets: `--limit-cpus`, `--limit-memory-mib`,
+- **Host ports are enforced by the database.** A `host_port_claims` table
+  (`(port, protocol)`) is written in the same transaction as every apply, so a
+  second claim on a published or exposed port is refused **even if the
+  application checks were bypassed** — the apply returns `400` naming the
+  owner. TCP and UDP are separate key spaces; `mc2 down` frees the stack's
+  ports.
+- **`cpus` is whole vCPUs.** `cpus: 2`, `2.0` and `"2"` are accepted;
+  fractional values (`0.5`, `1.5`) are rejected with the nearest whole choices
+  instead of being silently truncated. Range 1–255.
+- **Node capacity is host-derived.** The `--cpus` / `--memory-mib` server flags
+  are gone; the node advertises the host's real CPU/RAM and an unplaceable
+  stack is rejected up front instead of sitting `Pending`.
+- **Network profiles are a closed set** (`public | private | host | none`;
+  `none` alone). The old `local`/`any` aliases are rejected and never fall back
+  to public egress; `host` needs `--allow-host-profile`.
+- **Auth is router-wide.** Every `/v1` route sits behind one auth middleware
+  (only `/health` is public). `--no-auth` is per start and loopback-only, and a
+  non-loopback bind additionally needs `--allow-unauthenticated-remote`.
+
+### Reliability & correctness
+
+- **`mc2 up` is all-or-nothing.** Apply plans the whole stack (validation,
+  capacity, ports, claims, disk) with no writes, then commits the stack and
+  every instance change in one transaction. A rejected apply leaves the running
+  stack untouched. `mc2 down` is transactional too.
+- **VMs survive restarts correctly.** Every sandbox carries an install-id
+  label; on startup MC2 adopts its own sandboxes and removes labelled orphans
+  (foreign sandboxes are never touched). The applied config hash is persisted,
+  so a stale VM is recreated after a restart.
+- **Supervised server.** The reconcile loop and REST listener are supervised:
+  if either dies the process exits non-zero, and `/health` returns `503` with a
+  reason when the loop is dead or stale.
+- **Bounded shutdown.** One cancellation token stops the reconcile loop, splice
+  and SSH listeners, and REST; shutdown is capped at 10 s even with open log
+  streams. Running VMs are left alone and adopted next start.
+- **Healthchecks & ordering.** `CMD-SHELL` runs through `/bin/sh -c`; `["NONE"]`
+  disables; `timeout` defaults to 30 s and `0` is rejected. Probes run out of
+  band, `depends_on` gates **initial** start only, and crash loops back off.
+- **Ingress follows the live replica.** One selector picks a Running
+  (healthy-first) replica and uses that replica's host port; the catalog is
+  rewritten only when routes change.
+- **Bad instances are isolated.** A missing secret or SSH resolution error
+  fails only that instance instead of halting the node.
+- **Sandboxes of other installs are never touched.** If another MC2 data dir
+  already holds a sandbox name, the instance is reported `Failed` naming the
+  owner; nothing adopts, restarts, removes, or execs into it.
+- **Applies don't fail under load.** Write transactions take the database
+  lock up front, so `mc2 up` no longer returns `500 database is locked` while
+  the reconcile loop is writing.
+- **Valid empty ingress file.** With no ready routes, the Traefik dynamic file
+  is comment-only (Traefik 3 rejected `http: {}`).
+
+### Security & isolation
+
+- **Token recovery.** `mc2 server token rotate [--data-dir]` replaces the API
+  token in place — works while the server runs, and the old token is rejected
+  immediately.
+- **Credential files.** `secrets.key` and `~/.mc2/config.toml` are created
+  `0600`; a world-readable or symlinked key refuses to start. Secrets are
+  encrypted with their name as AEAD associated data.
+- **Secrets key guard.** A missing key with stored secrets refuses to start
+  instead of silently re-keying; `mc2 server secrets purge --data-dir <dir>`
+  is the recovery path when the key is truly lost.
+- **Egress hardening.** `expose` ports that collide with the REST bind, SSH
+  listeners, published ports, `53`, or a port already listening on host
+  loopback are rejected at apply; privileged ports on Linux need
+  `CAP_NET_BIND_SERVICE`. A VM whose allowed port has no MC2 listener is not
+  created (fail closed).
+- **Listener limits.** REST: connection cap with `503` load-shedding
+  (`--max-connections`, 256), header-read deadline, per-request timeout
+  (`--request-timeout-secs`, 60; `exec`/`logs` exempt), and a 16 MiB `exec`
+  body limit. SSH: global and per-listener session caps, a 30 s handshake
+  deadline, and no idle timeout.
+- **Network fixes.** Services without `expose` reach their peers, and replicas
+  reach their own service name.
+
+### Resources & disk
+
+- **Configurable cluster budgets.** `--limit-cpus`, `--limit-memory-mib`,
   `--limit-disk-mib` (env `MC2_LIMIT_*`), default `0` = unlimited. `mc2 up`
-  refuses an apply that would exceed the reserved budget.
-- Node capacity is host-derived; `--cpus`/`--memory-mib` flags removed.
-  Unplaceable stacks are rejected up front instead of sitting `Pending`.
-- Resource visibility in `mc2 status` / `/v1/status`.
+  refuses an apply that would exceed the reserved CPU/RAM budget or the disk
+  reservation (volume sizes + root disks × replicas).
+- **Disk limits are quotas.** `volumes.<name>.size` (default 10 GiB) is
+  enforced as a write quota (the guest sees `ENOSPC`; `df` shows the cap) and
+  is resizable with data kept — shrinking below usage is a `400`.
+  `storage_opt.size` (default 4 GiB) sets the root disk.
+- **Disk-full is visible.** `mc2 ps` gains a `NOTES` column; `mc2 exec`,
+  `mc2 ssh open` and `mc2 logs` print the condition with the exact
+  `stack.yaml` fix. (`mc2 up` doesn't — its view would predate the apply.)
+- **Volumes live in the data dir.** The volume root defaults to
+  `<data-dir>/volumes`, so `--data-dir /srv/mc2` keeps volumes in
+  `/srv/mc2/volumes`; `--volume-dir` still overrides.
+- **Resource visibility.** `mc2 status` / `/v1/status` report host CPU/RAM/disk,
+  the configured limits, reserved CPU/RAM, and MC2's measured disk usage.
 
-### CLI + fixes
+### CLI & UX
 
-- Bordered tables for `ps` / `node ls` / `network` / `ingress` / `secret ls`
-  / `ssh …` / `context ls` (comfy-table).
-- Fix: `mem_limit` JSON round-trip (bytes, matching compose semantics).
+- **Grouped top-level help.** `mc2 --help` renders commands under
+  `Stacks` / `Observe` / `Access` / `Security` / `Admin` headings.
+- **Connection flags are global.** `--api` / `--token` / `--context` /
+  `--allow-insecure-http` are accepted before or after the subcommand;
+  resolution order and the `MC2_*` env vars are unchanged.
+- **SSH refs.** `mc2 ssh open|show|close` accept `stack/service/ordinal`;
+  `mc2 ssh ls` shows a copyable `REF`.
+- **Flat SSH keys.** `mc2 ssh key add|show|ls|rm` →
+  `mc2 ssh add-key|show-key|keys|rm-key`.
+- **`rm` folds into `down`.** `mc2 down <stack> [--volumes]` (docker-compose
+  parity); `rm` remains a hidden alias.
+- **`mc2 volume ls`.** Lists the named volumes retained on the node via
+  `GET /v1/volumes` — verify what `down --volumes` would remove.
+- **Bordered tables.** `ps`, `node ls`, `network`, `ingress`, `secret ls`,
+  `ssh …`, `context ls` and the `status` resources block use comfy-table.
+- **`mc2 exec` passthrough.** Everything after the instance ref is guest argv
+  (`mc2 exec ref /bin/sh -c '…'` needs no `--`), and stdin/stdout/stderr
+  round-trip as bytes.
+- **Fix: `mem_limit` JSON round-trip.** The spec serializes `mem_limit` as
+  bytes (compose semantics), so a stored spec keeps its MiB value (512 MiB no
+  longer comes back as 1 MiB).
 
-### Rust best-practice cleanup (internal)
+### Internal (no behavior change)
 
-- `cargo doc` warning-clean and enforced; `unsafe_code = deny`; clippy
-  `--all-features`; CI gains `cargo machete`, blocking `cargo-deny` /
-  `cargo-audit`.
-- CLI split into modules; REST split into `api/` with typed errors; stack
-  schema split into `schema.rs` + `decode.rs` + `validate.rs`.
-- Typed phase enums at boundaries; automated releases (ADR-0003).
+- **Tooling baseline.** `cargo doc` is warning-clean and enforced; clippy runs
+  `--all-features`; `unsafe_code = "deny"`; CI gains `cargo machete` and
+  blocking `cargo-deny` / `cargo-audit`; `just check` covers fmt + lint + test +
+  doc + machete.
+- **Module splits.** The CLI splits into `cli.rs` / `client.rs` / `help.rs` /
+  `cmd/`; the REST layer into `api/` with typed errors; the stack schema into
+  `schema.rs` + `decode.rs` + `validate.rs`.
+- **Typed phases at boundaries** (`InstancePhase`, `NodeStatus`,
+  `SandboxPhase`, `NetworkPhase`, `SshPhase`) and dead code removed.
+- **Automated releases (ADR-0003).** release-plz bumps the version from
+  conventional commits and tags `vX.Y.Z`; cargo-dist builds the GitHub Release;
+  nightly prereleases come from `dev`. PRs into `dev`/`main` must update
+  `CHANGELOG.md`.
 
-See [0.1.0](/changelog/0.1.0) for the previous release.
+## Next
+
+<Cards cols={2}>
+  <Card title="0.1.0" description="The previous release: ssh, network, compose parity, exec/logs." href="/changelog/0.1.0" />
+  <Card title="Upgrade & migrate" description="How versions, releases, and state compatibility work." href="/documentation/operations/upgrade-and-migrate" />
+</Cards>

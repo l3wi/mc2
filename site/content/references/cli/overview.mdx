@@ -49,13 +49,16 @@ All flags may be combined on a single command line.
 
 ## Connection resolution
 
-The CLI resolves its connection in this order — the first hit wins:
+The CLI resolves the URL and the token separately, each taking the first
+value it finds:
 
-1. `--api` / `--token` flags
-2. `MC2_API` / `MC2_API_KEY` env vars
-3. `--context` / `MC2_CONTEXT`
-4. the `current` context in `~/.mc2/config.toml`
-5. the loopback default
+| | 1st | 2nd | 3rd | Fallback |
+| --- | --- | --- | --- | --- |
+| URL | `--api` | `MC2_API` | the context's URL | `http://127.0.0.1:7443` |
+| Token | `--token` | `MC2_API_KEY` | the context's token | none |
+
+The context is `--context` / `MC2_CONTEXT`, else `current` in
+`~/.mc2/config.toml`. `--api` alone still sends the context's token.
 
 The same rules apply when reading contexts. See
 [Contexts file](/references/config/contexts-file) and
@@ -65,11 +68,13 @@ The same rules apply when reading contexts. See
 
 The connection host class decides the client mode, reported by `mc2 status`:
 
-- **local** — loopback API (`127.0.0.1` / `localhost` / `::1`); a token is
-  optional.
-- **remote** — any other host; requires `https://` and an API key. Plaintext
-  `http://` is refused unless you opt in with `--allow-insecure-http` (or
+- **local** — the API host is loopback (`127.0.0.0/8`, `::1`, `localhost`);
+  plain `http://` is fine.
+- **remote** — any other host; the CLI requires `https://` and refuses
+  `http://` unless you pass `--allow-insecure-http` (or set
   `MC2_ALLOW_INSECURE_HTTP=1`).
+
+The server requires the token in both modes, unless it runs `--no-auth`.
 
 <Callout type="warning" title="Plaintext remote">
   The operator token travels unencrypted over plaintext `http://`. Prefer
@@ -77,8 +82,12 @@ The connection host class decides the client mode, reported by `mc2 status`:
   install published through the ingress catalog.
 </Callout>
 
-**Instances and output.** `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) is
-accepted anywhere an instance id is, for instance-taking commands such as
-`exec` and `logs`. Listing commands accept `-o json` (`-o`/`--output`, `table`
-by default) for machine-readable output that mirrors the
-[REST API](/references/api/overview) JSON.
+**Instances.** Commands that take an instance (`exec`, `logs`, `ssh open`,
+`network <ref>`, …) accept `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`)
+or the instance UUID. The CLI resolves refs; the REST API itself takes UUIDs.
+
+**Output.** `ps`, `node ls`, `status`, `network`, `ingress`, `volume ls`,
+`secret ls`, `ssh keys`, and `ssh ls` accept `-o json` (`table` by default).
+`context ls` is table-only. JSON mostly mirrors the
+[REST API](/references/api/overview) fields; `status` adds the client's mode,
+auth, and context.

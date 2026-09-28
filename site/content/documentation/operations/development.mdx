@@ -1,96 +1,149 @@
 ---
 title: Development & contributing
-description: Building MC2, the workspace layout, and the test strategy for contributing.
+description: Building MC2, the workspace layout, the just recipes, and the CI-vs-lab test strategy.
 ---
 
-MC2 is a Rust workspace. This page covers how to build, test, and contribute —
-the prerequisites, the crate layout, and the CI-vs-lab test split that keeps
-development fast without a hypervisor.
+MC2 is a Rust workspace. This page covers how to build and test it, the crate
+layout, and the split between CI (no hypervisor) and lab (real microVMs) that
+keeps development fast. For running the built server, see
+[Run the server](/documentation/operations/run-the-server).
 
 ## Prerequisites
 
-- Rust stable (see `rust-toolchain.toml`).
-- `just` for the recipe runner (`just --list`).
-- `cargo-machete` and `cargo-deny` for two of the checks (`cargo install
-  cargo-machete --locked`, `cargo install cargo-deny`).
-- A hypervisor only if you run lab tests that boot microVMs (Linux KVM / Apple
-  Silicon HVF). Everything else works without one.
+- **Rust stable** — pinned by `rust-toolchain.toml` (channel `stable`, with
+  `rustfmt` and `clippy`).
+- **`just`** — the recipe runner (`just --list`).
+- **`cargo-machete`** and **`cargo-deny`** / **`cargo-audit`** for the gate
+  recipes:
+  ```bash
+  cargo install cargo-machete --locked
+  cargo install cargo-deny
+  cargo install cargo-audit
+  ```
+- **Linux: `libcap-ng`.** The embedded microsandbox runtime links it, so
+  install the development package before building (Debian/Ubuntu:
+  `sudo apt-get install -y libcap-ng-dev`). CI does the same.
+- **A hypervisor only for lab tests** that boot microVMs (Linux KVM / Apple
+  Silicon HVF). Everything else runs without one.
 
 ## Workspace layout
 
 ```text
 mc2/
   crates/
-    mc2/          # the binary: CLI (cli.rs), REST client, handlers (cmd/)
-    mc2-api/      # REST DTOs + stack YAML types (schema/decode/validate)
-    mc2-server/   # orchestrator: REST API (api/), scheduler, reconcile loop, store
-    mc2-store/    # SQLite + memory store
-    mc2-runtime/  # embedded microsandbox SDK boundary (msb_sdk.rs, naming, spec)
-    mc2-metrics/  # OTLP metrics exports
-  tests/          # mc2-tests: cross-crate integration harness + tests
-  examples/       # Compose-shaped stack YAML, ingress, OTLP samples
+    mc2/          # the binary: CLI, REST client, command handlers
+    mc2-api/      # REST types + stack YAML (schema / decode / validate)
+    mc2-server/   # the orchestrator: REST API, apply, reconcile loop
+    mc2-store/    # SQLite + in-memory store, migrations
+    mc2-runtime/  # microsandbox SDK boundary (sandboxes, naming, specs)
+    mc2-metrics/  # OTLP metrics
+  tests/          # mc2-tests: cross-crate integration harness
+  examples/       # runnable stacks, Traefik and OTLP samples
+  site/           # this documentation site (Next.js + MDX)
   justfile        # build / test / check recipes
 ```
 
-The binary and server share a workspace version; library crates are never
-released separately.
+The `mc2` binary and the server share a workspace version; library crates are
+never released separately.
 
 ## Build & run
 
 ```bash
-just build          # debug build of the mc2 binary
-just run-server     # run `mc2 server` (REST on :7443, data dir ~/.mc2)
-just test           # full workspace tests
+just build            # debug build of the mc2 binary
+just release          # optimized build
+just run-server       # run `mc2 server` (REST on :7443, data dir ~/.mc2)
+just init-server      # bootstrap the data dir + token, no listen
 ```
+
+`just run-server *args` forwards extra arguments, so
+`just run-server --data-dir /tmp/mc2` works.
 
 ## Test strategy
 
 Two tiers, mirroring the CI split:
 
-- **Unit tests** — live next to the code in `crates/*/src`. Fast, no
-  hypervisor, deterministic. Cover parsers, validators, the store, the
-  scheduler, and the REST handlers (via an in-memory store and a mock
-  runtime).
-- **Integration tests** — in `tests/` (the `mc2-tests` package) and
-  `crates/mc2/tests` (black-box CLI). They boot a real `mc2 server` on an
-  ephemeral port with a temp data dir and drive the control plane over REST —
-  no microVMs needed. Sandboxes can't start without a hypervisor, but every
-  control-plane command works, so the whole apply → schedule → reconcile
-  surface is covered in CI.
-
-```bash
-just test-unit          # crates/*/src unit tests
-just test-integration   # mc2-tests + cli_smoke
+```text
+ tier         microVM?  covers
+ unit         no        parsers, validators, store, handlers
+ integration  no        real REST router + SQLite, no reconcile loop
+ lab          yes       real microVMs through microsandbox (not in CI)
 ```
 
-Lab tests that boot real microVMs are documented under
-[examples/](/examples) and are not part of CI.
+- **Unit tests** live next to the code in `crates/*/src`. They are fast and
+  deterministic and cover parsers, validators, the store, the scheduler, and
+  the REST handlers (via an in-memory store and a mock runtime).
+- **Integration tests** are in `tests/` (the `mc2-tests` package) and
+  `crates/mc2/tests` (the compiled CLI). `tests/` starts the real REST router
+  on an ephemeral port with a temporary SQLite store, but **no reconcile
+  loop**; node observations are simulated with store writes. They prove the
+  API and apply path, not VM lifecycle.
+- **Lab tests** boot real microVMs from the repository's
+  [examples/](https://github.com/l3wi/mc2/tree/main/examples) and are not
+  part of CI. Verify lifecycle changes (create, restart, adoption, networking)
+  this way.
+
+```bash
+just test               # full workspace (unit + integration)
+just test-unit          # crates/*/src unit tests (excludes mc2-tests)
+just test-integration   # mc2-tests + the cli_smoke black-box test
+```
+
+## Recipes
+
+| Recipe | Runs |
+| --- | --- |
+| `just build` / `just release` | `cargo build -p mc2` (debug / `--release`) |
+| `just test` | `cargo test --workspace` |
+| `just test-unit` | `cargo test --workspace --exclude mc2-tests` |
+| `just test-integration` | `cargo test -p mc2-tests` + `cargo test -p mc2 --test cli_smoke` |
+| `just fmt` / `just fmt-fix` | `cargo fmt --all -- --check` / `cargo fmt --all` |
+| `just lint` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `just doc` | `RUSTDOCFLAGS=-D warnings cargo doc --workspace --all-features --no-deps` |
+| `just machete` | `cargo machete` (unused dependencies) |
+| `just deny` | `cargo deny check` (licenses / advisories / bans / sources) |
+| `just audit` | `cargo audit` (RustSec advisories) |
+| `just check` | fmt + lint + test + doc + machete |
+| `just run-server` / `just init-server` | run the server / bootstrap only |
+| `just clean` | `cargo clean` |
 
 ## The regression gate
 
-`just check` runs everything CI gates on:
+`just check` runs what CI gates on before merging:
 
 ```bash
 just check   # fmt + clippy (-D warnings) + tests + rustdoc + machete
 ```
 
-- `cargo doc` must be warning-clean (`RUSTDOCFLAGS=-D warnings`).
-- `cargo clippy` runs with `--all-features`, `-D warnings`.
+- `cargo doc` must be **warning-clean** (`RUSTDOCFLAGS=-D warnings`).
+- `cargo clippy` runs with `--all-features --all-targets`, warnings denied.
 - `unsafe_code = "deny"` is a workspace lint — MC2 is zero-`unsafe`.
-- `cargo deny check` and `cargo audit` are blocking in CI.
+- `cargo deny check` and `cargo audit` are **blocking** in CI; documented
+  exceptions live in `deny.toml` and `.cargo/audit.toml`.
+
+CI also runs on every push/PR (`.github/workflows/ci.yml`), with `RUSTFLAGS=-D
+warnings`:
+
+- **rust job:** `cargo fmt --check`, clippy, `cargo test --workspace
+  --all-features`, rustdoc, `cargo machete`, and a binary build.
+- **security job:** `cargo deny check all` and `cargo-audit`.
+- **changelog gate:** a PR into `dev`/`main` must update `CHANGELOG.md`
+  (automation PRs are exempt).
+
+Releases are automated (ADR-0003): release-plz on `main` bumps the version from
+conventional commits and tags `vX.Y.Z`, and cargo-dist builds the GitHub
+Release; nightly prereleases are cut from `dev`.
 
 ## Contributing
 
-- Branch from `dev` (`feat/...`), open a PR against `dev`; `main` is
+- Branch from `dev` (`feat/...`) and open a PR against `dev`; `main` is
   release-only.
-- Update `CHANGELOG.md` for any PR into `dev`/`main` (a CI gate enforces it).
-- Keep the docs in sync: the [docs site](/) content lives in `site/content/`;
-  README, examples, and tests should reference it consistently.
+- Update `CHANGELOG.md` under `## Unreleased` for any PR into `dev`/`main` (a
+  CI gate enforces it).
+- Keep the docs in sync: page content lives in `site/content/`; README,
+  examples, and tests should reference it consistently.
 - Run `just check` before opening a PR.
 
 ## Deeper
 
-- [Troubleshooting](/documentation/operations/troubleshooting) — common
-  failures and recovery.
-- [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) — how
-  releases and versioning work.
+- [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) — release channels and versioning.
+- [Troubleshooting](/documentation/operations/troubleshooting) — common failures and recovery.

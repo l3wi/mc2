@@ -1,6 +1,6 @@
 # OpenTelemetry Collector example for MC2 + microsandbox (msb-metrics).
 #
-# MC2 (server/agent) exports control-plane metrics when:
+# mc2 server exports its metrics (OTLP/gRPC) when started with:
 #   export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 #   # or OTEL_EXPORTER_OTLP_ENDPOINT
 #

@@ -1,153 +1,144 @@
 ---
 title: Stacks & instances
-description: Apply and delete stacks, and list, exec, and read logs for instances via the /v1 API.
+description: Apply and delete stacks; list instances; exec, logs, and volumes — request and response shapes.
 ---
 
-## Overview
+All endpoints here need the bearer token; `{id}` is an instance UUID.
 
-The `/v1/stacks*` and `/v1/instances*` endpoints publish desired state and
-observe the converged result. All require a bearer token.
+## POST /v1/stacks:apply
 
-## Apply a stack
-
-`POST /v1/stacks:apply` publishes stack YAML as desired state and converges
-instances toward it. The request body is a JSON object with a `yaml` field
-holding the stack YAML. A missing top-level `name:` is filled in from the
-file path; the old k8s-style `apiVersion`/`kind`/`metadata` wrapper is
-**rejected** by the canonical parser (see
-[Stack overview](/references/stack/overview)).
-
-```
-POST /v1/stacks:apply
-Authorization: Bearer mc2at_...
-Content-Type: application/json
-
-{ "yaml": "name: demo\nservices:\n  web:\n    image: alpine:3.20\n" }
-```
-
-Apply is idempotent and **atomic**: the stack definition and every instance
-create/update/delete it implies are committed in one transaction. Validation
-errors — malformed YAML, duplicate `expose` ports, allocation or capacity
-failures — return `400` with an `error` message and leave the previously
-applied stack unchanged.
-
-The posted YAML is the whole desired state for that stack: a service removed
-from the document is torn down by the next apply, and a lower `scale` deletes
-the replicas above the new count. Named volumes are never removed by an apply.
+Applies a stack. The body is `{"yaml": "<stack YAML>"}`.
 
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." \
-  -X POST http://127.0.0.1:7443/v1/stacks:apply \
-  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}' | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" -H 'Content-Type: application/json' \
+  -X POST "$MC2_API/v1/stacks:apply" \
+  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}'
 ```
 
-## Delete a stack
-
-`DELETE /v1/stacks/{name}` tears down a stack: instances and the stack
-definition. Named volumes are retained unless you add `?volumes=true`, which
-removes them best-effort.
-
-```
-DELETE /v1/stacks/demo?volumes=true
+```json
+{"stack":"demo","services":1,"instances":1,"scheduled":1,"pending":0,"ssh":[]}
 ```
 
-Returns `204` on success, `404` if the stack does not exist.
+- **The YAML must include `name:`.** The API has no file name to derive it
+  from; without one it returns `400 {"error":"name is required"}`. (Only
+  `mc2 up -f` and `mc2 config -f` fill a missing name.)
+- **All or nothing.** Validation, capacity, and port checks run before any
+  write; a refusal is `400` and changes nothing. Otherwise the stack and every
+  instance create/update/delete commit in one transaction.
+- **Whole document.** Services missing from the YAML are removed, and a lower
+  `scale` removes the highest ordinals. Volumes are never removed by an
+  apply.
+
+| Response field | Meaning |
+| --- | --- |
+| `stack` | The stack name. |
+| `services`, `instances` | Counts in the applied document. |
+| `scheduled` | Instances placed on the node by this apply. |
+| `pending` | Instances that couldn't be placed (e.g. an unmatched `nodeName`). |
+| `ssh` | Declared SSH endpoints: `service`, `bind`, `port`, `entrypoint`, `replicas`. |
+
+## DELETE /v1/stacks/{name}
+
+Removes the stack's instances and definition. `?volumes=true` also deletes
+its volume directories. Returns `204`, or `404` if the stack doesn't exist —
+`?volumes=true` needs the definition to find the volumes, so it must be used
+while the stack exists.
 
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." -X DELETE \
-  "http://127.0.0.1:7443/v1/stacks/demo?volumes=true"
+curl -s -H "Authorization: Bearer $MC2_API_KEY" -X DELETE "$MC2_API/v1/stacks/demo?volumes=true"
 ```
 
-## List instances
+## GET /v1/instances
 
-`GET /v1/instances` lists all instances (desired sandboxes) with their phase.
-
-```
-GET /v1/instances
-Authorization: Bearer mc2at_...
-```
-
-```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/instances | jq .
-```
-
-## Exec & logs
-
-`POST /v1/instances/{id}/exec` runs a command inside the instance's sandbox and
-returns the captured output.
-
-| Body field | Meaning |
-| ---------- | ------- |
-| `cmd` | Command array (required; empty `cmd` → `400`) |
-| `stdinBase64` | Optional stdin, base64-encoded (raw bytes; malformed base64 → `400`) |
-
-Response fields: `instanceId`, `exitCode`, `stdoutBase64`, `stderrBase64` —
-both streams are base64 because guest output need not be valid UTF-8. An
-instance with no sandbox runtime yet returns `400`.
-
-The body limit is 16 MiB, and base64 costs 4/3, so the largest raw stdin is
-~12 MiB.
-
-```bash
-# echo -n hi | base64  →  aGk=
-curl -s -H "Authorization: Bearer mc2at_..." \
-  -X POST http://127.0.0.1:7443/v1/instances/<id>/exec \
-  -d '{"cmd":["echo","hi"],"stdinBase64":"aGk="}' | jq .
-
-# Decode the captured output.
-curl -s -H "Authorization: Bearer mc2at_..." \
-  -X POST http://127.0.0.1:7443/v1/instances/<id>/exec \
-  -d '{"cmd":["echo","hi"]}' | jq -r .stdoutBase64 | base64 -d
-```
-
-`GET /v1/instances/{id}/logs` returns recent sandbox logs.
-
-| Query param | Meaning |
-| ----------- | ------- |
-| `tail` | Show only the last N entries |
-| `follow=true` | Stream new entries as they arrive (SSE) |
-
-Without `follow`, the response is `{ instanceId, entries }`, each entry with
-`timestamp`, `source`, and `data`.
-
-```bash
-curl -s -H "Authorization: Bearer mc2at_..." \
-  "http://127.0.0.1:7443/v1/instances/<id>/logs?tail=50" | jq .
-```
-
-## List volumes
-
-`GET /v1/volumes` lists the named volumes retained on the node — directories
-under the server's volume root (`mc2 server --volume-dir`, default
-`~/.mc2/volumes`), each resolved as `mc2-<stack>--<volume>`. Each entry
-carries `limit_mib` (declared `volumes.<name>.size`, `null` when the stack is
-gone) and `used_mib` (measured usage).
-
-```
-GET /v1/volumes
-Authorization: Bearer mc2at_...
-```
-
-Each entry reports `name` (the resolved `mc2-<stack>--<volume>` identity),
-`stack`, `volume` (the name declared in the stack), `path`, and `sizeMib`
-(measured best-effort). Non-MC2 entries in the volume root are ignored.
-
-```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/volumes | jq .
-```
+Every instance on the server:
 
 ```json
 [
   {
-    "name": "mc2-shop--data",
-    "stack": "shop",
-    "volume": "data",
-    "path": "/srv/mc2-volumes/mc2-shop--data",
-    "sizeMib": 4
+    "id": "6bee1f2c-069f-46c2-927f-6bdbf2ec2469",
+    "stack": "api",
+    "service": "w",
+    "ordinal": 0,
+    "node_id": "422229db-1d70-43eb-9084-706331384d83",
+    "phase": "Running",
+    "runtime_id": "api--w--0",
+    "message": "microsandbox sdk (local)",
+    "spec_json": "{\"image\":\"alpine:3.20\", ...}",
+    "healthy": false,
+    "updated_at": "2026-09-28T20:14:13.800705+00:00"
   }
 ]
 ```
 
-Volumes are retained by `DELETE /v1/stacks/{name}` and only removed with
-`?volumes=true` — this endpoint is how you verify what a destructive teardown
-would remove. See [Storage](/documentation/concepts/storage).
+`phase` is one of `Pending`, `Scheduled`, `Creating`, `Running`, `Stopped`,
+`Failed`; `message` carries the reason for a failure and any disk-condition
+notes. `spec_json` is the normalized service spec (sizes in bytes, allocated
+host ports filled in).
+
+## POST /v1/instances/{id}/exec
+
+Runs a command in the microVM and returns its output.
+
+| Body field | Meaning |
+| --- | --- |
+| `cmd` | Argv array, required and non-empty. |
+| `stdinBase64` | Optional stdin bytes, base64-encoded. |
+
+```bash
+curl -s -H "Authorization: Bearer $MC2_API_KEY" -H 'Content-Type: application/json' \
+  -X POST "$MC2_API/v1/instances/$ID/exec" \
+  -d "{\"cmd\":[\"sh\",\"-c\",\"cat; echo err >&2; exit 3\"],\"stdinBase64\":\"$(printf hello | base64)\"}"
+```
+
+```json
+{"exitCode":3,"instanceId":"6bee1f2c-...","stderrBase64":"ZXJyCg==","stdoutBase64":"aGVsbG8="}
+```
+
+Output is base64 because it needn't be UTF-8. A non-zero exit is still `200`.
+The body limit is 16 MiB, so stdin tops out around 12 MiB. The request has no
+timeout.
+
+## GET /v1/instances/{id}/logs
+
+| Query | Meaning |
+| --- | --- |
+| `tail=N` | Only the last `N` entries. |
+| `follow=true` | Stream instead of returning once. |
+
+Without `follow`:
+
+```json
+{
+  "instanceId": "6bee1f2c-...",
+  "entries": [
+    {"timestamp": "2026-09-28T20:14:13.921+00:00", "source": "stdout", "data": "hello"},
+    {"timestamp": "2026-09-28T20:14:13.921+00:00", "source": "stderr", "data": "err\n"}
+  ]
+}
+```
+
+With `follow=true` the response is `text/event-stream`: each event's `data`
+is one entry object as above, existing entries first, then new ones as they
+arrive, with a keepalive comment every 15 s. The stream has no timeout.
+
+## GET /v1/volumes
+
+Volume directories under the server's volume root (`<data-dir>/volumes`, or
+`--volume-dir`):
+
+```json
+[
+  {
+    "name": "mc2-api--data",
+    "stack": "api",
+    "volume": "data",
+    "path": "/home/you/.mc2/volumes/mc2-api--data",
+    "limit_mib": 64,
+    "used_mib": 0
+  }
+]
+```
+
+`limit_mib` is the declared `size` (`null` once no stack declares the
+volume); `used_mib` is measured usage. Non-MC2 directories in the volume root
+are ignored. Check this before a `?volumes=true` delete.

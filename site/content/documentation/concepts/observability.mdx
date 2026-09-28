@@ -1,57 +1,89 @@
 ---
 title: Observability
-description: OTLP metrics for the orchestrator and node — plus the msb-metrics sidecar for sandboxes.
+description: OTLP metrics from mc2 server, health and status endpoints, logs, and where per-sandbox metrics come from.
 ---
 
-MC2 exports operational metrics over OpenTelemetry (OTLP) so you can watch
-the control plane and node, not just individual services. Sandbox-level
-CPU/memory/network stays on the microsandbox sidecar — point both at the
-same collector for a unified view.
+MC2 tells you how it's doing in four ways: a health endpoint for supervisors,
+a status summary for people, logs, and optional OpenTelemetry (OTLP) metrics
+for dashboards. Per-sandbox CPU, memory, and network figures come from
+microsandbox, not from MC2.
 
-## What is exported
+## Health and status
 
-| Prefix | Covers | Examples |
+| Check | For | Answers |
 | --- | --- | --- |
-| `mc2.server.*` | Orchestrator health | API requests, reconcile cycles, scheduler counts |
-| `mc2.node.*` | Node capacity & activity | capacity, instance counts by phase |
+| `GET /health` | systemd, launchd, load balancers | Is the reconcile loop alive? `200`, or `503` with a reason once no pass has completed for 3 × the interval + 30 s. No token needed. |
+| `mc2 status` / `GET /v1/status` | you | Version, instance counts, resource budgets and usage, public hostname. |
+| `mc2 ps` | you | Every instance's phase, ports, and `NOTES` (disk warnings, failure reasons). |
 
-Set the endpoint with the `MC2_OTLP_ENDPOINT` environment variable (or the
-equivalent server flag) and restart the server so it picks it up:
+## Logs
+
+- **Server logs** go to stdout (default level `info`). Set the level with `RUST_LOG` (for example
+  `RUST_LOG=mc2_server=debug`). They record applies, reconcile outcomes,
+  restarts, and disk-condition changes.
+- **Workload logs** come from each microVM: `mc2 logs <stack>/<service>/<ordinal>`
+  (`--tail N` for the last lines, `--follow` to stream).
+
+## OTLP metrics
+
+`mc2 server` exports metrics over OTLP/gRPC when an endpoint is set. It uses
+the first non-empty variable of:
+
+1. `MC2_OTLP_ENDPOINT`
+2. `OTEL_EXPORTER_OTLP_ENDPOINT`
+3. `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
+
+There is no command-line flag. Set the variable before starting the server;
+with none set, metrics are off. Metrics are exported every 15 s with
+`service.name = mc2-server`.
 
 ```bash
 export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
-mc2 server --no-auth
+mc2 server
 ```
 
-A reference collector configuration ships in
-`examples/90-advanced/observability/collector-config.yaml`.
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `mc2.server.applies` | counter | Stack applies |
+| `mc2.server.schedule_binds` | counter | Instances placed on the server |
+| `mc2.server.instances` | gauge | Instances, by attribute `phase` |
+| `mc2.server.nodes_ready`, `mc2.server.nodes_total` | gauge | Always 1 in v1 (one embedded node) |
+| `mc2.node.reconciles` | counter | Completed reconcile passes |
+| `mc2.node.reconcile_errors` | counter | Failed reconcile passes |
+| `mc2.instance.disk_used_mib`, `mc2.instance.disk_limit_mib` | gauge | Disk use and cap per instance; attributes `instance` and `target` (`root-disk` or `volume:<name>`) |
 
-## The msb-metrics sidecar
+A reference collector configuration is in
+`examples/90-advanced/observability/collector-config.yaml` in the
+repository.
 
-Sandbox CPU/mem/net metrics are **not** re-exported by MC2 — they remain on
-microsandbox's own `msb-metrics` sidecar. To get a unified view:
+```text
+ mc2 server ──OTLP/gRPC──┐
+                         ├──► your OTel collector ──► Prometheus, Grafana…
+ microsandbox metrics ───┘
+```
 
-1. Configure `msb-metrics` on the node to the same OTLP collector.
-2. Configure MC2 (`MC2_OTLP_ENDPOINT`) to the same collector.
-3. Query both `mc2.*` and sandbox metrics in the same dashboard.
+## Per-sandbox metrics
 
-<Callout type="note" title="Status, the built-in health check">
-  For a quick, dependency-free health read, `mc2 status` prints health,
-  version, and instance counts, and the REST endpoint `GET /v1/status`
-  returns the same as JSON.
-</Callout>
+MC2 doesn't re-export sandbox CPU, memory, or network usage. Those come from
+microsandbox's own metrics component (`msb-metrics`); configure it per the
+[microsandbox documentation](https://docs.microsandbox.dev) and send it to the
+same collector to see both side by side.
 
 ## Key behaviors
 
-- **Server metrics need a restart to pick up the endpoint.** Set
-  `MC2_OTLP_ENDPOINT` before boot.
-- **Two sources, one collector.** Orchestrator metrics and sandbox metrics
-  come from different processes; join them at the collector.
-- **`UNDER DEVELOPMENT`.** The advanced observability example is a working
-  collector config without a full start-and-verify workflow yet.
+- **Metrics are opt-in** and configured by environment only; restart the
+  server to change the endpoint.
+- **`/health` is for supervisors.** It turns `503` when the loop stalls, and
+  the process exits non-zero if a critical task dies — let your service
+  manager restart it.
+- **Two sources, one collector.** Join MC2 and sandbox metrics at the
+  collector.
 
 ## Deeper
 
-- [Metrics backends](/recipes/metrics-backends) — collector + Grafana setup.
-- [Run the server](/documentation/operations/run-the-server) — server flags.
-- [REST API: status](/references/api/status) — the `/v1/status` contract.
+- [Metrics backends](/recipes/metrics-backends) — collector and dashboard
+  setups.
+- [Run the server](/documentation/operations/run-the-server) — supervision
+  and flags.
+- [REST API: status](/references/api/status) — the `/health` and
+  `/v1/status` contracts.

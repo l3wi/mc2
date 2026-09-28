@@ -44,7 +44,7 @@ are dropped; complete files pass through verbatim. Full key reference:
 - [Service networks](./03-networks/) — connect two services with `expose` over a shared network (default-allow mesh); `mc2 network` shows members and ports.
 - [HTTP ingress](./04-http-ingress/) — route a local hostname through a BYO Traefik instance.
 - [SSH ingress](./05-ssh-ingress/) — forward a service's host-side SSH endpoint through Traefik TCP ingress.
-- [Persistent volumes](./06-persistent-volumes/) — mount a node-local named volume that survives sandbox recreate.
+- [Persistent volumes](./06-persistent-volumes/) — mount a named volume (with a size cap) that survives recreate and `mc2 down`.
 - [Startup ordering](./07-startup-ordering/) — `depends_on` with `service_healthy`, healthcheck tuning, and per-replica published ports at `scale > 1`.
 
 ## Advanced

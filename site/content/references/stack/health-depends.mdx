@@ -1,98 +1,146 @@
 ---
 title: Healthchecks & depends_on
-description: The healthcheck key table and runtime behavior, plus depends_on startup ordering in list and map form.
+description: The healthcheck key table with every supported test form, default and rounding rule, plus depends_on startup ordering in list and map form.
 ---
 
-Healthchecks gate readiness (and restart-on-failure); `depends_on` orders
-startup. Both only matter *while the stack is coming up and running*.
+A healthcheck decides whether an instance is *healthy*; `depends_on` orders the
+**first start** of services. Both are about coming up and staying up — neither
+applies to teardown.
 
 ## `healthcheck`
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `test` | no | — | Probe command. A bare string (`curl -f http://localhost/`) is a shell command (`CMD-SHELL`); list form is `["CMD", "curl", "-f", "http://localhost/"]` or `["CMD-SHELL", "curl -f http://localhost/"]`. `CMD` / `CMD-SHELL` are prefixes, not argv elements — `CMD-SHELL` runs `/bin/sh -c <script>`. `["NONE"]` (or `test` omitted) disables the probe. |
-| `interval` | no | `30s` | Probe interval (e.g. `30s`, `1m`). |
-| `timeout` | no | `30s` | Per-probe deadline (e.g. `5s`). An explicit `0` is rejected — a probe always has a finite deadline. |
-| `retries` | no | `3` | Consecutive failures after `start_period` before the service is marked unhealthy / restarted. |
-| `start_period` | no | `0` | Grace period after start during which probe failures are not counted toward `retries`. |
-| `disable` | no | `false` | `true` disables the healthcheck entirely. |
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `test` | string \| list | no | — | Probe command. Omitted, `null`, `[]` or `["NONE"]` means no probe runs. |
+| `interval` | duration | no | `30s` | Time between probes. Values below 1 s (and `0`) are raised to `1s`. |
+| `timeout` | duration | no | `30s` | Per-probe deadline. Must be > 0; an explicit `0` is rejected (omit the key for the default). Sub-second values round **up**. |
+| `retries` | integer | no | `3` | Consecutive failures (outside `start_period`) before MC2 acts: recreate under a `restart` policy, otherwise report `Failed`. `0` is treated as `1`. |
+| `start_period` | duration | no | `0` | Grace period after start; probe failures inside it are not counted toward `retries`. `0` is allowed. |
+| `disable` | bool | no | `false` | `true` disables the probe entirely, regardless of `test`. |
 
-Durations accept `ms`/`s`/`m`/`h` or bare seconds. Sub-second values are
-rounded **up** to the next second, so `timeout: 100ms` means a 1s deadline
-(never `0`, which would be "no deadline").
+Durations accept `ms`, `s`, `m`, `h` or bare seconds, so `100ms`, `30s`, `1m`
+and `30` are all valid.
+
+### `test` forms
+
+| Written | Runs as |
+| --- | --- |
+| `test: "pg_isready -U postgres"` | `/bin/sh -c "pg_isready -U postgres"` (a bare string is `CMD-SHELL`) |
+| `test: ["CMD-SHELL", "pg_isready -U postgres"]` | `/bin/sh -c "pg_isready -U postgres"` |
+| `test: ["CMD", "pg_isready", "-U", "postgres"]` | argv `["pg_isready", "-U", "postgres"]` |
+| `test: ["pg_isready", "-U", "postgres"]` | argv `["pg_isready", "-U", "postgres"]` (no prefix is required) |
+| `test: ["NONE"]`, `test: null`, `test: []`, `test: ["CMD"]` | disabled — nothing runs |
+
+`CMD` and `CMD-SHELL` are **prefixes, not argv elements**: when present they
+are stripped, so `["CMD", "pg_isready"]` and `["pg_isready"]` are the same
+command. Everything else is argv verbatim — no shell is involved.
+
+Omitting `test`, or setting it to `null`, `[]`, `["NONE"]`, `["CMD"]`, or
+`["CMD-SHELL"]`, disables probing even when `disable` is `false`.
+`disable: true` disables it even when a command is present.
 
 ```yaml
 services:
   db:
     image: postgres:16
-    expose: [5432]
+    command: ["postgres"]             # the image CMD isn't run by default
+    environment:
+      POSTGRES_PASSWORD: lab
     healthcheck:
-      test: ["CMD", "pg_isready"]
-      interval: 30s
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 ```
-
-The `test` value may be given as a string or a list; the `CMD` / `CMD-SHELL`
-prefix is stripped, so `test: ["pg_isready"]` and `test: ["CMD", "pg_isready"]`
-are equivalent. A string form runs through a shell, so
-`test: "pg_isready -U postgres"` and
-`test: ["CMD-SHELL", "pg_isready -U postgres"]` are also equivalent.
 
 ## Healthcheck behavior
 
-When running, the node `exec`s `test` every `interval`. Each probe runs in its
-own task with the `timeout` as a deadline, so a guest command that hangs can
-never stall the node's reconcile loop (or any other instance). A passing probe
-sets the instance healthy (which gates `depends_on: {condition: service_healthy}`);
-`retries` consecutive failures past `start_period` mark it unhealthy — with
-`restart` set the sandbox is removed and recreated, otherwise it reports
-`Failed`. Failures during `start_period` are not counted, and a recreate resets
-both the counters and the grace period.
+```text
+ probe passes ──► healthy
+ probe fails  ──► not healthy
+                     │
+          inside start_period? ── yes ──► not counted
+                     │ no
+                     ▼
+          failures in a row reach retries?
+                     │ yes
+          ┌──────────┴─────────────┐
+    restart: no              any other restart
+    report Failed            recreate the VM (backoff),
+    (VM left running)        fresh counters + start_period
+```
 
-<Callout type="note" title="Unhealthy ≠ dead">
-  Marking unhealthy triggers recreate only when `restart` is set. Without it,
-  the instance keeps running and reports `Failed` — check logs before assuming
-  the probe command itself is wrong.
+- A passing probe marks the instance healthy — what
+  `depends_on: {condition: service_healthy}` waits for. **Any** failed probe
+  clears the healthy flag, even during `start_period`; `retries` only decides
+  when MC2 acts.
+- Probes run in the guest **out of band**, each in its own task bounded by
+  `timeout`, so a hung command never stalls the loop. A new probe starts only
+  when none is in flight and `interval` has elapsed, and only on a reconcile
+  pass — so probes can't run more often than `--reconcile-interval-secs`.
+
+<Callout type="note" title="Unhealthy is not dead">
+  Without `restart`, an unhealthy instance keeps running and is reported
+  `Failed` — check logs before assuming the probe command is wrong.
 </Callout>
 
 ## `depends_on`
 
-Compose syntax. **Ordering only** — dependencies are started first, dependents
-wait.
+Compose syntax. **Startup ordering only**: dependencies are started first, and
+a dependent waits before its first start.
 
 ```yaml
 services:
   db:
     image: postgres:16
-    expose: [5432]
+    command: ["postgres"]
+    environment:
+      POSTGRES_PASSWORD: lab
     healthcheck:
-      test: ["pg_isready", "-q", "-U", "postgres"]
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
       interval: 5s
       timeout: 3s
       retries: 5
   web:
-    image: alpine
+    image: alpine:3.20
     depends_on:
       db:
         condition: service_healthy
 ```
 
-- **List form** (`depends_on: [db]`) means `condition: service_started`.
-- **Map form** (`{db: {condition: service_healthy}}`) lets you require health.
-  Conditions: `service_started` (default) \| `service_healthy` (requires the
-  dependency to declare a healthcheck).
-- References must name services in the **same stack**; cycles are rejected at
-  parse time.
-- `service_healthy` requires the dependency to declare a **non-disabled**
-  healthcheck.
-- The gate holds back a dependent's **first start** (and a recreate for a
-  changed config). Once the dependent is `Running` it is never re-gated: a
-  dependency going unhealthy does not stop it, take it out of routing or pause
-  its health, ssh, ingress and crash handling.
-- With `scale > 1` a dependency counts as live when **any** replica is running
-  (healthy, for `service_healthy`); one `Failed` replica does not hide a healthy
-  one, whichever is reconciled last.
+| Form | Meaning |
+| --- | --- |
+| `depends_on: [db]` | List form; each entry is `service_started`. |
+| `depends_on: {db: {condition: service_healthy}}` | Map form with an explicit condition. |
+| `depends_on: {db: "anything"}` | A bare string value is treated as `service_started` — the string is not a condition. |
 
-<Callout type="warning" title="Startup only">
-  Ordering applies only at startup, not teardown. Dependencies are not stopped
-  in reverse order, and a failed dependency does not cascade a teardown.
-</Callout>
+| Condition | Satisfied when |
+| --- | --- |
+| `service_started` (default) | Any replica of the dependency is `Running`. |
+| `service_healthy` | Any **running** replica of the dependency is healthy. The dependency must declare a non-disabled healthcheck with a `test`, or apply is refused. |
+
+Additional rules, all enforced at apply (`400`):
+
+- References must name services in the **same stack**.
+- Cycles are rejected, and the error prints the cycle
+  (`depends_on cycle detected: a -> b -> a`).
+
+How the gate behaves at runtime:
+
+```text
+     db starts ──► db healthy ──► web's FIRST start
+     (Running)     (service_healthy condition met)
+                                        │
+   web already Running? ── yes ──► never re-gated: db may degrade freely
+```
+
+- The condition gates a dependent's **first start** only. Once an instance
+  has started, restarts and config-change recreates aren't re-gated, and a
+  dependency going unhealthy doesn't stop it, take it out of routing, or
+  pause its health checks, SSH, ingress, or crash handling.
+- With `scale > 1`, a dependency counts as live when **any** replica is running
+  (healthy, for `service_healthy`); one failed replica does not hide a healthy
+  one, whichever is reconciled last.
+- Ordering applies only at startup. Dependencies are not stopped in reverse
+  order, and a failed dependency does not cascade a teardown.

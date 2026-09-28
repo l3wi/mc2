@@ -1,25 +1,28 @@
 ---
 title: SSH & node placement
-description: The host-side microsandbox SSH front end (boolean and map forms, key auth) and nodeName/nodeSelector placement.
+description: The ssh key (boolean and map forms, authorized keys) and the nodeName/nodeSelector placement keys.
 ---
-
-`ssh` gives you a host-side door into a sandbox; `nodeName` and `nodeSelector`
-decide which node runs it.
 
 ## `ssh`
 
-Host-side microsandbox SSH front end (not guest sshd). Accepts a short boolean
-form — `ssh: true` (all defaults, authenticated by **every registered key**) —
-or the long map form:
+An SSH endpoint served by MC2 on the host — not an `sshd` in the guest, so
+the image needs nothing. Short form `ssh: true` (every default below), or a
+map:
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `enabled` | `false` | Turns on the host-side microsandbox SSH server. |
-| `bind` | `127.0.0.1` | Host-side SSH listener address (loopback). |
-| `port` | `0` | Host-side SSH listener port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
-| `user` | `root` | SSH username presented to the SDK. |
-| `sftp` | `true` | Enable SFTP on the session. |
-| `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh add-key`). Empty → **all registered keys** authenticate. |
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Serve SSH for this service. `ssh: true` sets it. |
+| `bind` | string | `127.0.0.1` | Host address the listener binds. |
+| `port` | integer | `0` | Host port; `0` picks a free one (see `mc2 ssh ls`). Must be fixed (non-zero) for an `ingress.tcp` route. |
+| `user` | string | `root` | Guest user the session runs as. |
+| `sftp` | bool | `true` | Allow SFTP. |
+| `authorizedKeys` | list of strings | `[]` | Key names from `mc2 ssh add-key`. Empty means **every** registered key. |
+
+Register keys before applying:
+
+```bash
+mc2 ssh add-key developer --file ~/.ssh/id_ed25519.pub
+```
 
 ```yaml
 services:
@@ -28,52 +31,48 @@ services:
     ssh:
       enabled: true
       bind: 127.0.0.1
-      port: 2222          # 0 = auto-allocate (not usable with ingress.tcp)
-      user: root
-      sftp: true
+      port: 2222
       authorizedKeys: [developer]
 ```
 
-The boolean form expands to defaults, which means `ssh: true` also enables
-**all registered keys** (empty `authorizedKeys`). `mc2 up` prints the declared
-SSH ports and any `ingress.tcp` entrypoint per service (auto ports resolve on
-first reconcile — see `mc2 ssh ls`).
+- **Fails closed.** `ssh: true` with no registered keys, or an
+  `authorizedKeys` entry that doesn't exist, fails that instance during
+  reconcile — MC2 never opens an unauthenticated listener. Check `mc2 ps` and
+  `mc2 ssh ls`.
+- **One listener per replica.** A fixed `port` is used as-is for every
+  replica, so with `scale > 1` use `port: 0` (each replica gets its own free
+  port) or give SSH to a `scale: 1` service.
+- **Overrides.** `mc2 ssh open` / `mc2 ssh close` set a per-instance override
+  that wins over this YAML until it's removed with
+  `DELETE /v1/instances/{id}/ssh`.
+- `mc2 up` prints each service's declared SSH port and TCP entry point.
+- Sessions are capped by the server's `--max-ssh-sessions` (64) and
+  `--max-ssh-sessions-per-listener` (16); a client has 30 s to finish the
+  handshake, and there's no idle timeout.
 
-## Authorized keys
+<Warning title="An empty authorizedKeys admits every key">
+  Convenient for a one-person lab; risky once more keys are registered. List
+  key names explicitly in shared setups.
+</Warning>
 
-`authorizedKeys` lists names from the key registry (`mc2 ssh add-key`). Empty
-means **every registered key** authenticates — convenient for a single-operator
-lab, risky if you add keys later. The user `mc2` presents to the SDK defaults
-to `root` and the session can include SFTP (`sftp: true` by default).
+## `nodeName` and `nodeSelector`
 
-<Callout type="warning" title="Auto-allocated ports can't back ingress.tcp">
-  `port: 0` (auto-allocate) is resolved only at reconcile time, so a TCP
-  ingress route cannot be pinned to it. `ingress.tcp` requires `ssh.enabled`
-  with a **fixed (non-zero)** `ssh.port`, else apply returns `400`.
-</Callout>
+Placement keys. v1 has exactly one node — the machine running `mc2 server` —
+so they only decide whether the instance is placed at all:
 
-## `nodeName` & `nodeSelector`
-
-Two placement keys with different guarantees:
-
-| Key | Required | Default | Description |
+| Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `nodeName` | no | — | Hard pin to a node name. |
-| `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
+| `nodeName` | string | — | Place only on the node with this name (`--node-name`, default the hostname). |
+| `nodeSelector` | map | `{}` | Place only on a node whose labels (`mc2 server --label KEY=VALUE`) include all these pairs. |
 
 ```yaml
 services:
   web:
     image: alpine:3.20
-    nodeName: worker-1     # hard pin (optional)
-    nodeSelector:          # soft placement by labels (optional)
-      zone: a
+    nodeSelector:
+      zone: a        # matches mc2 server --label zone=a
 ```
 
-- **`nodeName`** is a hard pin: the instance goes on that node, no fallback.
-- **`nodeSelector`** is soft placement: the instance lands on any node whose
-  labels match the given set.
-
-Both are optional and may be combined — the pin wins where they conflict. See
-[Services & instances](/documentation/concepts/services-and-instances) for how
-placement interacts with the scheduler.
+If the node doesn't match, the instance stays `Pending` **with no message**;
+the apply output shows it as `"pending": 1`. Check `mc2 node ls` for the
+node's name and labels. When `nodeName` is set, `nodeSelector` is ignored.

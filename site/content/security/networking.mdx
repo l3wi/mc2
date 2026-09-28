@@ -1,120 +1,100 @@
 ---
 title: Networking
-description: Default-allow service networks, unique port claims, loopback host ports, and remote transport rules.
+description: What a guest can reach, how exposed ports are owned, what's reachable from outside, and how the CLI reaches a remote server.
 ---
 
-MC2 splits networking into two planes with different security postures.
-East–west traffic between services is **default-allow** within a shared
-network, Docker-style. North–south traffic in and out of the box is a single,
-controlled ingress path — host ports bind loopback and are only exposed
-publicly through the ingress catalog. This page covers both, plus the rules
-that govern how you reach a remote control plane.
+MC2's networking has three security-relevant surfaces: guest-to-guest
+(service networks), guest-to-world (egress profiles), and world-to-guest
+(host ports and ingress). This page covers each, plus how the CLI talks to a
+remote control plane.
 
-## East–west: default-allow service networks
-
-A service declares `expose` for its internal listeners. Every other service
-that shares a **network** reaches it by default over the node loop's L4 splice,
-resolved as `<service>.<network>.svc.mc2` DNS.
-
-- Named networks are **server-wide**, so stacks can share one.
-- Default-allow within a shared network: if you put a service on the network,
-  it can reach every other member.
-- A guest's own reach is further bounded by its network profile — see
-  [Isolation](/security/isolation).
-
-<Callout type="note">
-  Default-allow means membership is the access control. Keep unrelated
-  workloads on separate networks, and use `network.profiles: none` when a
-  sandbox must not have any network reach at all.
-</Callout>
-
-## Port claims are exclusive server-wide
-
-Exposed guest ports are exclusive server-wide and claimed at **apply** time,
-for the claim's whole lifetime. A guest resolves every name to the one gateway
-IP and msb rewrites `gateway:P` to host `127.0.0.1:P` with no remap, so the
-port alone identifies the shared splice — two stacks cannot hold the same
-`expose` port. When `scale > 1`, each replica gets a distinct host port (fixed
-`8080` becomes `8080, 8081, 8082`; target-only ports get a stable auto host
-port).
-
-<Callout type="warning" title="Rejected at apply, not at runtime">
-  `mc2 up` returns `400` for an `expose` port another stack already claims
-  (naming the owner and suggesting another port), for a port MC2 already takes
-  — the REST bind, any SSH listener, any published `ports:` host port, or `53`
-  — and for a loopback port a host process is already listening on. The
-  listener is then held from apply until the stack is removed, so a client sees
-  *accept-then-close* while the service has no running backend, and no host
-  process can take the port meanwhile. `mc2 network` prints the owner of every
-  claimed port.
-</Callout>
-
-## Egress is narrow and fail-closed
-
-A guest's east–west egress is a create-time `Host:tcp:P` rule per reachable
-port — no `host` profile, no broad loopback grant (that is exactly why
-`network.profiles: [host]` needs the server flag `--allow-host-profile`). A
-rule cannot be narrowed after the virtual machine exists, so the node **fails
-closed**: if the listener for one of an instance's allowed ports cannot be
-bound, that instance is reported `Failed` with the port and cause and its
-microVM is never created.
-
-On Linux, `expose` ports below the unprivileged threshold (typically 1024) are
-rejected with the fix: grant `CAP_NET_BIND_SERVICE` (`setcap` or systemd
-`AmbientCapabilities`), lower `net.ipv4.ip_unprivileged_port_start`, or choose a
-higher port. Host ports always bind loopback in any case, so a privileged port
-buys reachability from the node itself, never from the network.
-
-## Host ports: loopback only
-
-Published host ports always bind the host's loopback interface. Guests cannot
-reach them from inside, and nothing on the box exposes them to the world by
-default. The public path in is only what you publish.
-
-## North–south: ingress with TLS
-
-Public HTTP is a deliberate step: declare `ports:` + stack `ingress:` and the
-server writes a Traefik file-provider catalog (`--ingress-config-dir`). TLS
-termination and certificates are yours to operate — point your Traefik file
-provider at the catalog and it terminates TLS for the hostnames you own. MC2
-publishes the control plane itself the same way when you set
-`--public-hostname`, so a remote install is manageable over TLS.
-
-Ingress inputs are strictly validated before they reach the catalog: hosts must
-be exact lowercase RFC 1123 names (no ports, wildcards or trailing dots), paths
-must start with `/` and hold no whitespace/quotes/backticks/backslashes/control
-characters, and `certResolver`/`entryPoint`/TCP route names are restricted to
-`[A-Za-z0-9_-]+`. The catalog is rendered from typed structs, so an invalid or
-injected value is rejected at apply rather than written into Traefik's dynamic
-config.
-
-## Remote control plane transport
-
-The CLI is a REST client; a remote server is just a URL swap. Two modes,
-reported by `mc2 status`:
-
-- **local** — loopback API (`127.0.0.1` / `localhost` / `::1`), token
-  optional.
-- **remote** — any other host; requires **https + an API key**.
-
-Plaintext `http://` for a remote endpoint is **refused** unless you explicitly
-opt in:
-
-```bash
-# Refused:
-export MC2_API=http://mc2.example.com:7443
-
-# Explicitly allowed (do not use in production):
-export MC2_ALLOW_INSECURE_HTTP=1
+```text
+ guest ──► peers on its networks ....... default-allow, exposed ports only
+ guest ──► internet / LAN / host ...... per egress profile
+ world ──► guest ...................... only through ingress you configure
+ CLI   ──► mc2 server ................. token; HTTPS required when remote
 ```
 
-<Callout type="warning" title="Plaintext remote is refused">
-  Outside loopback, MC2 refuses `http://` by default. Only
-  `--allow-insecure-http` or `MC2_ALLOW_INSECURE_HTTP=1` re-enables it — and
-  that defeats the https requirement. Use it for nothing but throwaway labs.
-</Callout>
+## Guest to guest: service networks
 
-See [Networking & ingress reference](/references/stack/networks-ingress) for
-the stack schema, and
-[Manage a remote server](/documentation/guides/manage-a-remote-server) for the
-end-to-end remote setup.
+A service lists the ports it serves in `expose`. Every service that shares a
+network with it can connect to those ports — no allow-list. Membership **is**
+the access control:
+
+- Every service joins its stack's own network, so services in one stack can
+  always reach each other's exposed ports.
+- Named networks are server-wide; any stack can join one by name.
+- Keep workloads that shouldn't talk on separate named networks, or give a
+  service `network.profiles: [none]` to cut all networking.
+
+Connections go through a listener MC2 holds on the host (a **splice**) and
+are forwarded to one of the owning service's ready replicas.
+
+## Port ownership
+
+Inside a guest every service name resolves to the same gateway address, so
+the **port** is what identifies a service. That makes exposed ports unique
+across the server:
+
+- `mc2 up` rejects an `expose` port another stack holds (naming it), a port
+  MC2 uses itself (the REST port, SSH ports, published host ports, `53`), and
+  a port some other host process is already listening on.
+- Claims are stored in the database, so two applies can't both win.
+- Once a stack's microVMs are being reconciled, MC2 binds and **holds**
+  `127.0.0.1:<port>` for as long as the port is exposed and the server runs.
+  With no ready replica a client gets *accept-then-close*, and no other
+  process can take the port. Removing the `expose` (or the stack) releases
+  it; stopping the server releases the listener but keeps the claim.
+- One exposed port is one service-wide splice, shared by all replicas;
+  `scale` doesn't multiply exposed ports.
+
+## Fail closed
+
+A guest's permission to reach a peer port is fixed when its microVM is
+created. If MC2 can't hold the listener for one of those ports, the instance
+is reported `Failed` (naming the port) and its microVM isn't created — a
+guest must never be allowed to reach a port some other process might own.
+
+On Linux, a non-root server can't bind ports below 1024, so such `expose`
+ports are rejected at apply with the fix (`CAP_NET_BIND_SERVICE`, or a higher
+port).
+
+## Guest to world: egress profiles
+
+See [Isolation](/security/isolation#egress-profiles). In short: `public`
+reaches the internet, `private` reaches your LAN (not just MC2 services),
+`host` reaches the host's services including the MC2 API, and `none` reaches
+nothing.
+
+## World to guest: host ports and ingress
+
+- **Published ports bind `127.0.0.1`** — never a public interface.
+- **The public path is ingress.** A stack's `ingress:` rules become Traefik
+  routes that MC2 writes to `--ingress-config-dir`; your Traefik terminates
+  TLS and forwards to the loopback port.
+- **Ingress input is validated** before it's written: hostnames are exact
+  lowercase RFC 1123 names (no port, wildcard, or trailing dot); paths start
+  with `/` and contain no whitespace, quotes, backticks, backslashes, or
+  control characters; `certResolver`, `entryPoint`, and TCP route names match
+  `[A-Za-z0-9_-]+`. Nothing a stack says can inject arbitrary Traefik config.
+
+## CLI to server
+
+The server requires the API token on every `/v1` request, whether you
+connect over loopback or remotely — unless it was started with `--no-auth`.
+
+The CLI adds a transport rule: a **remote** URL (anything but `127.0.0.0/8`,
+`::1`, or `localhost`) must be `https://`, or the CLI refuses to send the
+token. `--allow-insecure-http` or `MC2_ALLOW_INSECURE_HTTP=1` overrides that
+— only for throwaway labs or trusted private links.
+
+The server itself speaks plain HTTP on `--bind`. Keep the bind on loopback
+and let Traefik terminate TLS (`--public-hostname` writes that route). If you
+bind it elsewhere, any client that ignores the CLI's rule can send the token
+in the clear.
+
+## Read next
+
+- [Authentication](/security/authentication) — the token and its lifecycle.
+- [Networking concepts](/documentation/concepts/networking) — how the planes
+  work.

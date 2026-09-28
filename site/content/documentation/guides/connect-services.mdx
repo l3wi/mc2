@@ -1,91 +1,162 @@
 ---
 title: Connect services
-description: East–west networking with expose, networks, and svc DNS.
+description: Let services reach each other by name — within a stack, and across stacks on a shared network.
 ---
 
-**You will learn:** make two services talk to each other over a shared
-network using `expose`, `networks`, and `<service>.<network>.svc.mc2` DNS — and
-inspect it with `mc2 network`.
+**You will learn:** expose a port so other services can reach it by name,
+share a network between two stacks, and inspect who can reach what with
+`mc2 network`.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
-This guide mirrors `examples/03-networks`.
+**Prerequisites:** [Order startup](/documentation/guides/order-startup).
 
-## The stack
+## Within one stack
+
+Every service in a stack is on the stack's own network. A service that lists
+a port under `expose` can be reached there by the others.
+
+Save this as `net.yaml`:
 
 ```yaml
-name: smoke-networks
-
 services:
   echo:
     image: python:3.12-alpine
-    expose: [8080]
-    command: 'exec sh -c "mkdir -p /tmp/www && printf ''NETWORK_OK\n'' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8080"'
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo NETWORK_OK > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 18100"]
+    expose: [18100]
   client:
     image: alpine:3.20
 ```
 
-`echo` declares `expose: [8080]`. Every other service sharing the same
-network — here, both services are on the stack's default network
-(`smoke-networks`) — reaches it by **default-allow**; no allow edges needed.
-The command matches `examples/03-networks` (Python's `http.server`, which the
-alpine image includes).
+<Steps>
 
-## Bring it up
+<Step title="Bring it up">
 
 ```bash
-mc2 up -f examples/03-networks/stack.yaml
-mc2 ps
+mc2 up -f net.yaml
+mc2 ps --stack net      # wait for echo/0 and client/0 to be Running
 ```
 
-## Talk to the other service
+</Step>
 
-From inside the client sandbox, reach the echo service by name:
+<Step title="Call echo from client">
 
 ```bash
-mc2 exec smoke-networks/client/0 wget -qO- http://echo.smoke-networks.svc.mc2:8080/
+mc2 exec net/client/0 wget -qO- http://echo:18100/
+# NETWORK_OK
+mc2 exec net/client/0 wget -qO- http://echo.net.svc.mc2:18100/
 # NETWORK_OK
 ```
 
-The DNS name is `<service>.<network>.svc.mc2`, the port is the exposed one.
+Inside a guest, a peer answers to its short name (`echo`) and its full name
+`<service>.<stack>.svc.mc2`. `client` needs no `expose` of its own to be a
+client.
 
-## Inspect the network
+</Step>
 
-```bash
-mc2 network                 # every network + member instances and ports
-mc2 network smoke-networks  # drill into one network
-mc2 network smoke-networks/client/0   # one instance's exposes/edges
+<Step title="Try to take the same port elsewhere">
+
+Exposed ports are unique across the whole server, because the port is what
+identifies the service. Another stack asking for `18100` is refused:
+
+```text
+Error: up failed: 400 Bad Request: expose port 18100 (dup/other) is already
+claimed by net/echo; exposed guest ports are exclusive server-wide, so pick
+another port — try 18102
 ```
 
-## Share a network across stacks
+A port that some other program on the host already listens on is refused the
+same way. Choose ports that are free on the server.
 
-Networks are **server-wide**, so services in different stacks can join one by
-name:
+</Step>
+
+</Steps>
+
+## Across stacks
+
+Named networks are server-wide: any stack can join one by name. Declare it at
+the top level and list it under the service's `networks`.
+
+`worker.yaml` — the service to call:
 
 ```yaml
+networks:
+  shared:
+    mode: mediated
 services:
   worker:
+    image: python:3.12-alpine
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo SHARED_OK > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 18101"]
+    expose: [18101]
+    networks: [shared]
+```
+
+`caller.yaml` — a different stack on the same network:
+
+```yaml
+networks:
+  shared:
+    mode: mediated
+services:
+  caller:
     image: alpine:3.20
     networks: [shared]
 ```
 
-Another stack's service with `networks: [shared]` can then reach
-`worker.shared.svc.mc2` by default. See
-[Shared networks across stacks](/recipes/shared-network-multi-stack).
+```bash
+mc2 up -f worker.yaml
+mc2 up -f caller.yaml
+# once both are Running:
+mc2 exec caller/caller/0 wget -qO- http://worker.shared.svc.mc2:18101/
+# SHARED_OK
+```
+
+From another stack, the full name uses the shared network:
+`<service>.<network>.svc.mc2`.
+
+```text
+ stack "caller"                                   stack "worker"
+ caller/0 ──► worker.shared.svc.mc2:18101 ──► MC2 splice ──► worker/0 :18101
+              (resolves to the VM gateway)   127.0.0.1:18101
+```
+
+## Inspect the networks
+
+```bash
+mc2 network                    # every network, plus who owns each port
+mc2 network shared             # one network's members
+mc2 network net/client/0       # what one instance can reach
+```
+
+```text
+port claims (exclusive server-wide):
+  18100  net/echo
+  18101  worker/worker
+```
+
+## Clean up
+
+```bash
+mc2 down caller
+mc2 down worker
+mc2 down net
+```
 
 ## Key behaviors
 
-- **Default-allow within a shared network** — Docker-style.
-- **Same-node in v1.** DNS and L4 splices are node-local.
-- **Exclusive server-wide ports.** An `expose` port another stack already
-  claims is rejected at `mc2 up` (400, naming the owner); the claim's listener
-  is held from apply until the stack is removed.
+- **Sharing a network is permission.** Every service on a network can reach
+  every exposed port on it. Put services on separate networks to separate
+  them.
+- **One owner per port, server-wide**, held from apply until the stack is
+  removed.
+- **Names are injected into `/etc/hosts`** in each guest, pointing at the
+  VM's gateway; MC2 forwards to a ready replica, round-robin.
+- **Local to the server** in v1.
 
 ## Next
 
 <Cards cols={2}>
   <Card
     title="Publish with ingress"
-    description="North–south HTTP through a BYO Traefik."
+    description="Give a service a public hostname through Traefik."
     href="/documentation/guides/publish-with-ingress"
   />
   <Card

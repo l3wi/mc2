@@ -1,7 +1,9 @@
 # Secrets
 
-`UNDER DEVELOPMENT`: this verifies secret configuration and agent sync, but does
-not yet provide a complete guest-side command that proves the injected value.
+Stores a secret, references it from a stack, and shows the guest only ever
+holds a placeholder. For an end-to-end proof against a real host (httpbin.org
+echoing the substituted header), see the
+[Add secrets guide](../../site/content/documentation/guides/add-secrets.mdx).
 
 ```bash
 mc2 secret set SMOKE_TOKEN --value 'lab-only-token'

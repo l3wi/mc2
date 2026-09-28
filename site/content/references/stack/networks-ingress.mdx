@@ -1,53 +1,88 @@
 ---
 title: Networks & ingress
-description: Server-wide network membership, network profiles, the top-level networks declaration, and the full ingress (rules/tcp) reference.
+description: Service-network membership and profiles, the top-level networks declaration, and the full ingress (tls/rules/tcp) reference with its validation grammar.
 ---
 
-Two layers compose here: **membership** (which networks a service joins) and
-**exposure** (the `ingress` catalog a BYO Traefik consumes).
+Two layers compose here: **membership** (which networks a service joins and
+what it may reach) and **exposure** (the ingress catalog a BYO Traefik
+consumes).
+
+```text
+ membership (guest to guest)          exposure (world to guest)
+┌────────────────────────────────┐   ┌──────────────────────────────────┐
+│ networks: [backend]            │   │ ingress: rules / tcp             │
+│ peer names in /etc/hosts:      │   │ MC2 writes <ingress-dir>/traefik │
+│   db, db.shop.svc.mc2          │   │ Traefik routes host ──► replica  │
+│ expose ports reachable by all  │   │   via its 127.0.0.1 host port    │
+└────────────────────────────────┘   └──────────────────────────────────┘
+```
 
 ## `networks[]` (membership)
 
-List of **server-wide** network names this service joins. Every service is
-implicitly on its stack's default network (named `<stack>`); joining a named
-network also makes it reachable from services in *other* stacks on that
-network (default-allow, `<service>.<network>.svc.mc2` DNS). Networks need no
-top-level declaration — they exist server-wide on first use.
+`networks:` on a service is the list of **server-wide** network names it
+joins. Every service is implicitly on its stack's default network (named after
+the stack), so services in one stack reach each other without declaring
+anything. Joining a named network also makes the service reachable from
+services in *other* stacks on that network.
 
 ```yaml
 services:
-  web:
-    image: alpine:3.20
-    networks: [backend]
+  db:
+    image: postgres:16
+    command: ["postgres"]
+    expose: [5432]
+    networks: [backend]        # also on the default network "shop"
 ```
 
-Same-stack services on the shared default network reach each other by
-`<service>.<network>.svc.mc2:<port>`; cross-stack reachability requires joining
-a shared named network.
+Membership is symmetric and default-allow in v1: every service on a shared
+network may reach every exposed port of every peer on that network — including
+its own service's replicas. A service needs no `expose` of its own to *reach*
+peers. Networks exist server-wide on first use; they need no declaration to be
+joined. `mc2 network` prints the membership summary.
+
+Resolution inside the guest:
+
+- Short form: the bare service name.
+- Full form: `<service>.<stack>.svc.mc2` for a peer in the same stack, and
+  `<service>.<network>.svc.mc2` for a peer in another stack, where
+  `<network>` is one shared named network (the first alphabetically). Only
+  that one full name is injected per peer — two services in the same stack
+  that both join `backend` still use `<service>.<stack>.svc.mc2`.
+- Names are written into the guest's `/etc/hosts` by MC2.
+- The name resolves to the single gateway IP; MC2 translates the port to the
+  host loopback splice. Cross-node splices are unsupported, so peers must be on
+  the same node.
+
+Consumers are recreated only when the **set of reachable ports changes** — a
+neighbour joining or leaving without changing ports does not churn VMs.
 
 ## `network.profiles`
 
-The `network.profiles` key on a service selects its posture from the closed
-set `public`, `private`, `host`, and `none`. `none` disables the guest network
-entirely and must be the only entry; duplicates and any other value (including
-`local`/`any`) are rejected at parse time rather than defaulting to `public`.
-`host` is only accepted when the server runs with `--allow-host-profile`. An
-empty list keeps the `public` default. The profile is independent of
-`networks[]` membership —
-membership says *which* networks, the profile says *how*. See
-[Services](./services#network-profiles) for the full table.
+`network.profiles` (on a service) selects its posture from a closed set. The
+list must be a subset of the values below, with no duplicates; an empty list
+keeps the default `public`. Unknown values are rejected — they never fall back
+to public egress — and the old `local`/`any` aliases are gone.
+
+| Profile | Effect |
+| --- | --- |
+| `public` (default) | Egress to public internet addresses. |
+| `private` | Egress to private/LAN addresses (RFC 1918, IPv6 ULA, CGN). Doesn't disable `ports` or ingress. |
+| `host` | Egress to the host's own services through the VM gateway — the control API and every published loopback port. Requires the server flag `--allow-host-profile` (env `MC2_ALLOW_HOST_PROFILE`), otherwise apply is refused. |
+| `none` | Networking disabled entirely, including service networks. Must be the only entry. |
+
+Profiles combine (`[public, private]`). With networking enabled, MC2 adds
+narrow egress rules for exactly the service-network ports the guest may
+reach. Membership says *which* peers; the profile says what else is
+reachable outbound.
 
 ## `networks` (top-level)
 
-Top-level declarations exist for group-level options. In v1 only one key is
-valid:
+The top-level declaration carries group-level options. In v1 exactly one key
+is valid:
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `mode` | no | `mediated` | Only `mediated` is valid in v1. |
-
-Any other value is rejected at parse time. The `backend` example from the
-stack reference declares this explicitly even though `mediated` is the default:
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `mode` | string | no | `mediated` | Only `mediated` (host-mediated L4 splice) is valid in v1; any other value is rejected. |
 
 ```yaml
 networks:
@@ -55,33 +90,48 @@ networks:
     mode: mediated
 ```
 
+Declaring a network here does not create or gate membership — a service may
+join any name in `networks: []`. The declaration exists so a stack can state
+its network mode explicitly.
+
 ## `ingress`
 
-Requires at least one of `rules` or `tcp`. Consumed by the server's Traefik
-file export (`mc2 server --ingress-config-dir`).
+`ingress` publishes HTTP(S) routes (and TCP routes) into a catalog that a BYO
+Traefik reads with its file provider. The server writes
+`<ingress-config-dir>/traefik/dynamic.yml` (what Traefik reads) and
+`catalog.json` (every route, ready or not, for you); it rewrites them only
+when the routes change. A route targets a healthy `Running` replica when the
+service has a health check, then any `Running` replica, and uses that
+replica's own host port; a route whose backend isn't running and accepting
+connections is left out of `dynamic.yml`. Inspect routes with `mc2 ingress`
+or `GET /v1/ingress`; they're configured only through stack YAML. Enable the
+files with `mc2 server --ingress-config-dir <dir>`.
+
+`ingress` requires at least one of `rules` or `tcp`; setting `ingress` with
+neither is rejected.
 
 ### `tls`
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `enabled` | `false` | Mark routes TLS in the catalog. Certs/ACME live in the proxy. |
-| `certResolver` | — | Traefik certificate resolver name from the proxy static config (`[A-Za-z0-9_-]+`). |
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Put the `rules` routes on Traefik's `websecure` entry point with TLS (otherwise `web`). Certs/ACME live in the proxy, not in MC2. |
+| `certResolver` | string | — | Traefik certificate resolver name from the proxy's static config. Must match `[A-Za-z0-9_-]+`. |
 
 ### `rules[]`
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `host` | yes | — | Exact lowercase RFC 1123 hostname (labels 1–63 of `[a-z0-9-]`, ≤ 253 total): no port, no wildcard, no trailing dot. |
-| `paths` | yes (≥1) | — | Path → backend entries. |
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `host` | string | yes | — | Exact lowercase RFC 1123 hostname: labels of 1–63 `[a-z0-9-]` that do not start/end with `-`, total ≤ 253. No port, no wildcard, no trailing dot. |
+| `paths` | list | yes (≥ 1) | — | Path entries; at least one required. |
 
 #### `rules[].paths[]`
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `path` | no | `/` | Route path: must start with `/` and contain no whitespace, quotes, backticks, backslashes or control characters. |
-| `pathType` | no | `Prefix` | `Prefix` or `Exact`. |
-| `service` | yes | — | Backend service in this stack. |
-| `port` | yes | — | Must equal a `ports[].target` on that service; backend `ports` entry must be `tcp` with a non-zero `published`. |
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `path` | string | no | `/` | Must start with `/` and contain no whitespace, quotes, backticks, backslashes or control characters. |
+| `pathType` | string | no | `Prefix` | `Prefix` or `Exact`. |
+| `service` | string | yes | — | Backend service; must be in this stack. |
+| `port` | integer | yes | — | Guest port; must equal a `ports[].target` on that service, and that `ports` entry must be `tcp`. Must be non-zero. |
 
 ```yaml
 ingress:
@@ -97,13 +147,19 @@ ingress:
           port: 8000
 ```
 
+The backend's `published` value does not matter — a target-only (auto) port is
+resolved at apply, so it backs an ingress route the same way a fixed one does.
+A `udp` `ports` entry, or a target with no `ports` entry at all, is rejected.
+
 ### `tcp[]`
 
-| Key | Required | Description |
-| --- | --- | --- |
-| `name` | yes | Stable route name for the Traefik config (`[A-Za-z0-9_-]+`). |
-| `entryPoint` | yes | Traefik entrypoint accepting TCP connections (`[A-Za-z0-9_-]+`). |
-| `service` | yes | Backend service; must have `ssh.enabled` with a fixed (non-zero) `ssh.port`. |
+TCP routes exist for host-side SSH endpoints (e.g. Traefik's `ssh` entrypoint).
+
+| Key | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes | Stable route name; must match `[A-Za-z0-9_-]+`. |
+| `entryPoint` | string | yes | Traefik entrypoint that accepts the TCP connections; `[A-Za-z0-9_-]+`. |
+| `service` | string | yes | Backend service; must be in this stack and have `ssh.enabled` with a **fixed, non-zero** `ssh.port`. |
 
 ```yaml
 ingress:
@@ -113,13 +169,25 @@ ingress:
       service: web
 ```
 
-<Callout type="warning" title="Backend-port validation">
-  HTTP rule backend ports must equal a `ports[].target` on the target service,
-  and that `ports` entry must be `tcp` with a non-zero `published` (`udp`
-  backends and auto-allocated ports are rejected). TCP routes target services
-  through their `ssh` front end, which must have `ssh.enabled` and a fixed
-  (non-zero) `ssh.port`. Hosts, paths and Traefik identifiers are strictly
-  validated (see the tables above), and two routes that would collapse to the
-  same Traefik router key are rejected rather than overwriting one another.
-  Violations return `400` at apply.
-</Callout>
+### Hostname sugar from `ports`
+
+A `ports` entry with a `hostname` synthesizes one more TLS route for that
+hostname → the target port, using the resolver name `le` from the Traefik
+static config. It needs no `ingress:` block, but it participates in the same
+router-key collision checks.
+
+### Validation grammar (summary)
+
+| Value | Rule |
+| --- | --- |
+| `rules[].host`, `ports[].hostname` | Lowercase RFC 1123 hostname, ≤ 253 chars, no port/wildcard/trailing dot; labels 1–63. |
+| `rules[].paths[].path` | Starts with `/`; no whitespace, quotes, backticks, backslashes or control characters. |
+| `rules[].paths[].pathType` | `Prefix` or `Exact` (case-insensitive). |
+| `tls.certResolver`, `tcp[].name`, `tcp[].entryPoint` | `[A-Za-z0-9_-]+`. |
+| `rules[].paths[].port` | Non-zero, matches a `tcp` `ports[].target` on the named service. |
+| `tcp[].service` | Exists in this stack, `ssh.enabled`, fixed non-zero `ssh.port`. |
+| Router keys | Two routes that normalize to the same Traefik router key (stack + host + path + service + port, with every non-alphanumeric character mapped to `-`) are rejected rather than overwriting one another. |
+
+Everything above is checked at parse/apply and returns `400`; the Traefik YAML
+is then serialized from typed structs, so a value that passes validation cannot
+inject YAML.

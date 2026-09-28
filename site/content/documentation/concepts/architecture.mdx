@@ -1,83 +1,147 @@
 ---
 title: Architecture
-description: One process — REST, SQLite, scheduler, and a reconcile loop driving detached microVMs.
+description: One process — REST API, SQLite, an apply planner, and a reconcile loop driving detached microVMs.
 ---
 
 MC2 is one process. `mc2 server` is the whole orchestrator: it stores state,
-serves the REST API, schedules work, and reconciles real microVMs toward what
-you declared. There is no daemon to install, no agent to run on the host, and
-no gRPC seam between layers.
+serves the REST API, plans every apply, and reconciles real microVMs toward
+what you declared. There is no daemon to install, no agent to run on the host,
+and no gRPC seam between layers. The `mc2` CLI is a thin REST client of that
+process.
 
 ## The analogy
 
 Think of Docker Compose's `compose up` — but the process that wrote the
 desired state stays alive and keeps converging, and each "container" is a
 microVM with its own kernel. Or think of a Kubernetes control plane with all
-controllers collapsed into a single binary that only ever manages one node.
+controllers collapsed into a single binary that only ever manages one machine.
 
 ## How it works
 
-`mc2 server` combines four components in one process:
-
-1. **SQLite store** — the source of truth: stacks (normalized `spec_json`),
-   instances and their phases, secrets, keys, contexts, and node state.
-   Nothing is re-derived from YAML on every request.
-2. **REST API** — the operator surface the CLI talks to (`/v1/...`). The CLI
-   is a thin REST client, so the same commands manage a local or remote
-   server.
-3. **Scheduler** — turns a published stack into concrete instances on nodes
-   (one node in v1), resolving per-replica ports and placement.
-4. **Reconcile loop** — on an interval, builds the *desired set* from state
-   and drives real sandboxes through the embedded microsandbox SDK toward it:
-   create, health-probe, restart, network splice, ingress file write, and
-   teardown.
-
 ```text
-            ┌────────────────────── mc2 server (one process) ──────────────────────┐
-            │                                                                      │
-  mc2 CLI ──┤──► REST API ──► Scheduler ──► desired set                            │
-            │       ▲              │                                                │
-            │       │         reconcile loop ──► embedded microsandbox SDK ──► microVMs
-            │       │              │                                                │
-            │       └──────────────┴──────────────► SQLite (source of truth)       │
-            └──────────────────────────────────────────────────────────────────────┘
+      ┌──────────────── mc2 server (one process) ────────────────┐
+      │                                                          │
+mc2 ──┼─► REST API ─► apply planner ──one transaction──► SQLite  │
+CLI   │                                                  │   ▲   │
+      │           ┌─────── desired state ────────────────┘   │   │
+      │           ▼                                          │   │
+      │     reconcile loop ─────── observed ─────────────────┘   │
+      │           │                                              │
+      │           ▼                                              │
+      │ embedded microsandbox SDK                                │
+      └───────────┼──────────────────────────────────────────────┘
+                  ▼
+        microVMs (one per instance)
 ```
 
-`mc2 doctor` is the pre-flight check: hypervisor present (KVM `/dev/kvm` or
-Apple Silicon HVF), `msb` CLI on PATH (optional), and expected paths. The REST
-and scheduler side serves even without a hypervisor; instances fail with a
-runtime error instead.
+Five parts share the process:
+
+1. **REST API** (`/v1/...`) — the only way in. Every route except `/health`
+   needs the API token. The CLI talks to it the same way whether the server is
+   on your laptop or across the internet.
+2. **Apply planner** — `mc2 up` sends the whole stack file. The planner
+   validates it, checks capacity and ports, and works out every instance to
+   create, update, or delete. It writes the result in **one transaction**, or
+   nothing at all if any check fails.
+3. **SQLite store** — the source of truth: stacks, instances and their
+   phases, encrypted secrets, SSH keys, host-port claims, and the API token
+   hash.
+4. **Reconcile loop** — every few seconds (`--reconcile-interval-secs`,
+   default 10) it reads the desired state, compares it with the microVMs that
+   actually exist, and closes the gap: create, health-probe, restart,
+   recreate, tear down. It writes each instance's observed phase back to
+   SQLite.
+5. **Host-side plumbing** — listeners that connect services to each other
+   (see [Networking](/documentation/concepts/networking)), SSH front ends, and
+   the Traefik file catalog for ingress.
+
+The microVMs are created *detached*: they are separate processes managed by
+the embedded [microsandbox](https://github.com/superradcompany/microsandbox) SDK,
+not children of `mc2 server`.
+
+## What lives where
+
+Everything the server owns sits under one **data dir** (`--data-dir`, default
+`~/.mc2`):
+
+```text
+~/.mc2/                     --data-dir
+├── mc2.db                  SQLite: stacks, instances, secrets, keys, claims
+├── secrets.key             decrypts stored secrets (mode 0600)
+├── bootstrap-token         first API token, when no terminal is attached
+└── volumes/                volume root (--volume-dir overrides)
+    └── mc2-<stack>--<volume>/
+```
+
+- **Back up `mc2.db` and `secrets.key` together.** Secrets in the database
+  can only be decrypted with that key; a server with stored secrets and a
+  missing or different key refuses to start.
+- **The API token is stored only as a hash.** Lose it and you rotate it (see
+  [Identity & contexts](/documentation/concepts/identity-and-contexts)); it
+  cannot be recovered.
+- **Volumes are plain directories** under the volume root, so
+  `--data-dir /srv/mc2` keeps volumes under `/srv/mc2/volumes` too.
+- **Client settings are not here.** The CLI's contexts live on each client
+  machine in `~/.mc2/config.toml`.
+
+## Restarts and failures
+
+```text
+ mc2 server stops ──► microVMs keep running
+                          │
+ mc2 server starts ──► adopts its own microVMs (install-id label)
+                    ├─► recreates any whose config changed meanwhile
+                    └─► removes labelled microVMs nothing wants
+```
+
+- **Stopping the server doesn't stop your workloads.** The microVMs keep
+  running, but what the server itself provides stops with it: the REST API,
+  service-network splices (so services can't reach each other by name), and
+  SSH listeners. On the next start it adopts the microVMs it created (each
+  carries this install's id as a label), restores those listeners, and never
+  touches sandboxes it didn't create.
+- **A failure in one instance stays in that instance.** A missing secret or
+  a failed create marks only that instance `Failed`; the rest of the pass goes
+  on.
+- **Supervise it like any daemon.** `/health` returns `200` while the
+  reconcile loop is live and `503` once it has stalled. If a critical internal
+  task dies the process exits non-zero, so systemd or launchd can restart it.
 
 ## In practice
 
 ```bash
-mc2 setup    # first run: collect flags, print the command
-mc2 server   # defaults: data dir ~/.mc2, bind 127.0.0.1:7443, auth on
+mc2 doctor   # hypervisor (KVM /dev/kvm or Apple Silicon HVF) and paths
+mc2 server   # data dir ~/.mc2, bind 127.0.0.1:7443, auth on
 ```
 
-Server-level knobs (all also env vars) include `--node-name`, `--label
-KEY=VALUE`, `--volume-dir` (durable volume root), `--ingress-config-dir`
-(Traefik file catalog), and `--reconcile-interval-secs`. Auth is on by
-default — the API token prints once on first bootstrap; `--no-auth` is for
-open lab installs. Use `--data-dir /srv/mc2` when a dedicated service user
-should own state.
+On first start the server creates the data dir and one API token. It prints
+the token once when attached to a terminal; under a service manager it writes
+it to `<data-dir>/bootstrap-token` (mode 0600) and logs the path.
+
+For a throwaway local lab, `mc2 server --no-auth` skips the token for **that
+run only**. It is refused on a non-loopback `--bind` unless you also pass
+`--allow-unauthenticated-remote`, and never allowed with `--public-hostname`.
+
+The REST API and planner work even without a hypervisor; instances then fail
+with a runtime error, which is useful for CI and for validating stack files.
 
 ## Key behaviors
 
-- **Single node, single process** in v1. There is no distributed store and no
+- **One machine, one process** in v1. There is no distributed store and no
   second node type.
-- **SQLite is the truth.** Re-apply is idempotent; the file on disk is
-  desired state, the database is the converged reality.
-- **Data-dir artifacts.** State, volumes, and the token live under the data
-  dir; back it up, don't hand-edit it.
+- **SQLite is the truth.** Your stack file is the *request*; the database
+  holds what was accepted and what was observed. Re-applying the same file
+  changes nothing.
+- **Applies are all-or-nothing.** A rejected `mc2 up` leaves the running
+  stack exactly as it was.
 - **`--public-hostname`** publishes the control plane itself through the
-  Traefik ingress catalog, so a remote install is manageable over TLS.
+  Traefik ingress catalog, so a remote server is reachable over TLS.
 
 ## Deeper
 
-- [Desired state & reconciliation](/documentation/concepts/desired-state) — the
-  loop that makes one process enough.
-- [Run the server](/documentation/operations/run-the-server) — every flag and
-  env var.
-- [Stacks](/documentation/concepts/stacks) — the document that drives it.
-- [REST API](/references/api/overview) — the control-plane contract.
+- [Desired state & reconciliation](/documentation/concepts/desired-state) —
+  how an apply becomes running microVMs, and how the loop keeps them there.
+- [Run the server](/documentation/operations/run-the-server) — every flag,
+  supervision, and backups.
+- [Identity & contexts](/documentation/concepts/identity-and-contexts) — the
+  API token and how the CLI finds a server.

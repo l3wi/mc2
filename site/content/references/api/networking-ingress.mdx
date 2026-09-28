@@ -23,8 +23,28 @@ Authorization: Bearer mc2at_...
 ```
 
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/networks | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/networks"
 ```
+
+```json
+{
+  "networks": [
+    {
+      "name": "api",
+      "kind": "default",
+      "stacks": ["api"],
+      "instances": [
+        {"instanceId": "6bee1f2c-...", "stack": "api", "service": "w", "ordinal": 0,
+         "runtimeId": "api--w--0", "phase": "Running", "healthy": false,
+         "nodeId": "422229db-...", "exposePorts": [], "ports": []}
+      ]
+    }
+  ],
+  "exposedPorts": []
+}
+```
+
+`kind` is `default` (a stack's own network) or `named`.
 
 ## GET /v1/instances/{id}/network
 
@@ -37,31 +57,31 @@ Authorization: Bearer mc2at_...
 ```
 
 Response fields: `instanceId`, `phase`, `message`, `updatedAt`, and `observed`
-(the reconcile loop's last report). Returns `404` when there is no network
-status for the instance.
+(`edges` it can reach, `exposes` it serves, `message`) — the reconcile loop's
+last report. Returns `404` when there is no network status for the instance.
 
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." \
-  http://127.0.0.1:7443/v1/instances/<id>/network | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/instances/$ID/network"
 ```
 
 ## GET /v1/ingress
 
-`GET /v1/ingress` lists the desired ingress routes derived from stack YAML and
-instance placement. Ready/file status is tracked by the server (the
-`catalog.json` under `--ingress-config-dir`).
+`GET /v1/ingress` lists the desired ingress routes derived from stack YAML
+and the chosen backend replica. Whether a route is ready (and so written to
+Traefik's file) is visible in `catalog.json` under `--ingress-config-dir`.
 
 ```
 GET /v1/ingress
 Authorization: Bearer mc2at_...
 ```
 
-The response is `{ routes, note }`. Each route carries `id`, `stack`, `host`,
-`path`, `service`, guest/host ports, `tlsEnabled`, `certResolver`, and the
-backend instance/ordinal.
+The response is `{ "routes": [...], "note": "..." }`. Each route has `id`,
+`stack`, `host`, `path`, `pathType`, `service`, `guestPort`, `hostPort`,
+`bind`, `tlsEnabled`, `certResolver`, `backendInstanceId`, `backendOrdinal`,
+and `nodeId`.
 
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/ingress | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/ingress"
 ```
 
 <Callout type="note" title="Ingress file readiness">

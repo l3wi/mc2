@@ -1,71 +1,98 @@
 ---
 title: Security overview
-description: The trust boundary between control plane, node, and guest — and what MC2 guarantees versus delegates.
+description: The trust boundary between operator, control plane, host, and guest microVMs — what MC2 guarantees and what you own.
 ---
 
-MC2's security model is best understood as three trust layers. The **control
-plane** is the `mc2 server` process — SQLite state, REST API, scheduler, and a
-reconcile loop. The **node** is the host machine it runs on. The **guest** is
-each replica microVM the server boots. Where those layers meet, and what each
-one is trusted to do, defines what MC2 protects and what you must protect
-yourself.
+MC2 runs one trusted process on one host and boots untrusted workloads as
+microVMs. Its security model follows from that shape: a small trusted core
+(`mc2 server` and the host under it), an operator who authenticates to that
+core, and guests treated as hostile from the moment they boot.
 
-## The trust boundary
+## Who's who
 
-- **Control plane** — `mc2 server` holds the operator API token, the
-  server-wide secret store, contexts, and the SQLite state. It is the only
-  process that talks to the sandboxes through the embedded microsandbox SDK.
-- **Node** — the host runs the hypervisor (`/dev/kvm` on Linux, Apple Silicon
-  HVF on macOS) and the sandbox runtime. In v1 there is a single node, and it
-  is the same machine that runs the server.
-- **Guest** — each replica is a detached microVM with its own kernel,
-  filesystem, and network boundary. Guests never share a kernel with the host
-  or with each other.
+- **Operator** — you, or anything holding the API token. The token grants
+  full control of the installation.
+- **Control plane** — the `mc2 server` process: REST API, SQLite state,
+  encrypted secret store, reconcile loop, network splices, SSH listeners, and
+  the Traefik catalog writer. It creates and manages microVMs through the
+  embedded microsandbox runtime.
+- **Host** — the machine running the server and the hypervisor (KVM on
+  Linux, Hypervisor.framework on macOS). Trusted; MC2 doesn't re-verify it.
+- **Guests** — the microVMs, each with its own kernel, root disk, and
+  network device. **Untrusted**: assume any of them can be compromised.
 
-The boundary you care about most is the guest-to-host one: a compromised
-microVM must not become a compromised host, and a compromised host must not
-silently hand your secrets to every guest.
+```text
+ operator (mc2 CLI / REST client, holds the token)
+    │ remote: HTTPS through Traefik        local: HTTP on loopback
+    ▼                                        │
+┌── host (trusted) ────────────────────────┼─────────────────────────┐
+│                                          ▼                         │
+│  Traefik (yours) ──── API ────► mc2 server  127.0.0.1:7443         │
+│  TLS, public ports              REST · SQLite · secrets · loop     │
+│        │                                │                          │
+│        │ published ports                │ microsandbox runtime     │
+│        ▼                                ▼                          │
+│  ┌── guests (untrusted) ─────────────────────────────────────────┐ │
+│  │ microVM A      microVM B      microVM C      ...              │ │
+│  │ own kernel · own root disk · own network device               │ │
+│  └───────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+The boundary that matters most is guest-to-host: a compromised microVM must
+not become a compromised host, and must reach only what it was granted.
 
 ## What MC2 guarantees
 
-- **Kernel isolation per replica.** Every replica is a microVM with its own
-  kernel — not a container sharing the host kernel. A guest escape would have
-  to cross the VMM/hypervisor boundary, not a syscall filter.
-- **Host ports bind loopback.** Published host ports are bound to the host
-  only; guests and other services cannot open arbitrary host ports, and the
-  public path in is a single controlled ingress.
-- **Secrets stay secret.** The secret store is encrypted at rest, `mc2 secret
-  ls` and the REST API return names and metadata only, and the guest never
-  receives a raw secret value — only a placeholder that is filled on
-  connections to declared `allowHosts`.
-- **A remote control plane requires https + token.** Any non-loopback API
-  endpoint is refused over plaintext unless you explicitly opt in.
+- **A kernel per replica.** Every replica is a microVM, not a container on
+  the host kernel. An escape has to cross the hypervisor boundary.
+- **Loopback host ports.** Published and exposed ports bind `127.0.0.1`.
+  Nothing listens publicly unless your Traefik does.
+- **Token-protected API.** Every `/v1` route needs the API token unless the
+  server was started with `--no-auth` (refused on non-loopback binds without
+  an extra flag, and with `--public-hostname`). Only `/health` is public.
+- **Secrets encrypted in MC2's store and never listed back.** Guests see a
+  placeholder; the real value is added to HTTP headers of requests to the
+  hosts you allow, and requests carrying it anywhere else are blocked.
+- **Fail closed.** A microVM whose service-network port has no MC2 listener
+  isn't created, an unknown egress profile is rejected, and a sandbox owned
+  by another install is never adopted or touched.
 
-## What MC2 delegates
+## Limits to know
 
-- **TLS and ACME.** MC2 writes Traefik file-provider catalogs, but the
-  certificate resolver, DNS, and TLS termination are yours to run (`--public-hostname` + a cert resolver publish the control plane through that
-  catalog).
-- **Host OS trust.** The hypervisor, host kernel, and sandbox runtime are the
-  outer security ring. MC2 does not re-verify the platform underneath it.
-- **Image provenance.** MC2 pulls and runs images from registries you
-  configure; it does not sign, pin, or verify images on your behalf.
+- **The runtime keeps a plaintext copy of secrets** in its own database
+  (`~/.microsandbox`) while a microVM exists. Protect it like the secrets key.
+- **Allowed hosts can echo secrets back** to the guest; allow only hosts you
+  trust with the value.
+- **Service networks are default-allow.** Every service on a network can
+  reach every exposed port on it. Separate networks separate services.
+- **Volumes can be shared.** Every service or replica mounting the same
+  volume sees the same files.
+- **The CLI enforces HTTPS, the server doesn't.** The server speaks plain
+  HTTP on its bind address; keep it on loopback and put TLS in front.
+
+## What you own
+
+- **TLS, ACME, and DNS.** MC2 writes Traefik routes; you run Traefik.
+- **The host.** Patch the kernel and hypervisor; restrict who can log in.
+- **Images.** MC2 doesn't sign, pin, or scan images. A malicious image is
+  code running in your microVMs.
 
 <Callout type="warning" title="You are responsible for">
-  - Running `mc2 server` as a dedicated user with a private data dir.
-  - Keeping auth on — never `--no-auth` outside a disposable loopback lab.
-  - Always https + a token for remote control planes.
-  - Backing up the data dir (it holds state, the token, and the secret-store
-    key material).
-  - Restricting who can read `~/.mc2/config.toml` and the data dir.
-  - Keeping the host and hypervisor patched, and vetting the images you run.
-  - Operating Traefik TLS/ACME and the public DNS path.
+  - Running `mc2 server` as a dedicated user that owns the data dir.
+  - Keeping auth on — `--no-auth` only for a disposable loopback lab.
+  - HTTPS for any remote control plane.
+  - Backing up `mc2.db` with `secrets.key`, and protecting both.
+  - Protecting `~/.mc2/config.toml` on clients (it holds tokens) and the
+    runtime's `~/.microsandbox` on the server.
+  - Vetting the images you run.
 </Callout>
 
-## Where to go next
+## Read next
 
-- [Isolation](/security/isolation) — microVM per replica and private-by-default storage.
-- [Secrets](/security/secrets) — encrypted-at-rest store and host-gated injection.
-- [Networking](/security/networking) — service networks, loopback host ports, remote transport.
-- [Authentication](/security/authentication) — the operator token, local vs remote modes.
-- [Hardening checklist](/security/hardening) — the production checklist.
+- [Isolation](/security/isolation) — what separates guests from the host and
+  from each other.
+- [Secrets](/security/secrets) — encryption, injection, and key handling.
+- [Networking](/security/networking) — what a guest can reach.
+- [Authentication](/security/authentication) — the API token.
+- [Hardening checklist](/security/hardening) — for production.

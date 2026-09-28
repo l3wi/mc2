@@ -26,8 +26,11 @@ and converges instances toward it.
   there is no half-applied state.
 - **The file is the whole desired state.** A service you deleted from the YAML
   is torn down on the next `up`, and a lower `scale` deletes the replicas
-  above the new count. Replicas that remain keep their identity, host ports and
-  placement. `up` never deletes named volumes — that is `down`'s job.
+  above the new count. Replicas that remain keep their identity and
+  placement; an unchanged automatic port stays the same, while an edited
+  fixed port moves. Any create-time change recreates the microVM (files
+  outside volumes are lost). `up` never deletes named volumes — that is
+  `down`'s job.
 - **`name` is optional.** If the stack file omits `name:`, it is filled in
   from the file path, sanitized to the stack-name grammar (lowercased,
   `.`/spaces → `-`, `--` collapsed, ≤ 40 characters); a file literally named
@@ -65,7 +68,10 @@ mc2 rm demo --volumes
 
 ## config
 
-`mc2 config -f <file>` validates a stack file and prints the normalized config.
+`mc2 config -f <file>` validates the stack schema locally and prints the YAML
+`mc2 up` would send — with a missing `name` filled in from the file name, but
+otherwise as written (service defaults aren't expanded). Server-side checks —
+capacity, disk budget, ports, host profile — only happen on `mc2 up`.
 
 | Arg | Meaning |
 | --- | ------- |

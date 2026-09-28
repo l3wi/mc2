@@ -1,26 +1,27 @@
 ---
 title: Metrics backends
-description: Export mc2.server.* and mc2.node.* metrics over OTLP to a collector, and point the sandbox metrics sidecar at the same collector for one view.
+description: Send MC2's OTLP metrics to an OpenTelemetry collector, scrape them with Prometheus, and chart them in Grafana.
 ---
 
 ## What you'll build
 
-Send MC2 control-plane metrics to an OpenTelemetry collector with
-`MC2_OTLP_ENDPOINT`, then point the microsandbox metrics sidecar (msb-metrics)
-at the same collector so control-plane and sandbox metrics land in one
-pipeline.
+An OpenTelemetry collector that receives MC2's metrics over OTLP and
+re-exports them for Prometheus, which Grafana can then chart.
 
-<Warning title="Under development">
-UNDER DEVELOPMENT: the collector configuration is retained here, but this
-example does not yet include a complete start-and-verify workflow.
-</Warning>
+```text
+ mc2 server ──OTLP :4317──► collector ──:8889──► Prometheus ──► Grafana
+                            (debug log)        (scrapes)      (queries)
+```
 
-## The stack
+MC2 exports its own metrics: applies, reconcile passes, instance counts by
+phase, and per-instance disk use. Per-sandbox CPU, memory, and network come
+from microsandbox's own metrics component, configured separately (see
+[Observability](/documentation/concepts/observability)).
 
-This recipe's "stack" is the OTLP pipeline. MC2 exports control-plane metrics
-(`mc2.server.*`, `mc2.node.*`) when `MC2_OTLP_ENDPOINT` (or
-`OTEL_EXPORTER_OTLP_ENDPOINT`) is set. The collector config lives in the
-examples tree at `examples/90-advanced/observability/collector-config.yaml`:
+## The collector config
+
+Save as `collector-config.yaml` (the same file is in the repository at
+`examples/90-advanced/observability/collector-config.yaml`):
 
 ```yaml
 receivers:
@@ -55,76 +56,107 @@ service:
       exporters: [debug, prometheus]
 ```
 
-The collector accepts OTLP on gRPC `:4317` and HTTP `:4318`, prints metrics to
-its debug exporter, and re-exports a Prometheus scrape endpoint on `:8889`.
-
 ## Run it
 
 <Steps>
+
 <Step title="Start the collector">
 
-```bash
-otelcol --config examples/90-advanced/observability/collector-config.yaml
-```
-
-Or with Docker:
+With Docker, publishing only on loopback:
 
 ```bash
-docker run --rm -p 4317:4317 -p 4318:4318 \
-  -v "$PWD/examples/90-advanced/observability/collector-config.yaml:/etc/otelcol/config.yaml" \
-  otel/opentelemetry-collector:latest
+docker run --rm --name mc2-otel \
+  -p 127.0.0.1:4317:4317 -p 127.0.0.1:4318:4318 -p 127.0.0.1:8889:8889 \
+  -v "$PWD/collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+  otel/opentelemetry-collector-contrib:latest
 ```
+
+Or natively: `otelcol-contrib --config ./collector-config.yaml`. (The
+`prometheus` exporter is in the *contrib* distribution.)
 
 </Step>
-<Step title="Point MC2 at the collector">
 
-Set the endpoint before booting the server:
+<Step title="Start MC2 with the endpoint">
+
+The endpoint is read once at startup, so restart the server with it set:
 
 ```bash
 export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
-mc2 server --no-auth
+mc2 server
 ```
 
-`MC2_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` are both honored.
+The log should show:
+
+```text
+INFO mc2_metrics: OTLP metrics export enabled service="mc2-server" endpoint=http://127.0.0.1:4317
+```
 
 </Step>
-<Step title="Point the sandbox sidecar at the same collector">
 
-Sandbox CPU/mem/net stay on msb-metrics — point that sidecar at the same
-collector if you want one pipeline. The resource processor tags both with
-`collector=mc2-lab`; the attributes include `service.name: mc2-server |
-msb-metrics`.
+<Step title="Generate some activity">
+
+Apply any stack, e.g. `hello.yaml` from the
+[Quickstart](/documentation/quickstart). Metrics are exported every 15 s.
 
 </Step>
+
+<Step title="Check the collector">
+
+```bash
+curl -s http://127.0.0.1:8889/metrics | grep '^mc2_lab' | cut -d'{' -f1 | sort -u
+```
+
+```text
+mc2_lab_mc2_instance_disk_limit_mib
+mc2_lab_mc2_instance_disk_used_mib
+mc2_lab_mc2_node_reconciles_total
+mc2_lab_mc2_server_applies_total
+mc2_lab_mc2_server_instances
+mc2_lab_mc2_server_nodes_ready
+mc2_lab_mc2_server_nodes_total
+mc2_lab_mc2_server_schedule_binds_total
+```
+
+`mc2_lab_mc2_node_reconcile_errors_total` appears once a pass has failed.
+`mc2_lab_mc2_server_instances` carries a `phase` label; the disk gauges
+carry `instance` and `target` (`root-disk` or `volume:<name>`).
+
+</Step>
+
 </Steps>
 
-## Verify
+## Prometheus and Grafana
 
-Confirm the endpoint is picked up:
+The collector's `:8889/metrics` is a **scrape target**, not something
+Grafana can query directly. Point Prometheus at it:
 
-```bash
-mc2 version
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: mc2
+    static_configs:
+      - targets: ["127.0.0.1:8889"]
 ```
 
-reports `otlp endpoint: http://127.0.0.1:4317`. The server exports control-plane
-metrics: `mc2.server.*` (`applies`, `schedule_binds`, `instances`, …) and
-`mc2.node.*` (`reconciles`, `reconcile_errors`, …).
+Then add Prometheus (e.g. `http://localhost:9090`) as a data source in
+Grafana. Useful queries:
 
-Check the collector's Prometheus export:
-
-```bash
-curl -s http://127.0.0.1:8889/metrics | grep mc2_
+```text
+rate(mc2_lab_mc2_node_reconciles_total[5m])            reconcile throughput
+increase(mc2_lab_mc2_node_reconcile_errors_total[1h])  failed passes
+sum by (phase) (mc2_lab_mc2_server_instances)          instances per phase
+mc2_lab_mc2_instance_disk_used_mib
+  / mc2_lab_mc2_instance_disk_limit_mib                disk fill ratio
 ```
 
 ## Notes
 
-- For Grafana, add a Prometheus data source that scrapes the collector's
-  endpoint (`http://<collector-host>:8889/metrics`), namespace `mc2_lab`.
-- MC2 exports control-plane metrics only; sandbox CPU/mem/net live on the
-  msb-metrics sidecar. Pointing both at one collector gives you a unified
-  view.
-- The example is `UNDER DEVELOPMENT` — the collector config exists, but there
-  is no complete start-and-verify workflow yet. Treat this recipe as a lab
-  setup.
-- Start the server after setting `MC2_OTLP_ENDPOINT`; the endpoint is read at
-  process startup.
+- **Environment only.** MC2 reads `MC2_OTLP_ENDPOINT`, then
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, then `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`;
+  there's no command-line flag. The exporter speaks OTLP over gRPC.
+- **`mc2 version` isn't proof.** It shows the endpoint set in *your* shell,
+  not what the running server uses; check the server log line above.
+- **Alert on disk.** A fill ratio near 1 means writes are about to fail with
+  `No space left on device`.
+- **Labels.** Series arrive with `job="mc2-server"` (from the OTLP resource's
+  `service.name`), plus the collector's `collector="mc2-lab"` attribute.

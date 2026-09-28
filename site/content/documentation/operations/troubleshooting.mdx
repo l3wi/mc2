@@ -1,74 +1,179 @@
 ---
 title: Troubleshooting
-description: mc2 doctor, common failures, and platform notes.
+description: Symptom → cause → fix for the real MC2 error messages, plus mc2 doctor and platform notes.
 ---
 
-Start with `mc2 doctor` — it checks the hypervisor, the `msb` CLI (optional),
-and expected paths, and names exactly what is missing.
+Start with `mc2 doctor`. It's a quick host check: `/dev/kvm` exists (Linux)
+or the Mac is Apple Silicon, plus the configured OTLP endpoint. It exits `1`
+only for a missing KVM device or an unsupported platform. It doesn't test KVM
+permissions, boot a VM, or contact the OTLP collector — a server that starts
+and runs the quickstart is the real test.
 
 ```bash
 mc2 doctor
+mc2 status          # control plane up? counts, host + reserved resources
+mc2 ps              # instance phases and disk NOTES
 ```
 
-## Common failures
+## Where a failure surfaces
 
-| Symptom | Likely cause | Fix |
+`mc2 up` fails at the **first** layer that objects; nothing is written until
+the whole plan passes, so a rejected apply leaves the running stack untouched.
+
+```text
+ mc2 up ──► server: parse + validate ──► plan: capacity, ports ──► commit
+                 │                           │
+                 └──── rejected: HTTP 400, nothing changes ◄───┘
+
+ reconcile loop ──► create / start microVM ──► instance Failed + message
+                                                (image, hypervisor, secret)
+ guest ──► writes past a disk cap ──► "No space left on device"
+```
+
+## `mc2 up` returns 400 (apply refused)
+
+### Stack document & names
+
+| Symptom (server message) | Cause | Fix |
 | --- | --- | --- |
-| Instance reports `Failed` with an image error | Image name/tag not found, or the image lacks a shell for `command` | Check `mc2 logs <instance>` for the pull/boot error; fix the `image:` reference or provide an explicit `command`. |
-| Instance reports `Failed` immediately | No hypervisor, or the sandbox could not boot | `mc2 doctor`; ensure KVM/HVF is available and your user can open `/dev/kvm`. |
-| `mc2 up` returns `400` with `unknown field …` | Non-canonical key (e.g. k8s-style `apiVersion`, `replicas`, `env:`) | Remove the key; see [Stack YAML](/references/stack/overview). |
-| Host port already in use | Cross-service conflict | Published host ports are effectively unique server-wide; change the port or remove the conflicting service. |
-| `mc2 up` returns `400` naming another stack for an exposed port | That stack already claims the `expose` port — ports are exclusive server-wide | Use the suggested port and update the client's connection string; see [Ports & expose](/references/stack/ports-expose). |
-| `mc2 up` returns `400` `already in use by another process` for an exposed port | A host process listens on that loopback port | Stop it, or expose a different port (the listener is held for the claim's lifetime). |
-| `mc2 up` returns `400` `privileged` for an exposed port (Linux) | The port is below `net.ipv4.ip_unprivileged_port_start` | Grant `CAP_NET_BIND_SERVICE` (`setcap`, or systemd `AmbientCapabilities`), lower the threshold, or pick a port above 1023. |
-| Writes inside the VM fail with `No space left on device` | The service filled its root disk, or a volume hit its `size` quota | `mc2 exec <ref> -- df -h` to see which. Raise `storage_opt.size` (root disk; the VM is recreated and files outside volumes are lost) or the volume's `size` (data is kept), then `mc2 up -f stack.yaml`. `mc2 ps` shows the same condition in `NOTES`. |
-| `mc2 up` returns `400` `volume "data" already holds …; size: … is smaller` | The declared volume `size` is below what the directory already holds | Free space (`mc2 exec <ref> -- du -sh /data/*`), or set a `size` at least as large as the current usage. |
-| `mc2 up` returns `400` `disk reservation would reach …` | The stacks' declared volume sizes plus root disks × replicas exceed `--limit-disk-mib` | Raise `--limit-disk-mib`, or lower `volumes.<name>.size` / `services.<name>.storage_opt.size` / `scale`. |
-| `mc2 up` returns `400` `disk reservation would reach …` for a stack with no `size` fields | Defaults count too: 10 GiB per volume and 4 GiB per replica | Make the budget cover the defaults, or declare smaller sizes explicitly. |
-| `Failed` with `no listener on 127.0.0.1:P` | The port claim could not bind, so the VM was failed closed (its egress rule is create-time) | Resolve the port conflict and re-apply; `mc2 network` shows the claim owners. |
-| Remote `http://` refused | Remote mode requires https + token | Use `https://`, or explicitly opt in with `--allow-insecure-http`. |
-| `mc2 status` shows the wrong mode | Context or env points elsewhere | Check `mc2 context ls`; resolution is flags > env > context > current > loopback. |
+| `unknown field …` / `unknown key …` | A non-canonical key (e.g. k8s-style `apiVersion`/`kind`/`metadata`, or `env:` instead of `environment:`). Unknown keys are rejected everywhere. | Remove the key; see [Stack YAML overview](/references/stack/overview). |
+| `invalid stack name "…": must match [a-z0-9]([a-z0-9_-]*[a-z0-9])? and must not contain '--'` | Upper case, a leading/trailing `-`/`_`, `--`, or a disallowed character. | Use the suggested name from the error. Stack names are ≤ 40 chars; service/network names ≤ 63. |
+| `invalid volume name "…"` | A volume name that fails `[a-z0-9][a-z0-9._-]*`, contains `--`, or ends in `-`. | Rename the volume. |
+| `service X: network.profiles value "…" is not supported` | A profile outside the closed set `public \| private \| host \| none` (the old `local`/`any` aliases are gone). | Use one of the four; `none` must be the only entry. |
+| `service X: network.profiles [host] gives the guest the whole host loopback …` | `host` is refused unless the server allows it. | Re-run the server with `--allow-host-profile`, or use `private`/`none`. |
+| `cpus must be a whole number of vCPUs (got 0.5): … use 1` | A fractional `cpus`. | Use whole vCPUs; the message suggests the nearest ones. |
+| `service X: cpus must be between 1 and 255 (got …)` | `cpus` outside the range. | Use 1–255. |
+| `service X: restart must be no\|on-failure\|always\|unless-stopped` | Unknown restart policy. | One of the four. |
+| `invalid hostname …` / `pathType must be Prefix\|Exact` | An ingress host/path that fails validation (hosts are lowercase RFC 1123, no wildcard/port). | Fix the `ingress:` block; see [Networks & ingress](/references/stack/networks-ingress). |
+
+### Ports, claims & the host
+
+| Symptom (server message) | Cause | Fix |
+| --- | --- | --- |
+| `expose port P (stack/service) is already claimed by other/service; exposed guest ports are exclusive server-wide` | Another stack already owns that `expose` port. Claims are exclusive and stored in the database. | Use the suggested port and update the client connection string; see [Ports & expose](/references/stack/ports-expose). |
+| `host loopback port P is already in use by another process (it answers on 127.0.0.1:P)` | A host process is listening on that loopback port. | Stop it, or expose a different port — MC2 holds the listener for the claim's lifetime. |
+| `host loopback port P is privileged: binding it needs CAP_NET_BIND_SERVICE …` (Linux) | An `expose` port below 1024 by a non-root server. | `sudo setcap cap_net_bind_service=+ep "$(command -v mc2)"`, systemd `AmbientCapabilities=CAP_NET_BIND_SERVICE`, lower `net.ipv4.ip_unprivileged_port_start`, or pick a port ≥ 1024. |
+| `published host port P for ports target T (replica N) is already taken by another expose or publish in this cluster` | Another stack (or an `expose`) already uses that host port. | Change the `published` port, or `mc2 down` the stack holding it. |
+| `published host port P (from Q + replica N) is already assigned to another entry in this stack` | Two `ports:` entries in this stack land on the same host port (often a fixed port plus `scale`). | Space the fixed ports at least `scale` apart. |
+| `published host port P + replica N exceeds the host port range (0–65535)` | A fixed `published: P` with `scale: N` runs past 65535. | Lower the published port or the scale. |
+| `no free host port for automatic allocation (10000–65535 exhausted)` | Every auto-pool port is taken. | Publish a fixed port or free one. |
+| `refusing apply: disk reservation would reach … MiB (limit … MiB)` | Volume sizes + root disks × replicas exceed `--limit-disk-mib`. The breakdown shows where the budget went. | Raise `--limit-disk-mib`, or lower `volumes.<name>.size` / `storage_opt.size` / `scale`. Defaults count too (10 GiB/volume, 4 GiB/replica). |
+| `volume "data" already holds X; size: Y is smaller` | Shrinking a volume below its current usage — every later guest write would fail. | See what's using it (`mc2 exec <ref> /bin/sh -c 'du -sh /data/*'`) and delete files in the guest, or choose a `size` at least as large as the usage. |
+| An apply refused for **capacity** | Declared CPUs/RAM exceed `--limit-cpus` / `--limit-memory-mib`, or the host's real capacity. | Lower the stack's `cpus`/`mem_limit`/`scale`, or raise the budget. A `restart: no` instance that has stopped releases its reservation; others keep it. |
+
+## An instance is `Failed`
+
+`mc2 ps` shows phases and disk notes; the failure reason is the instance's
+`message` in `mc2 ps -o json`. `mc2 logs <ref>` shows the guest's output.
+
+If the desired state can't be resolved (a missing secret or SSH key), MC2
+marks the instance `Failed` and keeps any existing microVM as it is. A
+failure on first create may leave no VM at all, and a `restart` policy
+recreates failed VMs — don't count on files outside volumes surviving.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `Failed` with an image/pull or boot error | Image name/tag not found, no shell for `command`, or no hypervisor. | Fix the `image:`/`command:`; on Linux ensure `/dev/kvm` is openable (often the `kvm` group); on macOS use Apple Silicon (HVF). |
+| `Failed`, message mentions a **missing secret** | The service declares `secrets: [{name, …}]` but the secret was never set. | `mc2 secret set <name>`; only that instance fails — the rest of the node keeps converging. |
+| `Failed` with `network: no listener on 127.0.0.1:P (…); not starting — the egress rule is create-time` | A consumer's allowed port has no MC2 listener (a bind failed, or the owner isn't scheduled), so the VM is **failed closed** rather than risk reaching a foreign process. | Resolve the port conflict and re-apply; `mc2 network` shows the claim owners. |
+| `Failed` with an SSH resolution error | A declared SSH endpoint could not be set up (e.g. no registered keys). | `mc2 ssh keys`, add keys with `mc2 ssh add-key`, then re-apply. |
+| `Failed`: `sandbox name <stack>--<svc>--<n> is already taken by another MC2 install (mc2.install=…)` | microsandbox's store is shared by everything on the host, and another MC2 data dir (or an old test server) owns a sandbox with the same name. MC2 never touches it. | `mc2 down` that stack from the install that owns it (start it with its `--data-dir`), or rename your stack. The instance starts on the next pass once the name is free. |
+| `Running`, but the service doesn't answer | The server process died inside a VM that is still up — MC2 watches the VM, not your process. | Add a `healthcheck` that exercises the service; failing it past `retries` restarts the replica under a `restart` policy. |
+| Replica keeps going `Creating` → `Running` → `Creating` | A health check fails while the service is still starting, so every recreate is killed again (with growing backoff). | Set `healthcheck.start_period` longer than the service's startup time. |
+| Guest request fails (`wget: error getting response: Invalid argument`) | The request carried a secret placeholder (`$MSB_…`) to a host not in that secret's `allowHosts`, so the proxy refused it. | Add the host to `allowHosts`, or don't send the secret there. |
+
+## Writes fail with `No space left on device`
+
+Either the VM root disk or a named volume hit its cap. The `mc2 ps` `NOTES`
+column and the message on `mc2 exec`/`mc2 ssh open`/`mc2 logs` name which one,
+with the exact `stack.yaml` fix:
+
+```bash
+mc2 ps                                          # NOTES: root disk full / volume data 90%
+mc2 exec <ref> df -h                            # guest view of the caps
+mc2 exec <ref> /bin/sh -c 'du -sh /data/*'      # what filled a volume
+```
+
+Volume usage is re-measured at most once a minute, so `NOTES` can lag a
+fresh write by up to a minute.
+
+- **Root disk** (`storage_opt.size`, default 4 GiB): raise it and re-apply. The
+  VM is **recreated** — files outside volumes are not kept. The suggested size
+  is 2× the declared size.
+- **Volume** (`volumes.<name>.size`, default 10 GiB): raise it and re-apply.
+  Data is **kept**, the VM restarts. Or free space in the guest.
+
+Thresholds: ≥ 90 % used warns; ≥ 99 % used or < 64 MiB free is full. The server
+logs each transition and exports `mc2.instance.disk_{used,limit}_mib`.
+
+## Auth & connectivity
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `401 Unauthorized: unauthorized: missing or invalid bearer token` | No/incorrect token for a remote or non-default control plane. | Export `MC2_API_KEY`, pass `--token`, or set the context token with `mc2 context set <name> --api <url> --token <key>`. |
+| `refusing to use plaintext http:// for a remote control plane (…): … Use https:// … or set --allow-insecure-http` | A non-loopback URL over `http://`. | Use `https://` (e.g. through Traefik), or explicitly opt in with `--allow-insecure-http` / `MC2_ALLOW_INSECURE_HTTP=1`. |
+| `GET /health` returns `503` with a `reason` | The reconcile loop is dead or hasn't completed a **successful** pass within `3 × interval + 30 s`. | Check the server logs for the failing task; a dead critical task makes the process exit non-zero so its supervisor restarts it. If it's up but not converging, look for store errors in the logs. |
+| `down failed: 404 Not Found: stack not found: <name>` | The stack was already removed (or the name is wrong). | Nothing to do. To delete its retained volumes, re-apply the stack first, then `mc2 down <name> --volumes`. |
+| `mc2` talks to the wrong server / wrong mode | `--api`/`--token`/`--context` or env vars point elsewhere. | The URL and the token resolve separately: flag > env var > context > default. `mc2 status` prints the URL and context in use; `mc2 context ls` lists contexts. |
+| Commands hit `127.0.0.1:7443` after `mc2 context set` | `context set` saves a context but doesn't switch to it. | `mc2 context use <name>`. |
+| `context 'x' not found (available: …)` | The named context does not exist. | `mc2 context ls`, then `mc2 context set`. |
+
+## The server won't start
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `secrets key <path> is missing, but the database <path> already holds N stored secret(s)` | `secrets.key` was deleted or the database was restored without its key. The server refuses to silently re-key. | Restore the original `secrets.key`, or — if the values are truly gone — `mc2 server secrets purge --data-dir <dir> --yes`, start, and `mc2 secret set` again. |
+| `secrets key <path> is a symlink; refusing to use it` | The key path is a symlink. | Point `--secrets-key-path` at the real file (or copy it there). |
+| Key world-readable | `secrets.key` mode allows others to read it (group-readable only warns). | `chmod 600 <key-path>` — don't change its contents. |
+| Key too short | `secrets.key` is under 32 bytes (truncated or replaced). | Restore the original key from backup. If it's truly lost, `mc2 server secrets purge --data-dir <dir> --yes`, remove the bad key file so startup generates a new one, then set the secrets again. |
+| Startup refuses `--no-auth` | `--no-auth` needs a loopback `--bind` (or `--allow-unauthenticated-remote`), and is always refused with `--public-hostname`. | Fix the combination, or enable auth. |
+| Startup refuses `--public-hostname` / `--public-tls-cert-resolver` | The hostname isn't exact lowercase RFC 1123, or the resolver isn't `[A-Za-z0-9_-]+`. | Correct the values. |
+
+## SSH
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| A new SSH connection is closed immediately | The global `--max-ssh-sessions` (64) or per-listener `--max-ssh-sessions-per-listener` (16) cap is reached. | Close idle sessions or raise the caps. |
+| Handshake times out | More than 30 s elapsed before the transport handshake completed. | Check the client and network; there is **no idle timeout**, so a quiet but connected session stays open. |
+| `mc2 ssh open` fails with no key | `--key` was given an unregistered name, or `ssh: true` with no registered keys (fails closed). | `mc2 ssh add-key <name> --file key.pub`, then retry. |
 
 ## Platform notes
 
 ### Linux (KVM)
 
-- Ensure your user can open `/dev/kvm` — this often means being in the `kvm`
-  group: `sudo usermod -aG kvm $USER` and re-login.
-- Nested virtualization is required if MC2 runs inside a VM without
-  passthrough; `mc2 doctor` reports it.
+- Your user must be able to open `/dev/kvm`; often that means the `kvm` group:
+  `sudo usermod -aG kvm $USER` and re-login.
+- Running MC2 inside a VM needs nested virtualization (or passthrough);
+  `mc2 doctor` reports `/dev/kvm`.
 
 ### macOS (Apple Silicon / HVF)
 
-- arm64 is first-class. Intel Macs are out of scope for the MVP.
-- If the hypervisor check fails, confirm the machine is Apple Silicon and the
-  app is running natively (not under Rosetta for the virtualization layer).
+- arm64 is first-class; Intel Macs are out of scope.
+- If the hypervisor check fails, confirm Apple Silicon and that the binary runs
+  natively (not Rosetta).
 
 ### Hypervisor present but nothing boots
 
-The REST/scheduler side serves without a hypervisor — instances just fail
-with a runtime error. Check `mc2 ps` for the `Failed` reason and `mc2 logs
-<instance>` for the runtime/kernel logs.
+The REST/control side serves fine without a hypervisor — instances simply fail
+with a runtime error. Read the instance's `message` in `mc2 ps -o json` and the
+guest logs via `mc2 logs <ref>`.
 
 ## Where to look next
 
-- **Instance detail:** `mc2 ps` phases + `mc2 logs <instance>` (add
-  `--follow`).
-- **Network:** `mc2 network` / `mc2 network <name>` / `mc2 network
-  <stack>/<service>/<ordinal>`.
-- **Ingress:** `mc2 ingress`, the catalog JSON in `--ingress-config-dir`, and
-  your Traefik logs.
-- **Tests:** the repo's test strategy separates CI (no hypervisor) from lab
-  (real microVMs) — see the repo `tests/` README.
+- **Instance detail:** `mc2 ps` phases + `mc2 logs <ref>` (add `--follow`).
+- **Network:** `mc2 network`, `mc2 network <name>`, `mc2 network <stack>/<service>/<ordinal>`.
+- **Ingress:** `mc2 ingress`, the catalog under `--ingress-config-dir`, and your Traefik logs.
+- **Server:** `GET /health`, `mc2 status`, and the service's logs (for
+  example `journalctl -u mc2`). A 500 from the API is logged with its full
+  cause.
 
 <Callout type="tip" title="Report a bug">
-  Include `mc2 doctor` output, `mc2 status`, `mc2 ps`, and the failing
-  instance's logs when opening an issue at
-  https://github.com/l3wi/mc2.
+  Include `mc2 doctor`, `mc2 status`, `mc2 ps`, and the failing instance's logs
+  when opening an issue at https://github.com/l3wi/mc2.
 </Callout>
 
 ## Deeper
 
-- [Run the server](/documentation/operations/run-the-server) — flags and
-  health reporting.
+- [Run the server](/documentation/operations/run-the-server) — flags, health, and limits.
+- [Upgrade & migrate](/documentation/operations/upgrade-and-migrate) — key and state recovery.
 - [Stack validation](/references/stack/overview) — the 400-error cases.

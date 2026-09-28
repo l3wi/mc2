@@ -3,10 +3,11 @@ title: Stacks
 description: The Compose-shaped desired-state document you hand to MC2.
 ---
 
-A **stack** is the desired-state document `mc2 up -f <file>` sends to the
-server. It is Docker-Compose-shaped: a top-level `name` plus a `services`
-map, with `volumes`, `networks`, and `ingress` as top-level declarations.
-Everything is declared in one git-committable YAML file.
+A **stack** is the document `mc2 up -f <file>` sends to the server: one YAML
+file that describes a set of services and everything they need. It is shaped
+like Docker Compose — a top-level `name` and a `services` map, plus optional
+top-level `volumes`, `networks`, and `ingress`. Keep it in git next to your
+code.
 
 ## The analogy
 
@@ -18,7 +19,7 @@ file describes a desired state that is reconciled, not a run-once recipe.
 ## The shape
 
 ```yaml
-name: shop                        # required (else derived from the file name)
+name: shop                        # optional: defaults from the file name
 volumes:
   data:
     kind: dir
@@ -29,12 +30,16 @@ networks:
 services:
   db:
     image: postgres:16
+    command: ["postgres"]         # MC2 doesn't run the image's CMD by default
+    environment:
+      POSTGRES_PASSWORD: lab-only
     expose: [5432]
     volumes:
       - name: data
         target: /var/lib/postgresql/data
   web:
-    image: alpine:3.20
+    image: python:3.12-alpine
+    command: ["python", "-m", "http.server", "8000"]
     ports:
       - "8080:8000"
 
@@ -55,9 +60,39 @@ services:
     image: alpine:3.20
 ```
 
-`mc2 up` fills the missing `name` from the sanitized file stem (or the parent
-directory when the stem is the generic `stack`), and defaults `scale`, `cpus`,
-`mem_limit`, `restart`, `command`, and the network profile.
+`mc2 up` fills a missing `name` from the file name (`shop.yaml` → `shop`, or
+the parent directory when the file is called `stack.yaml`), and defaults
+`scale`, `cpus`, `mem_limit`, `restart`, `command`, and the network profile.
+Run `mc2 config -f <file>` to see the normalized result without applying it.
+
+## What a stack becomes
+
+Each service turns into one **instance** per replica, and each instance is
+one microVM. The stack name prefixes everything, so two stacks never collide:
+
+```text
+stack "shop"
+├── service db            ──► instance shop/db/0    microVM shop--db--0
+├── service web (scale 2) ──► instance shop/web/0   microVM shop--web--0
+│                         ──► instance shop/web/1   microVM shop--web--1
+├── network shop          (implicit; every service joins it)
+└── volume data           ──► directory <volume root>/mc2-shop--data
+```
+
+You refer to an instance as `stack/service/ordinal` in the CLI
+(`mc2 logs shop/web/1`).
+
+## One file is the whole stack
+
+The file you apply is the complete desired state for that stack, not a
+patch:
+
+- A service you delete from the file is removed by the next `mc2 up`.
+- A lower `scale` removes the highest-numbered replicas.
+- An apply that fails validation or planning changes **nothing** — the
+  running stack stays as it was.
+
+Other stacks are untouched: an apply only ever changes the stack it names.
 
 ## Names
 
@@ -67,9 +102,9 @@ capped at 40 characters (stack) and 63 (service, network). Volume names allow
 `.` as well, cap at 63, and must not contain `--` or end with `-`. An invalid
 name is rejected at apply (or `mc2 config`) with a suggested replacement.
 
-Names are also the runtime identity: MC2 derives each sandbox as
-`{stack}--{service}--{ordinal}` and each volume directory as
-`mc2-{stack}--{volume}`, so two stacks can never collide on the same name.
+Names are also the runtime identity (see the tree above), which is why they
+are restricted: `--` is reserved as the separator in `{stack}--{service}--{ordinal}`
+and `mc2-{stack}--{volume}`.
 
 ## Canonical parsing
 
@@ -93,17 +128,17 @@ references to unknown services, unknown conditions, or cycles.
 
 ## Key behaviors
 
-- **Defaults are applied, not required.** The parser fills sensible defaults
-  so partial files work, then normalizes.
-- **`name` is the stack's identity.** `mc2 down <name>` targets it; the name
-  also namespaces the stack's default network and volumes.
-- **The file is the source of desire, not truth.** Reality lives in SQLite;
-  re-applying converges.
+- **Defaults are applied, not required.** Partial files work; the server
+  normalizes them and stores the result.
+- **`name` is the stack's identity.** `mc2 down <name>` targets it; it also
+  names the stack's default network and prefixes its volumes.
+- **The file is the request, not the record.** What was accepted and what is
+  running lives in the server's database; re-applying converges.
 
 ## Deeper
 
+- [Services & instances](/documentation/concepts/services-and-instances) —
+  what each service entry controls.
 - [Stack YAML reference](/references/stack/overview) — every key and default.
-- [Run your first stack](/documentation/guides/run-your-first-stack) — apply,
-  inspect, tear down.
 - [Migrate from Docker Compose](/recipes/compose-to-mc2) — port an existing
   compose file.

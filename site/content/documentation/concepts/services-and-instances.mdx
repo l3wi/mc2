@@ -1,113 +1,184 @@
 ---
 title: Services & instances
-description: Replicas, restart policies, health, and startup ordering.
+description: Replicas, phases, restart policies, health checks, startup ordering, and resources.
 ---
 
-A **service** is a named description of a workload in a stack. An
-**instance** is one replica of that service — one detached microVM. MC2
-schedules instances, runs them through a phase model, and keeps them alive
-according to the service's restart policy.
+A **service** is a named workload in a stack: an image plus how to run it. An
+**instance** is one replica of that service, and every instance is its own
+microVM. MC2 creates instances, tracks each one through a set of phases, and
+keeps them alive according to the service's restart policy and health check.
 
 ## The analogy
 
 Like a Compose service, but each replica is a separate hardware-isolated
-microVM with its own kernel, and the service is a *desired state* that MC2
-keeps converged rather than a one-shot run.
+microVM with its own kernel, and the service is desired state that MC2 keeps
+converged rather than a one-shot run.
 
-## Phases
+## Replicas and addressing
 
-Instances move through a simple phase model, visible in `mc2 ps`:
-
-| Phase | Meaning |
-| --- | --- |
-| `Pending` | Scheduled but not yet running — a first start waiting on `depends_on`. |
-| `Running` | Sandbox booted; service command running. |
-| `Failed` | Could not start or stay healthy; a reason is shown. |
-
-With a `restart` policy, a failed or stopped instance is removed and
-recreated instead of being left `Failed`. Repeated restarts are spaced by a
-backoff (`2s`, `5s`, `15s`, then `30s`), reset after `60s` of continuous
-`Running` — including restarts the runtime performs on a crashed sandbox
-itself.
-
-## Service keys
-
-- **`scale`** — replica count. `scale: 3` creates three instances. With
-  published ports, each replica gets a distinct host port: a fixed
-  `published: P` becomes the block `P, P+1, …, P+N-1` (ordinal 0 keeps `P`);
-  target-only ports get distinct auto-allocated ports. Allocations are stable
-  across re-applies.
-- **`restart`** — `no` | `on-failure` | `always` | `unless-stopped`. Drives
-  node restart/recreate on failure. Every restart attempt is spaced by the
-  backoff schedule (`2s`, `5s`, `15s`, then `30s`), and the counter resets after
-  `60s` of continuous `Running`, so a crash loop cannot restart on every
-  reconcile pass.
-- **`command`** — guest argv as a list or a shell-split string. Omitted
-  defaults to `sleep infinity` so a shell-less image stays alive.
-- **`cpus` / `mem_limit`** — whole vCPUs (`1`–`255`; fractions are rejected)
-  and guest memory (`512m`, `1g`, `1.5g`, or bytes).
-- **`depends_on`** — startup ordering; see below.
-- **`healthcheck`** — exec health probe that gates health.
-
-## Addressing instances
-
-Everywhere a command wants an instance, you can pass a UUID **or** the
-human-readable `<stack>/<service>/<ordinal>` form:
+`scale: N` creates N instances, numbered from `0` (the **ordinal**). Refer to
+one as `stack/service/ordinal` anywhere the CLI wants an instance (the
+instance UUID works too):
 
 ```bash
-mc2 exec shop/web/0 /bin/sh -c 'echo hi'
+mc2 exec shop/web/0 cat /etc/os-release
 mc2 logs shop/web/2 --tail 20
 ```
 
-## Health-gated startup
+Each replica gets its own microVM, root disk, and host ports. A fixed
+`published: 8080` with `scale: 3` becomes ports 8080, 8081, 8082; target-only
+ports get distinct automatic ports. Allocations stay stable across
+re-applies. Lowering `scale` removes the highest ordinals.
 
-`depends_on` lets a service wait until a dependency is *healthy*, not just
-started:
+## Phases
+
+`mc2 ps` shows each instance's phase:
+
+```text
+ Pending ──► Scheduled ──► Creating ──► Running
+                              │            │
+                              ▼            ▼
+                            Failed      Stopped / Failed
+                              │            │
+                              └──► restart policy ──► Creating
+```
+
+| Phase | Meaning |
+| --- | --- |
+| `Pending` | Accepted, not started yet — for example waiting on `depends_on` (the message says which dependency). |
+| `Scheduled` | Placed on the server; the reconcile loop will create it on its next pass. |
+| `Creating` | The microVM is being created and booted, or a restart is waiting out its backoff. |
+| `Running` | The microVM is up and its command is running. |
+| `Stopped` | The command exited. |
+| `Failed` | It couldn't start, crashed, or failed its health check; `mc2 ps` shows the reason. |
+
+## Restart policies
+
+`restart` decides what happens after `Stopped` or `Failed`:
+
+| `restart` | `Stopped` (command exited) | `Failed` (crash, failed health check) |
+| --- | --- | --- |
+| `no` (default) | left stopped | left failed |
+| `on-failure` | started again (same microVM) | recreated |
+| `always` / `unless-stopped` | started again (same microVM) | recreated |
+
+Recreating builds a fresh microVM from the image, so files outside
+[volumes](/documentation/concepts/storage) are lost; starting again keeps the
+root disk.
+
+Retries are spaced out so a crash loop can't restart on every pass: 2 s,
+5 s, 15 s, then 30 s between attempts. The counter resets after 60 s of
+continuous `Running`. Restarts that microsandbox performs on its own count
+toward the same backoff.
+
+With `restart: no`, a `Failed` or `Stopped` instance also releases its
+CPU/memory/disk reservation. Instances that will be retried keep theirs.
+
+## Health checks
+
+A `healthcheck` runs a command **inside** the guest on an interval. It uses
+Compose's forms:
+
+| `test:` | Runs |
+| --- | --- |
+| `["CMD", "pg_isready", "-q"]` | the argv directly (no shell) |
+| `["CMD-SHELL", "curl -f localhost:8000"]` or a plain string | `/bin/sh -c "<script>"` |
+| `["NONE"]`, or `disable: true` | nothing — health check off |
+
+Defaults: `interval: 30s`, `timeout: 30s`, `retries: 3`, `start_period: 0s`.
+Sub-second values round up to whole seconds.
+
+```text
+ Running ──probe every interval──► pass ──► healthy
+                                  fail ──► counted (not during start_period)
+                                           │ retries reached
+                                           ▼
+                  restart: no ──► Failed    otherwise ──► recreate (backoff)
+```
+
+Probes run in the background, so a hung probe can't stall other instances;
+a probe that exceeds `timeout` counts as a failure.
+
+## Startup ordering
+
+`depends_on` holds a service back until its dependencies are ready:
 
 ```yaml
+name: shop
 services:
   db:
     image: postgres:16
+    command: ["postgres"]        # MC2 doesn't run the image's CMD by default
+    environment:
+      POSTGRES_PASSWORD: lab
     expose: [5432]
     healthcheck:
-      test: ["pg_isready", "-q", "-U", "postgres"]
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
       interval: 5s
   web:
-    image: alpine
+    image: alpine:3.20
     depends_on:
       db:
         condition: service_healthy
 ```
 
-- List form (`depends_on: [db]`) means `condition: service_started`.
-- `service_healthy` requires the dependency to declare a non-disabled
-  healthcheck.
-- References must be to services in the same stack; cycles are rejected at
-  parse time.
-- While waiting, the dependent reports `Pending` with a message like
+- The list form (`depends_on: [db]`) means `condition: service_started`.
+- A dependency is **started** when any of its replicas is `Running`, and
+  **healthy** when any running replica passes its health check.
+  `service_healthy` needs the dependency to have an enabled health check.
+- While it waits, the dependent shows `Pending` with a message like
   `depends_on: waiting for db (service_healthy)`.
-- A dependency counts as live when **any** of its replicas is running
-  (healthy, for `service_healthy`) — one `Failed` replica does not hide a
-  healthy one.
+- Dependencies must be in the same stack; unknown names and cycles are
+  rejected at apply.
+- **It only gates the first start.** Once an instance has started, later
+  restarts and config-change recreates aren't held back, and a dependency
+  going down doesn't stop it (Compose semantics). Make clients retry.
+
+## Resources
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `cpus` | `1` | Whole vCPUs, 1–255. `0.5` or `1.5` is rejected. |
+| `mem_limit` | `512m` | Guest RAM: `512m`, `1g`, `1.5g`, or bytes. |
+| `storage_opt.size` | `4GiB` | The writable root disk. |
+
+`cpus` and `mem_limit` are reserved against the host's CPUs and memory (and
+any `--limit-*` budget) when you apply; a stack that doesn't fit is rejected
+up front instead of sitting `Pending`. Changing any of them recreates the
+microVM.
+
+## What runs in the microVM
+
+`command` replaces the image's `CMD` (its `ENTRYPOINT` still runs). Give it as
+a list (`["python", "-m", "http.server", "8000"]`) or a string, which is
+split into words like a shell would but **not** run by one — use
+`["/bin/sh", "-c", "..."]` when you need `&&`, pipes, or `exec`.
+
+<Warning title="Unlike Compose, the image's CMD doesn't run by default">
+Leave `command` out and MC2 runs `sleep infinity` instead of the image's
+`CMD`. The microVM stays up for `mc2 exec`, but a server image such as
+`postgres` or `nginx` won't start its server. Set `command` explicitly, e.g.
+`command: ["postgres"]`.
+</Warning>
 
 ## Key behaviors
 
-- **Ordering at startup only.** The gate holds back a dependent's *first*
-  start (and a recreate for a changed config). Once it is `Running`, a
-  dependency going unhealthy does not tear it down, re-gate it or drop it from
-  routing (Compose semantics).
-- **`restart` is the resilience knob.** Without it, failures surface as
-  `Failed`; with it, MC2 re-creates the sandbox, spacing repeated restarts by
-  the backoff schedule.
-- **Health drives convergence.** A passing probe sets an instance healthy,
-  which unlocks `service_healthy` dependents.
+- **One instance, one microVM.** Replicas share nothing but volumes you
+  mount into each of them.
+- **`restart` is the resilience knob.** Without it, failures stay visible as
+  `Failed`; with it, MC2 retries with backoff.
+- **Health is part of resilience.** MC2 watches the microVM, not your
+  process: a server can die inside a VM that is still `Running`. A health
+  check catches that, and failing it past `retries` is treated like a crash.
+- **Ordering is startup-only.** `depends_on` never tears down a running
+  dependent.
 
 ## Deeper
 
-- [Desired state & reconciliation](/documentation/concepts/desired-state) —
-  the loop behind the phases.
-- [Scale & restart](/documentation/guides/scale-and-restart) —
-  replicas and resilience in practice.
-- [Order startup](/documentation/guides/order-startup) —
-  healthchecks and `depends_on` end to end.
+- [Networking](/documentation/concepts/networking) — how instances reach each
+  other and the outside world.
+- [Scale & restart](/documentation/guides/scale-and-restart) — replicas and
+  resilience in practice.
+- [Order startup](/documentation/guides/order-startup) — health checks and
+  `depends_on` end to end.
 - [Services reference](/references/stack/services) — every service key.

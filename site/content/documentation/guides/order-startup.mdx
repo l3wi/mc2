@@ -1,102 +1,133 @@
 ---
 title: Order startup
-description: Health-gated startup with healthcheck and depends_on.
+description: Hold a service back until its database is healthy, with healthcheck and depends_on.
 ---
 
-**You will learn:** make one service wait until another is *healthy* (not
-just started) using `healthcheck` and `depends_on`, and tune per-replica
-ports at `scale > 1`.
+**You will learn:** make a web service wait until a database is actually
+ready — not just started — using `healthcheck` and `depends_on`.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
-This guide mirrors `examples/07-startup-ordering`.
+**Prerequisites:** [Scale & restart](/documentation/guides/scale-and-restart).
 
 ## The stack
 
+Save this as `ordered.yaml`:
+
 ```yaml
-name: startup-ordering
 services:
   db:
     image: postgres:16
-    expose: [5432]
+    command: ["postgres"]            # MC2 doesn't run the image's CMD by default
     environment:
-      POSTGRES_PASSWORD: lab
+      POSTGRES_PASSWORD: lab-only
     healthcheck:
-      test: ["pg_isready", "-q", "-U", "postgres"]
-      interval: 5s
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
+      interval: 2s
       timeout: 3s
       retries: 5
+      start_period: 30s
   web:
     image: python:3.12-alpine
-    scale: 3
+    command: ["python", "-m", "http.server", "8000"]
     ports:
-      - "8080:8000"
+      - "18090:8000"
     depends_on:
       db:
         condition: service_healthy
-    command: 'exec python -m http.server 8000'
 ```
 
-## Watch the gating
+`db`'s health check runs `pg_isready` inside its VM. `web` declares that it
+needs `db` to be **healthy**, not merely started.
+
+```text
+ db:   Scheduled ──► Running ─────────────────► Running + healthy
+                                                        │
+ web:  Scheduled ──► Pending (waiting for db) ──────────┴──► Running
+```
+
+<Steps>
+
+<Step title="Apply and watch the gate">
 
 ```bash
-mc2 up -f examples/07-startup-ordering/stack.yaml
-mc2 ps
+mc2 up -f ordered.yaml
+mc2 ps --stack ordered -o json     # repeat every few seconds
 ```
 
-Until the DB's `pg_isready` probe passes, `web` stays `Pending` with a
-message like `depends_on: waiting for db (service_healthy)`. Once the DB
-reports healthy, `web` converges to `Running`.
+While Postgres initializes, `web` stays `Pending` with the message:
 
-## Ordering semantics
+```text
+depends_on: waiting for db (service_healthy)
+```
 
-- **List form** (`depends_on: [db]`) means `condition: service_started`.
-- **`service_healthy`** requires the dependency to declare a non-disabled
-  healthcheck.
-- **Ordering only at startup.** The gate holds back a dependent's *first*
-  start (and a recreate for a changed config). Once `web` is `Running`, a
-  dependency going unhealthy never re-gates it: it is not reported `Pending`,
-  it stays in routing, and its health/ssh/crash handling keeps running.
-- **A dependency is live if any replica is.** At `scale > 1` one `Running`
-  replica — healthy, for `service_healthy` — is enough for dependents to start,
-  whatever the other replicas are doing.
-- **Cycles are rejected** at parse time; references must stay in-stack.
+</Step>
 
-## Healthcheck keys
+<Step title="See it release">
 
-`interval`, `timeout` (default `30s`; `0` is rejected), `retries`,
-`start_period`, and `disable`. `retries` consecutive failures past
-`start_period` mark the instance unhealthy — with `restart` set it is
-recreated, otherwise it reports `Failed`. Failures inside `start_period` do not
-count toward `retries`, and every probe is bounded by `timeout` in a task of its
-own, so a hung probe never blocks reconcile.
-
-## Per-replica ports
-
-With `scale: 3` and `8080:8000`, replicas get **`8080, 8081, 8082`** —
-distinct host ports per replica, ingress following the running one. Check:
+Once `pg_isready` passes, `db` is healthy and the next reconcile pass starts
+`web`. In testing this took about 15 seconds with the image already
+downloaded.
 
 ```bash
-curl -s http://127.0.0.1:8080/
-curl -s http://127.0.0.1:8082/
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18090/
+# 200
 ```
 
-## What you learned
+</Step>
 
-- `depends_on` gates *when* a dependent starts, keyed on health.
-- Healthchecks are exec probes with full Compose tuning.
-- Scaling a published-port service allocates ports per replica for you.
+<Step title="Clean up">
+
+```bash
+mc2 down ordered
+```
+
+</Step>
+
+</Steps>
+
+## How the gate behaves
+
+- **List form** — `depends_on: [db]` means `condition: service_started`: wait
+  until any `db` replica is `Running`.
+- **`service_healthy`** — wait until any running `db` replica passes its
+  health check. The dependency must have an enabled `healthcheck`.
+- **First start only.** Once `web` has started, a later restart or a
+  recreate after a config change isn't held back, and `db` going down doesn't
+  stop `web`. Your application still needs to retry its connection.
+- **Same stack only.** Dependencies name services in the same file; unknown
+  names and cycles are rejected at apply.
+
+## Tuning the health check
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `30s` | Time between probes. |
+| `timeout` | `30s` | A probe running longer counts as failed (`0` is rejected). |
+| `retries` | `3` | Consecutive failures before the replica is unhealthy. |
+| `start_period` | `0s` | Failures in this window after boot don't count. |
+| `disable` | `false` | Turn the check off. |
+
+An unhealthy replica is recreated if the service has a `restart` policy, and
+reported `Failed` otherwise.
+
+<Note title="Exposing the database">
+  To let `web` connect to `db`, add `expose: [5432]` to `db` — see
+  [Connect services](/documentation/guides/connect-services). Exposed ports
+  are unique on the server *and* must be free on the host's loopback, so this
+  is rejected if you already run Postgres locally on 5432. Make Postgres
+  listen elsewhere (`command: ["postgres", "-p", "15432"]`) and expose that.
+</Note>
 
 ## Next
 
 <Cards cols={2}>
   <Card
-    title="Manage a remote server"
-    description="Contexts, setup wizard, and remote TLS."
-    href="/documentation/guides/manage-a-remote-server"
+    title="Connect services"
+    description="Let services reach each other by name."
+    href="/documentation/guides/connect-services"
   />
   <Card
     title="Healthchecks reference"
-    description="Every healthcheck and depends_on key."
+    description="Every healthcheck and depends_on form."
     href="/references/stack/health-depends"
   />
 </Cards>

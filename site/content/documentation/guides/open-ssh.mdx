@@ -1,117 +1,158 @@
 ---
 title: Open SSH
-description: Host-side SSH into a service, with a key registry and optional TCP ingress.
+description: SSH into a microVM with your own key — directly on the server, or through a Traefik TCP route.
 ---
 
-**You will learn:** enable SSH on a service, register authorized keys, and
-connect — locally and through Traefik TCP ingress.
+**You will learn:** register an SSH key, give a service an SSH endpoint,
+connect to it, change it per instance, and route it through Traefik.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack),
-a local SSH key, and a hypervisor-capable machine. This guide mirrors
-`examples/05-ssh-ingress`.
+**Prerequisites:** [Add secrets](/documentation/guides/add-secrets) (or any
+earlier guide) and an SSH key pair. For the Traefik part, the server and
+Traefik set up as in [Publish with ingress](/documentation/guides/publish-with-ingress).
 
-## The stack
+MC2's SSH is served by the host, not by an `sshd` inside the guest: the
+microVM image needs nothing extra.
 
-```yaml
-name: ssh-ingress
-services:
-  web:
-    image: alpine:3.20
-    ssh:
-      enabled: true
-      authorizedKeys: [developer]
+```text
+ ssh -p 2222 ──► 127.0.0.1:2222 (MC2, on the host) ──► shell in microVM
+ ssh -p 2200 ──► Traefik :2200 ──► 127.0.0.1:2222 ──► shell in microVM
 ```
 
-`ssh:` is a **host-side microsandbox SSH front end** — not a guest `sshd`.
-The short form `ssh: true` works too (all defaults, authenticated by every
-registered key). The stack name here matches the `examples/05-ssh-ingress`
-example the guide applies, so instance refs below use `ssh-ingress`. Replace
-it with your own `name:` and adjust the refs if you use a different file.
+<Steps>
 
-## Register a key
+<Step title="Register your key">
 
 ```bash
 mc2 ssh add-key developer --file ~/.ssh/id_ed25519.pub
 mc2 ssh keys
 ```
 
-## Bring it up and connect
+Keys are stored on the server under a name (`developer`); stacks refer to
+that name.
 
-```bash
-mc2 up -f examples/05-ssh-ingress/stack.yaml
-mc2 ssh ls          # shows the direct MC2 listener port
-```
+</Step>
 
-Then, with the fixed port in the example stack (`ssh.port: 2222`):
+<Step title="Enable SSH on a service">
 
-```bash
-ssh -p 2222 root@127.0.0.1
-```
-
-`mc2 ssh ls` reports the direct listener, which is useful for telling SSH
-problems apart from Traefik problems.
-
-## Override SSH per instance
-
-Keys and endpoints are also first-class commands:
-
-```bash
-mc2 ssh open ssh-ingress/web/0 --key developer --port 2222
-mc2 ssh show ssh-ingress/web/0
-mc2 ssh close ssh-ingress/web/0
-```
-
-## Expose it through Traefik TCP ingress
-
-For remote access over your proxy, add a TCP route. It requires a **fixed**
-`ssh.port`:
+Save this as `ssh.yaml`:
 
 ```yaml
 services:
-  web:
+  dev:
+    image: alpine:3.20
     ssh:
       enabled: true
       port: 2222
       authorizedKeys: [developer]
-
-ingress:
-  tcp:
-    - name: web-ssh
-      entryPoint: ssh
-      service: web
 ```
-
-Then start Traefik with the catalog and connect through it:
 
 ```bash
-traefik --configFile=examples/05-ssh-ingress/traefik.static.yml
-ssh -p 2222 root@127.0.0.1
+mc2 up -f ssh.yaml
+mc2 ssh ls
 ```
+
+```text
+│ REF       ┆ INSTANCE     ┆ PHASE ┆ NODE        ┆ BIND:PORT      │
+│ ssh/dev/0 ┆ 65236a2f-... ┆ Open  ┆ k762.hs.net ┆ 127.0.0.1:2222 │
+```
+
+Wait until the endpoint shows `Open`. Without `port`, MC2 picks a free one
+(`mc2 ssh ls` shows it).
+
+</Step>
+
+<Step title="Connect">
+
+```bash
+ssh -p 2222 root@127.0.0.1 hostname
+# ssh--dev--0
+```
+
+The listener binds the server's loopback by default, so connect from the
+server itself, through an SSH tunnel, or via Traefik (below).
+
+</Step>
+
+<Step title="Change SSH for one instance">
+
+```bash
+mc2 ssh close ssh/dev/0                                  # stop the endpoint
+mc2 ssh open ssh/dev/0 --key developer --port 2223        # reopen elsewhere
+mc2 ssh show ssh/dev/0
+ssh -p 2223 root@127.0.0.1 hostname
+```
+
+`open` and `close` set a per-instance **override** that takes precedence over
+the stack file — including a later `mc2 up`. The CLI has no command to drop
+the override; to return the instance to its YAML settings, call the API:
+`DELETE /v1/instances/<id>/ssh` (see
+[REST API: Secrets & SSH](/references/api/secrets-ssh)).
+
+</Step>
+
+<Step title="Route it through Traefik">
+
+A TCP route needs a **fixed** `ssh.port`. Add an ingress block to `ssh.yaml`:
+
+```yaml
+ingress:
+  tcp:
+    - name: dev-ssh
+      entryPoint: ssh
+      service: dev
+```
+
+and an `ssh` entry point to your Traefik static config:
+
+```yaml
+entryPoints:
+  ssh:
+    address: ":2200"
+```
+
+```bash
+mc2 up -f ssh.yaml
+ssh -p 2200 root@127.0.0.1 hostname      # through Traefik
+# ssh--dev--0
+```
+
+From another machine, use `ssh -p 2200 root@<server>` and allow inbound TCP
+2200 on the server. MC2 writes the route as a `HostSNI(*)` TCP router, so
+the entry point serves one SSH backend.
+
+</Step>
+
+<Step title="Clean up">
+
+```bash
+mc2 down ssh
+mc2 ssh rm-key developer
+```
+
+</Step>
+
+</Steps>
 
 ## Key behaviors
 
-- **Host-side SSH, not guest sshd.** The SDK's SSH server fronts the
-  sandbox.
-- **Key registry is server-wide.** `authorizedKeys` names keys from `mc2 ssh
-  add-key`; an empty list means *all* registered keys authenticate.
-- **TCP ingress needs a fixed port.** `ssh.port: 0` (auto) can't be routed
-  by Traefik.
-- **Sessions are capped, not idled out.** `--max-ssh-sessions` (64) and
-  `--max-ssh-sessions-per-listener` (16) close connections beyond the cap,
-  and a client has 30 s to finish the handshake. There is **no idle
-  timeout**, so a quiet `tmux` or agent session stays connected; accepted
-  sockets use TCP keepalive to notice a peer that vanished.
+- **Keys are server-wide.** `authorizedKeys` lists key names; an empty list
+  (or `ssh: true`) lets every registered key in.
+- **Loopback by default.** `ssh.bind` is `127.0.0.1`; change it deliberately.
+- **Session limits, no idle timeout.** `--max-ssh-sessions` (64) and
+  `--max-ssh-sessions-per-listener` (16) cap connections, and a client has
+  30 s to finish the handshake. Idle sessions (a quiet `tmux`) stay open.
+- **SFTP is on by default** (`ssh.sftp: true`).
 
 ## Next
 
 <Cards cols={2}>
   <Card
-    title="Use persistent volumes"
-    description="State that outlives a microVM."
-    href="/documentation/guides/use-persistent-volumes"
+    title="Manage a remote server"
+    description="Run MC2 on a VPS and drive it from your laptop."
+    href="/documentation/guides/manage-a-remote-server"
   />
   <Card
-    title="SSH & node placement reference"
+    title="SSH reference"
     description="Every ssh key and default."
     href="/references/stack/ssh-node"
   />

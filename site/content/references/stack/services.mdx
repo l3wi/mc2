@@ -1,97 +1,155 @@
 ---
 title: Services
-description: The services.<name> key table, network profiles, and command string-vs-list behavior.
+description: Every services.<name> key with its type and default, replica fan-out, restart policies, and the command/environment forms.
 ---
 
-A service is the unit of work in a stack: a container image, resource limits,
-and the runtime behavior that turns it into one or more sandbox instances.
+A service is the unit of work in a stack. It names a container image, the
+resources one replica gets, and the runtime behavior that turns that image into
+one or more sandbox instances. An **instance** is one replica, referred to as
+`stack/service/ordinal`.
 
 ## `services.<name>` keys
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `image` | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). |
-| `scale` | no | `1` | Instance count; must be ≥ 1 in v1. |
-| `cpus` | no | `1` | Whole vCPUs, `1`–`255` (`2`, `2.0` and `"2"` are accepted). Fractional values such as `0.5` or `1.5` are rejected: each microVM gets whole vCPUs. Unlike Docker, this is a VM size, not a CPU-time quota. |
-| `mem_limit` | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
-| `storage_opt` | no | `{size: 4GiB}` | Guest writable root-disk size (compose `storage_opt.size`). Compose byte sizes (`8GiB`, `512m`, or bytes); max 1 TiB. Changing it recreates the VM — files outside volumes are **not** kept. |
-| `command` | no | `sleep infinity` | Guest argv. List (`["echo", "hi"]`) or string (`echo "hi there"`, split shell-like). Omit to keep a shell-less image alive. |
-| `restart` | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`. Drives node restart/recreate on failure. |
-| `environment` | no | `{}` | Guest environment variables (map or `KEY=VALUE` list). |
-| `depends_on` | no | `{}` | Startup ordering: list (`[db]`) or map (`{db: {condition: service_healthy}}`). Conditions: `service_started` (default) \| `service_healthy` (requires the dependency to declare a healthcheck). |
-| `labels` | no | `{}` | Free-form labels copied onto the sandbox. |
-| `network` | no | public | See `network` below. |
-| `ports` | no | `[]` | Host↔guest port forwards (north-south; auto host port when `published` omitted). |
-| `secrets` | no | `[]` | Cluster secret injections. |
-| `volumes` | no | `[]` | Mounts of declared stack volumes. |
-| `healthcheck` | no | none | Exec health probe. |
-| `ssh` | no | disabled | Host-side msb SSH front end. |
-| `expose` | no | `[]` | Network listeners (east-west; default-allow on shared networks). |
-| `networks` | no | `[]` | Server-wide network membership (default = stack). |
-| `nodeName` | no | — | Hard pin to a node name. |
-| `nodeSelector` | no | `{}` | Soft placement: node labels that must match. |
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `image` | string | yes | — | Container image reference (`alpine:3.20`, `docker.io/...`). Must be non-empty. |
+| `scale` | integer | no | `1` | Replica count; must be ≥ 1 in v1. |
+| `cpus` | integer | no | `1` | Whole vCPUs, 1–255. `2`, `2.0` and `"2"` are accepted; fractional values (`0.5`, `1.5`) are rejected with the nearest whole choices. This is the microVM's vCPU count, not a CPU-time quota. |
+| `mem_limit` | size | no | `512m` | Guest memory: `512m`, `1g`, `1.5g`, or bytes. |
+| `storage_opt` | map | no | `{size: 4GiB}` | Writable root disk. Only `size` is accepted (compose byte sizes, max 1 TiB). |
+| `command` | list \| string | no | `sleep infinity` | Replaces the image `CMD` (not run by default); see [Command forms](#command-forms). |
+| `environment` | map \| list | no | `{}` | Guest environment variables; see [Environment forms](#environment-forms). |
+| `restart` | string | no | `no` | `no` \| `on-failure` \| `always` \| `unless-stopped`; see [Restart policies](#restart-policies). |
+| `healthcheck` | map | no | none | Exec health probe. Fully documented in [Healthchecks & depends_on](/references/stack/health-depends). |
+| `depends_on` | list \| map | no | `{}` | Startup ordering (list or map form). See [Healthchecks & depends_on](/references/stack/health-depends). |
+| `ports` | list | no | `[]` | Host↔guest port forwards (north-south). See [Ports & expose](/references/stack/ports-expose). |
+| `expose` | list | no | `[]` | Service-network listeners (east-west). See [Ports & expose](/references/stack/ports-expose). |
+| `networks` | list of strings | no | `[]` | Server-wide named networks this service joins (default: the stack's implicit network). |
+| `network` | map | no | `{profiles: []}` → `public` | Guest network posture; see [Network profiles](#network-profiles). |
+| `secrets` | list | no | `[]` | Encrypted cluster-secret injections. See [Secrets & volumes](/references/stack/secrets-volumes). |
+| `volumes` | list | no | `[]` | Mounts of declared stack volumes. See [Secrets & volumes](/references/stack/secrets-volumes). |
+| `ssh` | bool \| map | no | disabled | Host-side microsandbox SSH front end. See [SSH & node placement](/references/stack/ssh-node). |
+| `labels` | map | no | `{}` | Free-form metadata attached to the instance; it never affects scheduling or networking. |
+| `nodeName` | string | no | — | Hard pin to the node's display name. See [SSH & node placement](/references/stack/ssh-node). |
+| `nodeSelector` | map | no | `{}` | Node labels the instance must land on (`--label key=value`). See [SSH & node placement](/references/stack/ssh-node). |
 
-The last four — `ssh`, `expose`/`networks`, `healthcheck`/`depends_on`, and
-`nodeName`/`nodeSelector` — have dedicated pages in this section.
+Unknown keys are rejected (`unknown field ...`). In JSON/API form the
+`mem_limit` and `storage_opt.size` values are serialized as **bytes**, so a
+stored spec round-trips losslessly (512 MiB comes back as 536870912).
 
-## `network` profiles
+## Replicas: `scale`
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `profiles` | `[]` → `public` | Closed set: `public`, `private`, `host`, `none`. `none` must be the only entry; duplicates and any other value are rejected (there are no `local`/`any` aliases). `host` requires the server flag `--allow-host-profile`. Network reachable ports are always allowed via narrow rules regardless of profile. |
+`scale` creates N identical instances, distinguished by a zero-based
+**ordinal**. The runtime name is `{stack}--{service}--{ordinal}`; each instance
+gets its own microVM, its own root disk, and its own host ports. Volumes are
+shared (the same host directory is mounted into every replica).
 
-Profiles select the guest's network posture:
+```text
+services:
+  web:
+    scale: 3
+    ports: ["8080:8000"]
 
-- **`public`** (default) — the guest participates in the shared networks and
-  its reachable ports are exposed north-south.
-- **`private`** — guest traffic stays on its own networks; no north-south
-  exposure.
-- **`host`** — host networking semantics for the guest: the whole host
-  loopback. Refused at apply unless the server runs with
-  `--allow-host-profile` (env `MC2_ALLOW_HOST_PROFILE`).
-- **`none`** — the guest network is disabled entirely; must be the only entry.
-
-Regardless of profile, reachable ports are always allowed via narrow rules, so
-the profile only controls the default posture. See
-[Networks & ingress](./networks-ingress) for how membership works.
-
-## `command`
-
-`command` sets the guest argv and defaults to `sleep infinity`, which keeps a
-shell-less image alive so you can inspect it. Two spellings are accepted:
-
-```yaml
-command: ["echo", "hi"]        # list form: argv verbatim
-
-command: echo "hi there"       # string form: split shell-like
+stack "shop", service "web"
+  ordinal 0 ─► sandbox shop--web--0   host port 8080 → guest 8000
+  ordinal 1 ─► sandbox shop--web--1   host port 8081 → guest 8000
+  ordinal 2 ─► sandbox shop--web--2   host port 8082 → guest 8000
+  (fixed `published: 8080` becomes the block 8080, 8081, 8082 — see
+   Ports & expose for auto-allocated and hostname-sugar ports)
 ```
 
-A string is split shell-like, so quoting behaves as you'd expect — useful for
-`sh -c "…"`-style invocation or one-line commands. Omit the key entirely to get
-the `sleep infinity` default.
+Lowering `scale` deletes the surplus ordinals; raising it creates new ones.
+Instances are independent — one failing replica does not stop its siblings.
 
-## `storage_opt.size`
-
-The guest's writable root disk — packages, `/root`, anything outside a volume.
-Everything a guest writes is otherwise capped: `/tmp` is a RAM-backed tmpfs and
-logs rotate, but the root disk is the space your workload actually uses.
+## `cpus`, `mem_limit`, `storage_opt`
 
 ```yaml
 services:
-  web:
-    image: python:3.12
+  worker:
+    image: alpine:3.20
+    cpus: 2                 # 2 vCPUs (whole numbers only, 1–255)
+    mem_limit: 1g           # 1 GiB guest RAM
     storage_opt:
-      size: 8GiB        # default 4 GiB
+      size: 8GiB            # writable root disk; default 4 GiB
 ```
 
-Changing `size` recreates the VM, so files outside volumes are **not** kept —
-put anything that must survive in a [volume](/documentation/concepts/storage).
-When the root disk (or a volume) fills, guests see
-`No space left on device`; MC2 reports the condition in `mc2 ps` (`NOTES`
-column) and prints the exact fix from `mc2 exec`/`mc2 ssh open`/`mc2 logs`.
+- `cpus` and `mem_limit` are reserved against the node's host CPU/RAM (and the
+  operator's `--limit-*` budget) at apply; a stack that cannot be placed is
+  rejected up front rather than left `Pending`.
+- `storage_opt.size` is the guest's writable root disk — packages, `/root`,
+  anything outside a volume. Everything else a guest writes is capped: `/tmp`
+  is a RAM-backed tmpfs and logs rotate, but the root disk is the space your
+  workload actually uses.
+- Changing any of these changes create-time configuration, so the VM is
+  **recreated** and files outside volumes are **not** kept. Put anything that
+  must survive in a [volume](/documentation/concepts/storage).
+- When a disk fills, guests see `No space left on device`; MC2 reports the
+  condition in `mc2 ps` (`NOTES` column) and prints the exact fix from
+  `mc2 exec` / `mc2 ssh open` / `mc2 logs`.
 
-<Callout type="tip" title="Related service keys">
-  Startup ordering and probes: [Healthchecks & depends_on](./health-depends).
-  Ports: [Ports & expose](./ports-expose). Secrets and mounts:
-  [Secrets & volumes](./secrets-volumes).
-</Callout>
+## Restart policies
+
+| `restart` | Behaviour |
+| --- | --- |
+| `no` (default) | Never restarted. A crash is reported as `Failed` and left alone; the reservation is released. |
+| `on-failure` | A `Failed` instance is recreated; a `Stopped` desired instance is started again. |
+| `always` | Same as `on-failure` (MC2 has no separate "stopped by hand" state to honour). |
+| `unless-stopped` | Same as `always`. |
+
+Restarts are spaced by a backoff — 2 s, 5 s, 15 s, then 30 s — and the counter
+resets after 60 s of sustained `Running`. Restarts microsandbox performs
+itself are reported to the controller and spaced the same way.
+
+## Command forms
+
+`command` replaces the image's `CMD`; the image's `ENTRYPOINT` still runs
+first. The list form is used verbatim; the string form is split into
+arguments without running a shell. Omit it (or leave it empty) and MC2 runs
+`sleep infinity` — **not** the image's own `CMD` — so an image like
+`postgres` or `nginx` needs an explicit `command` to start its server, and
+the image must contain `sleep`.
+
+```yaml
+command: ["echo", "hi"]      # list form: argv verbatim, no shell
+command: echo "hi there"     # string form: split shell-like
+command: /bin/sh -c "date"   # string form, explicit shell
+```
+
+The string form is split with shell-like quoting — single quotes, double
+quotes and backslash escapes are honoured, whitespace separates words, and no
+shell operators are interpreted. Compose splits string commands the same way.
+An empty string (or `[]`) yields no argv, which falls back to the default.
+
+## Environment forms
+
+```yaml
+environment:                 # map form
+  POSTGRES_DB: app
+  POSTGRES_PASSWORD: lab
+
+environment:                 # list form: KEY=VALUE entries
+  - POSTGRES_DB=app
+  - POSTGRES_PASSWORD=lab
+```
+
+A list entry without `=` is rejected (`environment entry "..." must be
+KEY=VALUE`). An explicit `environment` entry **overrides** a
+`secrets[].env` of the same name — the secret is dropped and a warning is
+logged per service (see [Secrets & volumes](/references/stack/secrets-volumes)).
+
+## Network profiles
+
+`network.profiles` is a closed set: `public` (default), `private`, `host`,
+`none`. `none` must be the only entry; duplicates and unknown values are
+rejected (there are no `local`/`any` aliases). `host` additionally requires the
+server flag `--allow-host-profile`. Membership says *which* networks a service
+joins; the profile says *how* it may reach them — see
+[Networks & ingress](/references/stack/networks-ingress) for the full semantics.
+
+## Related keys
+
+The remaining keys have their own pages: [Ports & expose](/references/stack/ports-expose),
+[Networks & ingress](/references/stack/networks-ingress),
+[Secrets & volumes](/references/stack/secrets-volumes),
+[Healthchecks & depends_on](/references/stack/health-depends),
+[SSH & node placement](/references/stack/ssh-node).

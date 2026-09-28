@@ -1,100 +1,89 @@
 ---
 title: Status
-description: Cluster health, version, counts, and node listing via GET /v1/status and GET /v1/nodes.
+description: GET /health (readiness), GET /v1/status (version, counts, resources), and GET /v1/nodes.
 ---
 
-## Overview
+`GET /health` tells a supervisor whether the reconcile loop is converging.
+`GET /v1/status` and `GET /v1/nodes` report what's stored and what the host
+has; they don't check the loop.
 
-Two endpoints report the health of the cluster: `/v1/status` for the aggregate
-picture and `/v1/nodes` for the registered node(s). Both require a bearer
-token.
+## GET /health
+
+No authentication.
+
+```bash
+curl -s http://127.0.0.1:7443/health
+# {"service":"mc2-server","status":"ok"}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | The loop is alive and its last successful pass is no older than `3 × --reconcile-interval-secs + 30 s` (measured from startup until the first pass). |
+| `503` | The loop has died or gone stale. The body includes a `reason`. |
 
 ## GET /v1/status
 
-Returns cluster status: health, version, counts, and the published public
-hostname.
-
-```
-GET /v1/status
-Authorization: Bearer mc2at_...
-```
-
-Fields include:
-
-| Field | Meaning |
-| ----- | ------- |
-| `version` | Server version |
-| `apiVersion` | API version (e.g. `mc2/v1`) |
-| `nodesReady` / `nodesTotal` | Node readiness counts |
-| `stacks` | Number of stacks |
-| `instances` | Number of instances |
-| `message` | Human status line (e.g. `"control plane up"`) |
-| `publicHostname` | The server's published hostname, set via `--public-hostname` |
-| `resources` | Resource budget: `limits`, `host`, `reserved`, `mc2DiskUsedMib` |
-
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/status | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/status"
 ```
 
 ```json
 {
   "version": "0.1.0",
-  "apiVersion": "mc2/v1",
-  "nodesReady": 1,
-  "nodesTotal": 1,
-  "stacks": 2,
-  "instances": 5,
+  "api_version": "mc2/v1",
+  "nodes_ready": 1,
+  "nodes_total": 1,
+  "stacks": 0,
+  "instances": 0,
   "message": "control plane up",
-  "publicHostname": "mc2.example.com",
   "resources": {
     "limits": { "cpus": 0, "memoryMib": 0, "diskMib": 0 },
-    "host": { "cpus": 8, "memoryMib": 16384, "diskTotalMib": 1000000, "diskFreeMib": 500000 },
-    "reserved": { "cpus": 5, "memoryMib": 2560 },
-    "mc2DiskUsedMib": 120
+    "host": { "cpus": 14, "memoryMib": 49152, "diskTotalMib": 948584, "diskFreeMib": 61046 },
+    "reserved": { "cpus": 0, "memoryMib": 0 },
+    "mc2DiskUsedMib": 0
   }
 }
 ```
 
-`resources.limits` is the configured `--limit-*` budget (`0` = unlimited);
-`resources.host` is the machine MC2 runs on; `resources.reserved` is the
-CPU/RAM reserved by bound instance specs; `mc2DiskUsedMib` is MC2's measured
-on-disk usage (data dir + named volumes).
+| Field | Meaning |
+| --- | --- |
+| `version` | Server version. |
+| `api_version` | API version (`mc2/v1`). |
+| `nodes_ready`, `nodes_total` | Always `1` in v1. |
+| `stacks`, `instances` | Stored counts. |
+| `message` | Always `"control plane up"` when the API answers — not a health signal. |
+| `publicHostname` | The `--public-hostname`, omitted when unset. |
+| `resources.limits` | The `--limit-*` budgets (`0` = unlimited). |
+| `resources.host` | The host's CPUs, memory, and disk (for the filesystem holding the volume root). |
+| `resources.reserved` | CPU and memory reserved by instances. |
+| `resources.mc2DiskUsedMib` | Measured size of the data dir plus the volume root. |
 
 ## GET /v1/nodes
 
-Lists registered nodes — in v1, the local node.
-
-```
-GET /v1/nodes
-Authorization: Bearer mc2at_...
-```
-
-Each entry reports node identity and capacity. Node tokens are never exposed.
-
-| Field | Meaning |
-| ----- | ------- |
-| `id` | Node id |
-| `name` | Node name |
-| `arch` | Architecture (e.g. `aarch64`) |
-| `cpus` | Host CPUs |
-| `memoryMib` | Host memory MiB |
-| `status` | Node status (`Ready` while the server process runs) |
-| `labels` | Node labels (`key=value`) |
-| `createdAt` | When the node was created |
-
 ```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/nodes | jq .
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/nodes"
 ```
 
 ```json
 [
   {
-    "name": "n1",
+    "id": "422229db-1d70-43eb-9084-706331384d83",
+    "name": "k762.hs.net",
     "arch": "aarch64",
-    "cpus": 8,
-    "memoryMib": 16384,
+    "cpus": 14,
+    "memory_mib": 49152,
     "status": "Ready",
-    "labels": {}
+    "labels": {},
+    "created_at": "2026-09-28T19:33:38.505920+00:00"
   }
 ]
 ```
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Node ID (persisted; survives renames). |
+| `name` | `--node-name`, default the hostname. |
+| `arch`, `cpus`, `memory_mib` | Host architecture and capacity. |
+| `status` | `Ready` while the server runs. |
+| `labels` | Object of `--label KEY=VALUE` pairs. |
+| `created_at` | When the node was first registered. |

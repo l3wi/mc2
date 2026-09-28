@@ -1,102 +1,167 @@
 ---
 title: Ports & expose
-description: "Host↔guest ports (north-south) and network listeners (east-west): short and long forms, auto host ports, and scaling blocks."
+description: "Host↔guest ports (north-south) and service-network listeners (east-west): every short and long form, auto allocation, scaling blocks, and the full list of apply-time rejections."
 ---
 
-Two independent mechanisms expose a service: `ports[]` forwards host↔guest
-traffic (north-south), while `expose[]` publishes listeners on the shared
-networks (east-west).
+Two independent mechanisms put traffic on a service: `ports[]` forwards
+host↔guest traffic (**north-south**) and `expose[]` publishes listeners on the
+service network (**east-west**).
+
+```text
+     guest VM (web)             MC2 host (loopback)          guest VM (db)
+┌────────────────────┐      ┌──────────────────────┐      ┌──────────────┐
+│ guest 8000         │◄─────┤ 127.0.0.1:8080+ord   │      │              │
+│                    │ports │   (publish)          │      │              │
+│                    │      │                      │      │              │
+│                    │      │ 127.0.0.1:5432       │◄─────┤ guest 5432   │
+│                    │      │   (expose splice)    │expose└──────────────┘
+└────────────────────┘      └──────────────────────┘
+```
+
+Both planes are **host-loopback only** in v1: a publish and a splice each bind
+`127.0.0.1`, never a LAN interface. Reach a published port from outside through
+`ingress` (a BYO Traefik on the same host) or the `hostname` sugar below.
 
 ## `ports[]` (north-south)
 
-Compose syntax. Host ports always bind loopback; expose publicly through
-`ingress` or the hostname sugar below (BYO Traefik).
+Compose syntax. Short (string) and long (map) forms:
 
 ```yaml
 ports:
   - "5000:3001"            # published:target
-  - "3001"                 # target-only → auto-allocated host port (server picks)
-  - "mcp.example.com:3000" # hostname sugar → ingress route for that hostname (TLS, `le`)
-  - "127.0.0.1:5000:3001"  # ip:published:target (ip advisory; always loopback)
-  - "5000:3001/tcp"        # explicit protocol
+  - "3002"                 # target-only -> auto-allocated host port
+  - "mcp.example.com:3003" # hostname sugar -> ingress route + auto host port
+  - "127.0.0.1:5001:3004"  # ip:published:target (ip advisory; always loopback)
+  - "5002:3005/tcp"        # explicit protocol (also /udp)
+  # long form:
+  - target: 3006
+    published: 5003
+    protocol: tcp
+    hostname: admin.example.com
 ```
 
-Long form: `{ target: 3001, published: 5000, protocol: tcp, hostname: "mcp.example.com" }`.
-Omit `published` (or use the target-only short form above) → auto host port,
-resolved once at apply and persisted (the port is stable across restarts and
-re-applies); an explicit `published: 0` in the long form is rejected, so leave
-the key out to get the server's allocation.
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `target` | integer | **yes** | — | Port inside the guest. |
+| `published` | integer | no | auto | Host port. **Omit** it for the server to allocate; an explicit `published: 0` in the long form is rejected so the intent is unambiguous. |
+| `protocol` | string | no | `tcp` | Use `tcp` or `udp`. Short-form suffixes are lowercased; long-form values are kept as written. Anything other than (case-insensitive) `udp` is treated as TCP — a typo isn't rejected. HTTP ingress backends must be `tcp`. |
+| `hostname` | string | no | — | Sugar: also publish this hostname through ingress, routed to `target`. Must be an exact lowercase RFC 1123 hostname — no port, wildcard or trailing dot. |
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `published` | no | auto | Host port. **Omit** for the server to allocate (`0` is rejected in the long form). |
-| `target` | yes | — | Port inside the guest. |
-| `protocol` | no | `tcp` | `tcp` or `udp` (`udp` not usable as ingress backend). |
-| `hostname` | no | — | Hostname sugar: route this hostname to `target` via ingress (TLS, `le`). Must be an exact lowercase RFC 1123 hostname — no port, wildcard or trailing dot. |
+Long-form keys are closed: any other key (`guest`, `host`, `mode`, a misspelt
+`published`, …) is rejected by name rather than silently ignored. In the short
+form the protocol is the part after `/` (`"5000:3001/udp"`), and a two-part
+entry whose first part is not a number is read as `hostname:target`:
 
-A published port is the north-south gateway; to reach it over the network you
-route it through `ingress` (see [Networks & ingress](./networks-ingress)).
+| Short form | Meaning |
+| --- | --- |
+| `"T"` | guest port `T`, auto host port |
+| `"P:T"` | host port `P`, guest port `T` |
+| `"H:T"` | route hostname `H` to guest `T` (ingress sugar) + auto host port |
+| `"IP:P:T"` | host port `P`, guest port `T` (the IP is advisory; MC2 always binds loopback) |
+| `"…/tcp"`, `"…/udp"` | protocol suffix on any of the above |
 
-## Auto host ports & scaling
+`"0:T"` is accepted and means the same as omitting `published` (auto).
 
-When `scale > 1` and a service declares published ports, each replica gets a
-distinct host port:
+## Auto host ports and scaling
 
-- a fixed `published: P` becomes the block `P, P+1, …, P+N-1` (ordinal 0 keeps
-  `P`);
-- a target-only (`"3001"` / hostname-sugar) port gets a distinct auto-allocated
-  port per replica.
+With `scale > 1`, every replica needs a distinct host port:
 
-Allocations are stable across re-applies. Moving a fixed `published` base is
-fine — the same apply releases the stack's previous block — but `mc2 up` is
-refused (`400`) if two entries would need the same host port, if the port is
-already an `expose` claim or another stack's publish, or if `published +
-ordinal` would exceed `65535`. Ingress routes for a scaled service target a
-Running replica (healthy one first when the service declares a healthcheck,
-otherwise the lowest ordinal) and use that replica's own port, so a route
-fails over when ordinal 0 is down.
+- A fixed `published: P` becomes the block `P, P+1, …, P+N-1`; ordinal 0 keeps
+  `P`. The block may move between applies — the same apply releases the
+  stack's previous block — but it may never land on a taken port.
+- A target-only (or hostname-sugar) entry is resolved per replica: each
+  `(ordinal, target)` keeps the port it already had, otherwise it takes a free
+  port from the **10000–65535** pool.
 
-<Callout type="note" title="Auto ports persist">
-  An auto host port is resolved once at apply and persisted — the same port
-  survives restarts and re-applies rather than churning each reconcile.
-</Callout>
+Allocations are resolved once at apply and **persisted in the stored spec**, so
+a port is stable across reconciles, restarts and re-applies. Ingress routes
+prefer a healthy `Running` replica (when the service has a health check), then
+any `Running` replica, and use *that* replica's own port, so a route follows a
+failover. With no replica running, the route is left out of Traefik's file.
+
+### What apply rejects
+
+Every one of these is a `400` returned before any write:
+
+| Rejection | Reason |
+| --- | --- |
+| `published: 0` in the long form | Ambiguous — omit the key instead. |
+| `P + ordinal > 65535` | The fixed block runs past the host port range; lower `published` or `scale`. |
+| Auto pool exhausted | No free port in 10000–65535; publish a fixed port or free one. |
+| The candidate port is in the taken set | Already an `expose` claim (any stack, including this document's own), another stack's published port, the REST bind (`--bind`), or `:53` (the guest DNS interceptor). |
+| The candidate was already handed to another entry in this pass | Two `ports` entries would share a host port. |
+| The database refuses the claim | A `(port, protocol)` uniqueness constraint backs every publish and expose, so even two applies racing each other cannot both win the same port. |
+
+Published ports are checked against MC2's own claims only — not against other
+programs on the host. If something else already listens on a published port,
+apply succeeds and the clash shows up when the microVM starts. (`expose`
+ports *are* probed; see below.)
+
+The database claim key is `(port, protocol)`, so TCP and UDP are separate
+there — but the apply-time allocator compares port **numbers** only. Don't
+reuse a host-port number for both TCP and UDP, within a service or against
+another stack's claim; use distinct numbers. `mc2 down` frees the stack's
+claims; `mc2 network` lists expose claims and their owners.
 
 ## `expose[]` (east-west listeners)
 
 Compose list form or map form:
 
 ```yaml
-expose: [5432, "6379"]        # bare ports
-# or map form for protocol/name:
-expose:
+expose: [5432, "6379", "6380/tcp"]   # bare ports (optionally with /protocol)
+expose:                              # map form for protocol/name
   - port: 5432
+    protocol: tcp
     name: main
 ```
 
-| Key | Required | Default | Description |
-| --- | --- | --- | --- |
-| `port` | yes | — | Listener port; non-zero, unique per service. |
-| `protocol` | no | `tcp` | Only `tcp` in v1. |
-| `name` | no | — | Optional listener name. |
+| Key | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `port` | integer | **yes** | — | Listener port; must be non-zero. |
+| `protocol` | string | no | `tcp` | Only `tcp` in v1; anything else is rejected at apply. |
+| `name` | string | no | — | Optional listener name (metadata). |
 
-Reachable by every other service that shares a network (same or different
-stack) as `<service>.<network>.svc.mc2:<port>` (default-allow, round-robin
-across Ready replicas). A service needs no `expose` of its own to reach peers,
-and replicas of a service can reach their own service. Same-node only in v1.
-See [Networking](/documentation/concepts/networking).
+An exposed port is reachable by every service that shares a network with it
+(same stack by default, or a named network — see
+[Networks & ingress](/references/stack/networks-ingress)) as
+`<service>.<network>.svc.mc2:<port>`. Replicas of a service can reach their own
+service name. Duplicate `expose.port` values in one service, and the same
+exposed port in two services of one stack, are rejected — the splice binds one
+host port per exposed guest port.
 
-<Callout type="warning" title="Exposed ports are exclusive server-wide, claimed at apply">
-  A guest resolves every name to the one gateway IP and msb rewrites
-  `gateway:P` to host `127.0.0.1:P` with no remap, so the port alone identifies
-  the shared splice. `mc2 up` therefore rejects an `expose` port another stack
-  already claims (`400`, naming the owner and suggesting another port), a port
-  MC2 already takes — the REST bind, any SSH listener, any published `ports:`
-  host port, or `53` — and a loopback port a host process already listens on.
-  MC2 then holds the listener from apply until the stack is removed (a client
-  sees accept-then-close while no backend is Ready), and refuses to create a
-  VM whose allowed port has no listener (fail closed). Ports below 1024 need
-  `CAP_NET_BIND_SERVICE` on Linux. `mc2 network` prints the owner of each claim.
-  Claims are additionally enforced by a database uniqueness constraint on
-  `(port, protocol)` — for `ports[].published` and `expose[]` alike — so even
-  two applies racing each other can never both win the same host port.
+### What apply rejects
+
+An exposed port is claimed **exclusively server-wide** at `mc2 up`, because the
+guest's `gateway:P` maps to host `127.0.0.1:P` with no remap, so the port alone
+identifies the splice. Apply returns `400` for:
+
+| Rejection | Reason |
+| --- | --- |
+| Claimed by another stack | The error names the owning `stack/service` and suggests a free port. Re-applying the *same* stack is fine — it keeps its own claims. |
+| Collides with the REST API listener | `--bind` (default `127.0.0.1:7443`). |
+| Collides with an SSH listener | Any service's `ssh.port`, in any stack. |
+| Collides with a published host port | Any `ports[].published`, including the ones this document resolves (fixed or auto). |
+| Port `53` | The guest DNS interceptor owns it. |
+| A host process already listens there | MC2 connects first, then test-binds, so a daemon on `*:P` is caught too. |
+| Privileged port on Linux | Ports below 1024 need `CAP_NET_BIND_SERVICE`; the error prints the `setcap`/systemd/`ip_unprivileged_port_start` options. |
+
+MC2 then **holds** the `127.0.0.1:<port>` listener from apply until the stack
+is removed. While a claim has no running backend it accepts and closes the
+connection (and the error/fix is visible in the server log), and MC2 refuses to
+create a VM whose allowed port has no listener — it fails closed rather than
+leaving an exposed port unrouted.
+
+<Callout type="note" title="Claims survive in the database">
+  `host_port_claims` (primary key `(port, protocol)`) is written in the same
+  transaction as each apply, for `expose[]` and `ports[].published` alike. Even
+  if the application-level checks were bypassed, a second claim on the same
+  `(port, protocol)` is refused. `mc2 down` frees the stack's rows.
 </Callout>
+
+## Choosing between them
+
+| Need | Use |
+| --- | --- |
+| Reach a port from the host or from outside (via Traefik) | `ports` (and `ingress`) |
+| A peer service should call it over the service network | `expose` |
+| Both | Declare both — they are independent mechanisms with independent claims. |

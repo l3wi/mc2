@@ -65,14 +65,14 @@ export const tabs: NavTab[] = [
             description: "Host ports, service networks, and ingress.",
           },
           {
-            path: "concepts/secrets",
-            title: "Secrets",
-            description: "Encrypted at rest, host-gated at runtime.",
-          },
-          {
             path: "concepts/storage",
             title: "Storage",
             description: "Named volumes that outlive a microVM.",
+          },
+          {
+            path: "concepts/secrets",
+            title: "Secrets",
+            description: "Encrypted at rest, host-gated at runtime.",
           },
           {
             path: "concepts/identity-and-contexts",
@@ -95,14 +95,14 @@ export const tabs: NavTab[] = [
         title: "Guides",
         icon: "book-open",
         pages: [
-          { path: "guides/run-your-first-stack", title: "Run your first stack" },
+          { path: "guides/run-your-first-stack", title: "Change a running stack" },
           { path: "guides/scale-and-restart", title: "Scale & restart" },
+          { path: "guides/order-startup", title: "Order startup" },
           { path: "guides/connect-services", title: "Connect services" },
           { path: "guides/publish-with-ingress", title: "Publish with ingress" },
+          { path: "guides/use-persistent-volumes", title: "Use persistent volumes" },
           { path: "guides/add-secrets", title: "Add secrets" },
           { path: "guides/open-ssh", title: "Open SSH" },
-          { path: "guides/use-persistent-volumes", title: "Use persistent volumes" },
-          { path: "guides/order-startup", title: "Order startup" },
           { path: "guides/manage-a-remote-server", title: "Manage a remote server" },
           { path: "guides/tear-down-and-clean-up", title: "Tear down & clean up" },
         ],

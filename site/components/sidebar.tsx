@@ -76,7 +76,7 @@ export function Sidebar() {
 
   return (
     <aside className="hidden w-[264px] shrink-0 border-r border-zinc-200 py-6 md:block dark:border-zinc-800">
-      <nav className="sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-y-auto pb-10">
+      <nav className="sidebar-scroll sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-y-auto pb-10">
         {tab.groups.map((group) => (
           <Group
             key={group.title}

@@ -1,22 +1,42 @@
 ---
 title: Storage
-description: Named volumes that outlive a microVM.
+description: Named volumes that outlive a microVM, root disks, size caps, and what happens when a disk fills.
 ---
 
-A **volume** is a named directory on the node that survives sandbox
-recreation, restarts, and stack removal. It is the way state outlives a
-microVM — everything inside the sandbox's own filesystem is ephemeral.
+A microVM's own disk goes away whenever the microVM is recreated. A
+**volume** is a named directory on the server that survives recreates,
+restarts, and stack removal. Put anything that must last — databases,
+uploads, caches you want to keep — in a volume.
 
 ## The analogy
 
-Like a Compose named volume, but backed by a directory on the MC2 node
-rather than by the Docker daemon. Mount it where the service writes state;
-that state persists across `restart`-driven recreates and across `mc2 down`
-until you explicitly delete it.
+Like a Compose named volume, but backed by a plain directory that MC2 owns on
+the server rather than by the Docker daemon. It persists across `mc2 down`
+until you delete it explicitly.
+
+## Two kinds of disk
+
+```text
+ microVM shop--db--0
+ ┌──────────────────────────────────────────┐
+ │ root disk (storage_opt.size, def. 4 GiB) │  lost when the microVM is
+ │   /usr, /etc, /root, packages, ...       │  recreated
+ │                                          │
+ │ /var/lib/postgresql/data ◄───────────────┼── volume "data" (size, def.
+ └──────────────────────────────────────────┘   10 GiB): a directory on the
+                                                 server, kept until deleted
+```
+
+- The **root disk** holds the image and anything written outside a volume.
+  Size it per service with `storage_opt.size` (default 4 GiB). It survives a
+  plain restart of a stopped microVM, but not a recreate (a crash under a
+  `restart` policy, or any config change).
+- A **volume** is mounted into the microVM at a path you choose and survives
+  everything except `mc2 down --volumes`.
 
 ## Declaring and mounting
 
-Volumes are declared at the top level and referenced by services:
+Declare volumes at the top level of the stack, then mount them in services:
 
 ```yaml
 volumes:
@@ -25,74 +45,97 @@ volumes:
     size: 10GiB        # optional; default 10 GiB
 
 services:
-  keep:
-    image: alpine:3.20
+  db:
+    image: postgres:16
+    command: ["postgres"]
     volumes:
       - name: data
-        target: /data
+        target: /var/lib/postgresql/data
 ```
 
-- The top-level declaration is required — services cannot invent volumes.
-- `kind: dir` is the only kind in v1. Disk images and snapshots are not yet
-  supported.
-- `size` is the volume's quota (compose byte sizes: `10GiB`, `512m`, or
-  bytes), default **10 GiB**. Raise it with `mc2 up`: the VM restarts and the
-  data is kept. MC2 refuses a size below what the directory already holds.
-- Volume names must match `[a-z0-9][a-z0-9._-]*`, must not contain `--` or end
-  with `-`, and are at most 63 characters.
-- Mount targets must be absolute and unique per service.
+- Services can only mount volumes declared at the top level.
+- `kind: dir` is the only kind in v1.
+- `size` takes Compose byte sizes (`10GiB`, `512m`, or bytes).
+- Volume names match `[a-z0-9][a-z0-9._-]*`, can't contain `--` or end with
+  `-`, and are at most 63 characters.
+- Mount targets must be absolute paths, unique within a service.
 
-## How names resolve
+## Where the data lives
 
-At sandbox create time, each mount resolves to the directory
-`mc2-<stack>--<volume>` under the server's volume root
-(`mc2 server --volume-dir`, default `~/.mc2/volumes`), and is mounted into the
-VM as a bind mount with an explicit write quota of `size − current usage`.
-Because the stack name namespaces the volume — and neither a stack nor a volume
-name may contain `--` — two stacks can each mount a `data` volume without
-colliding.
+Each volume is the directory `mc2-<stack>--<volume>` under the server's
+**volume root**: `<data-dir>/volumes` by default (`~/.mc2/volumes` with the
+default data dir), or wherever `mc2 server --volume-dir` points. The stack
+name is part of the directory name, so two stacks can each have a `data`
+volume without colliding.
+
+`mc2 volume ls` lists the volume directories on the server with their stack,
+declared size, and current usage — check it before a destructive
+`mc2 down --volumes`.
+
+## Size caps
+
+`size` is enforced as a write quota. Each time the microVM starts, MC2
+measures what the directory already holds and mounts it with the remaining
+allowance:
+
+```text
+ size: 10GiB
+ ├──────── used: 6 GiB ────────┼──── quota for this start: 4 GiB ────┤
+                                                  writes past it ──► ENOSPC
+```
+
+Inside the guest, `df` shows the cap, and writing past it fails with
+`No space left on device`.
+
+- **Grow a volume** by raising `size` and running `mc2 up`. The microVM
+  restarts with the new cap; the data is kept.
+- **Shrinking** below what the directory already holds is rejected at apply.
+- **Replicas share the allowance, not the cap.** If several replicas mount
+  the same volume, each gets the remaining allowance when it starts, so
+  together they can write more than `size`. Treat a volume as belonging to
+  one service replica at a time.
+- **Quotas don't protect the host disk.** Declared sizes can add up to more
+  than the disk has free. Set `mc2 server --limit-disk-mib` to reserve disk
+  at apply time (volume sizes plus root disks × replicas); `mc2 up` then
+  refuses a stack that doesn't fit.
+
+## When a disk fills
+
+MC2 checks root disks and volumes as it reconciles (volume usage is
+re-measured at most once a minute, so a condition can take up to a minute to
+appear). At 90% used it reports a warning; at 99% (or under 64 MiB free) it
+reports the disk as full.
+
+- `mc2 ps` shows the condition in its `NOTES` column (for example
+  `volume data full`).
+- `mc2 exec`, `mc2 ssh open`, and `mc2 logs` print it before running, with the
+  exact stack-file change that fixes it.
+- `mc2 up` doesn't print it — conditions from before the apply would be
+  stale. Check `mc2 ps` after the next pass.
 
 ## Lifecycle
 
-| Event | Volume survives? |
-| --- | --- |
-| Sandbox crash + `restart` recreate | Yes |
-| `mc2 up` after changing `size` | Yes (VM restarts, data kept) |
-| `mc2 down <stack>` | Yes (retained) |
-| `mc2 down <stack> --volumes` | No (deleted) |
-
-`mc2 volume ls` lists the volumes currently retained on the node (stack,
-volume name, declared size, used size, path) — useful for verifying what a
-destructive `down --volumes` would remove.
-
-## Running out of space
-
-A guest that fills a volume or its root disk sees the kernel's
-`No space left on device`. MC2 detects both conditions and tells you where:
-`mc2 ps` shows a `NOTES` entry (`volume data full`, `root disk 93%`), and
-`mc2 exec`, `mc2 ssh open`, `mc2 logs` and `mc2 up` print the exact YAML change
-to make. See
-[troubleshooting](/documentation/operations/troubleshooting).
+| Event | Root disk | Volume |
+| --- | --- | --- |
+| Command exits, microVM started again | kept | kept |
+| Crash or failed health check → recreate | **lost** | kept |
+| Config change (`mc2 up`) → recreate | **lost** | kept |
+| Volume `size` raised (`mc2 up`) | **lost** | kept |
+| `mc2 down <stack>` | **lost** | kept |
+| `mc2 down <stack> --volumes` | **lost** | **deleted** |
 
 ## Key behaviors
 
-- **Ephemeral by default.** Writes to the sandbox rootfs vanish with the
-  microVM; a volume is the explicit choice to persist. The root disk is sized
-  per service (`storage_opt.size`, default 4 GiB) and is *recreated* — not
-  grown in place — when you change it.
-- **Every volume is capped.** The quota is passed on every VM start, so a
-  runaway writer cannot fill the node's disk.
-- **Single-consumer in v1.** Treat a volume as belonging to one service at a
-  time; design caches/grids accordingly (e.g. one scale-1 cache service).
-  Replicas that share one volume each receive the remaining budget at start, so
-  concurrent writers can overshoot the declared size by up to
-  (replicas − 1) × remaining.
+- **Ephemeral by default.** Persisting is an explicit choice: mount a volume.
+- **Every volume is capped** by its declared `size`.
+- **Local to the server.** There is no replication or migration in v1; back
+  up the volume root like any other data directory.
 - **`--volumes` is destructive.** It deletes the stack's volume directories.
 
 ## Deeper
 
 - [Use persistent volumes](/documentation/guides/use-persistent-volumes) —
-  marker-file persistence end to end.
+  prove data survives a teardown.
 - [Secrets & volumes](/references/stack/secrets-volumes) — exact syntax.
-- [Throwaway test grid](/recipes/throwaway-test-grid) — a cache-volume
-  pattern.
+- [Troubleshooting](/documentation/operations/troubleshooting) — disk-full
+  fixes.

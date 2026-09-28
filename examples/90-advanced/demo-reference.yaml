@@ -24,9 +24,9 @@ services:
     #     allowHosts:
     #       - api.github.com
     restart: on-failure
-    # Optional app probe (agent runs via msb exec while Running):
+    # Optional app probe (MC2 runs it inside the VM while Running):
     # healthcheck:
-    #   test: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
+    #   test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
     #   interval: 30s
     command: ["httpd", "-f", "-p", "8000", "-h", "/"]
     labels:

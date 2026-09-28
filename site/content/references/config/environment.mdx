@@ -5,15 +5,16 @@ description: Every MC2 environment variable — client connection, telemetry, an
 
 ## Overview
 
-Every `mc2` flag that takes a value is mirrored by an environment variable. The
-client connection env vars resolve the control plane; the server env vars map
-one-to-one onto `mc2 server` flags (flags override env vars).
+These are all the environment variables MC2 reads. Where a flag has one, an
+explicit flag wins over the variable; not every flag has a variable (for
+example `--label`, `-f`, `--tail`). Client variables choose the control plane;
+server variables configure `mc2 server`.
 
 ## Client
 
 | Env var | Role | Default |
 | ------- | ---- | ------- |
-| `MC2_API` | Control plane REST base URL | — (loopback default applies) |
+| `MC2_API` | Control plane REST base URL | — (then the context's URL, then `http://127.0.0.1:7443`) |
 | `MC2_API_KEY` | Operator API bearer token | — |
 | `MC2_CONTEXT` | Named context to use (overrides the current context) | — |
 | `MC2_ALLOW_INSECURE_HTTP` | Allow plaintext `http://` for a remote (non-loopback) control plane | off |
@@ -26,9 +27,13 @@ precedence.
 
 | Env var | Role | Default |
 | ------- | ---- | ------- |
-| `MC2_OTLP_ENDPOINT` | OTLP endpoint for orchestrator + node metrics (e.g. `http://127.0.0.1:4317`) | — |
+| `MC2_OTLP_ENDPOINT` | OTLP/gRPC collector for `mc2 server` metrics (e.g. `http://127.0.0.1:4317`) | — |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Used when `MC2_OTLP_ENDPOINT` is unset | — |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Used when both of the above are unset | — |
+| `RUST_LOG` | Log filter for `mc2` and `mc2 server` (e.g. `mc2_server=debug`) | `info` |
 
-Restart the server after changing the OTLP endpoint so it picks it up.
+The first non-empty OTLP variable wins; with none set, metrics are off.
+Restart the server after changing it.
 
 ## Server
 
@@ -37,20 +42,21 @@ These map onto `mc2 server` flags. Defaults match the flag defaults.
 | Env var | Flag | Role | Default |
 | ------- | ---- | ---- | ------- |
 | `MC2_BIND` | `--bind` | Address to bind the operator REST API | `127.0.0.1:7443` |
-| `MC2_DATA_DIR` | `--data-dir` | Data directory (SQLite, tokens) | `~/.mc2` |
+| `MC2_DATA_DIR` | `--data-dir` | Data directory: database, secrets key, default volume root. Also read by `mc2 server token rotate` / `secrets purge` | `~/.mc2` |
 | `MC2_SECRETS_KEY_PATH` | `--secrets-key-path` | Path to the secrets encryption key (32 bytes) | `<data-dir>/secrets.key` |
 | `MC2_NODE_NAME` | `--node-name` | Local node display name (identity is persisted) | hostname |
 | `MC2_RECONCILE_INTERVAL_SECS` | `--reconcile-interval-secs` | Node reconcile interval in seconds | `10` |
 | `MC2_INGRESS_CONFIG_DIR` | `--ingress-config-dir` | Directory for Traefik ingress catalog files | — |
 | `MC2_PUBLIC_HOSTNAME` | `--public-hostname` | Public hostname to publish this control plane through the ingress catalog | — |
 | `MC2_PUBLIC_TLS_CERT_RESOLVER` | `--public-tls-cert-resolver` | Traefik cert resolver for the control-plane TLS route | `le` |
-| `MC2_VOLUME_DIR` | `--volume-dir` | Root for MC2-owned volume directories (bind mounts) | `~/.mc2/volumes` |
+| `MC2_VOLUME_DIR` | `--volume-dir` | Root for MC2-owned volume directories (bind mounts) | `<data-dir>/volumes` |
 | `MC2_NO_AUTH` | `--no-auth` | Skip API auth for this run (lab only; loopback bind unless the remote escape hatch is set) | `false` |
 | `MC2_ALLOW_UNAUTHENTICATED_REMOTE` | `--allow-unauthenticated-remote` | Confirm `--no-auth` on a non-loopback bind | `false` |
-| `MC2_MAX_CONNECTIONS` | `--max-connections` | Max concurrent REST connections (extra ones get `503`) | `256` |
+| `MC2_ALLOW_HOST_PROFILE` | `--allow-host-profile` | Allow `network.profiles: [host]` (guests can reach host services, including the API) | `false` |
+| `MC2_MAX_CONNECTIONS` | `--max-connections` | Max concurrent REST connections (extra ones get `503`; minimum 1) | `256` |
 | `MC2_REQUEST_TIMEOUT_SECS` | `--request-timeout-secs` | Whole-request deadline for ordinary REST routes (`exec`/`logs` exempt; `0` disables) | `60` |
-| `MC2_MAX_SSH_SESSIONS` | `--max-ssh-sessions` | Max concurrent SSH sessions across every instance listener | `64` |
-| `MC2_MAX_SSH_SESSIONS_PER_LISTENER` | `--max-ssh-sessions-per-listener` | Max concurrent SSH sessions for one instance listener | `16` |
+| `MC2_MAX_SSH_SESSIONS` | `--max-ssh-sessions` | Max concurrent SSH sessions across every instance listener (minimum 1) | `64` |
+| `MC2_MAX_SSH_SESSIONS_PER_LISTENER` | `--max-ssh-sessions-per-listener` | Max concurrent SSH sessions for one instance listener (minimum 1) | `16` |
 | `MC2_LIMIT_CPUS` | `--limit-cpus` | Max reserved CPUs across the cluster | `0` (unlimited) |
 | `MC2_LIMIT_MEMORY_MIB` | `--limit-memory-mib` | Max reserved memory MiB across the cluster | `0` (unlimited) |
 | `MC2_LIMIT_DISK_MIB` | `--limit-disk-mib` | Max reserved disk MiB: declared volume sizes + root disks × replicas | `0` (unlimited) |

@@ -1,98 +1,164 @@
 ---
 title: Scale & restart
-description: Replicas, per-replica published ports, and crash resilience.
+description: Run several replicas with their own host ports, and have MC2 replace one when it stops serving.
 ---
 
-**You will learn:** scale a service to multiple replicas, understand
-per-replica port allocation, and make it survive crashes with `restart`.
+**You will learn:** run a service as three replicas, reach each one on its
+own host port, and make MC2 replace a replica whose server has died.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+**Prerequisites:** [Change a running stack](/documentation/guides/run-your-first-stack).
 
 ## The stack
 
-```yaml
-name: shop
+Save this as `shop.yaml`:
 
+```yaml
 services:
   web:
     image: python:3.12-alpine
     scale: 3
     restart: on-failure
+    command: ["python", "-m", "http.server", "8000"]
     ports:
-      - "8080:8000"
-    command: 'exec python -m http.server 8000'
+      - "18080:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/"]
+      interval: 2s
+      timeout: 2s
+      retries: 2
+      start_period: 10s
 ```
 
-## Scale it up
+- `scale: 3` — three instances, each its own microVM.
+- `restart: on-failure` — replace a replica that crashes or fails its health
+  check.
+- `healthcheck` — every 2 s, fetch the page from inside the VM. Two failures
+  in a row count as a crash; failures in the first 10 s after boot don't
+  count, so a slow start isn't punished.
+
+<Steps>
+
+<Step title="Bring it up">
 
 ```bash
-mc2 up -f stack.yaml
-mc2 ps
+mc2 up -f shop.yaml
+mc2 ps --stack shop
 ```
 
-Three instances, each its own microVM. With `scale > 1` and a published
-port, each replica gets a distinct host port: fixed `8080` becomes the block
-**`8080, 8081, 8082`** (ordinal 0 keeps `8080`).
+Repeat `mc2 ps` until all three replicas are `Running` (the first run
+downloads the image).
+
+</Step>
+
+<Step title="Reach each replica">
+
+A fixed host port with `scale: 3` becomes a block of three, one per replica:
+
+```text
+ shop/web/0 ──► 127.0.0.1:18080 ──► guest :8000
+ shop/web/1 ──► 127.0.0.1:18081 ──► guest :8000
+ shop/web/2 ──► 127.0.0.1:18082 ──► guest :8000
+```
 
 ```bash
-curl -s http://127.0.0.1:8080/   # replica 0
-curl -s http://127.0.0.1:8082/   # replica 2
+for port in 18080 18081 18082; do
+  curl -s -o /dev/null -w "$port %{http_code}\n" http://127.0.0.1:$port/
+done
+# 18080 200
+# 18081 200
+# 18082 200
 ```
 
-A target-only port (`"3001"`) gets a distinct auto-allocated host port per
-replica instead. Allocations are stable across re-applies.
+A target-only port (`"8000"`) would instead get an automatic host port per
+replica. Either way, allocations stay the same across re-applies.
 
-## Make it resilient
+</Step>
 
-`restart: on-failure` tells MC2 to re-create a replica that exits
-non-zero. Kill one from inside and watch it come back:
+<Step title="Kill a replica's server">
+
+Stop the Python server inside replica 1:
 
 ```bash
-mc2 exec shop/web/1 /bin/sh -c 'kill 1'   # simulate a crash
-mc2 ps                          # replica recreated, not left dead
+mc2 exec shop/web/1 /bin/sh -c '(sleep 1; kill "$(pidof python)") >/dev/null 2>&1 &'
 ```
 
-`restart` accepts `no | on-failure | always | unless-stopped`.
-
-## Address replicas
-
-Each replica is addressable as `<stack>/<service>/<ordinal>`:
+(The kill runs in the background so `mc2 exec` returns before the server
+dies.) Watch replica 1:
 
 ```bash
-mc2 exec shop/web/2 /bin/sh -c 'echo third replica'
-mc2 logs shop/web/0 --follow
+mc2 ps --stack shop -o json   # or just mc2 ps --stack shop, repeatedly
 ```
+
+Within a few seconds its health check fails twice, and the replica goes to
+`Creating` with a message like `restart backoff 2s`, then back to `Running`.
+The other two replicas are untouched throughout.
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18081/
+# 200
+```
+
+</Step>
+
+<Step title="Scale down">
+
+Change `scale: 3` to `scale: 2` and apply:
+
+```bash
+mc2 up -f shop.yaml
+mc2 ps --stack shop     # web/0 and web/1 only
+```
+
+The highest ordinal is removed and its host port (18082) is released. The
+remaining replicas keep their IDs and ports.
+
+</Step>
+
+<Step title="Clean up">
+
+```bash
+mc2 down shop
+```
+
+Later guides reuse nearby ports, so tear each guide's stack down when you
+finish it.
+
+</Step>
+
+</Steps>
+
+## Why the health check matters
+
+MC2 watches the **microVM**. If the VM stops or crashes, `restart` handles
+it. But a server process can die while its VM keeps running — MC2 would still
+see `Running`. A health check that exercises the service catches that case,
+and a failure past `retries` is treated like a crash.
+
+Repeated restarts wait longer each time — 2 s, 5 s, 15 s, then 30 s — so a
+crash loop can't restart on every pass. The wait resets after 60 s of
+continuous `Running`.
 
 ## Key behaviors
 
-- **Distinct host ports per replica** — no port bookkeeping.
-- **Scale down deletes the extras.** Lowering `scale` removes the replicas
-  above the new count (and frees their host ports); the remaining ones keep
-  their identity, ports and placement. `mc2 up` is all-or-nothing, so a
-  rejected apply leaves the running stack untouched.
-- **Ingress follows the running replica.** With a scaled service, a route
-  targets a Running replica whose healthcheck has passed (when the service
-  declares one), otherwise any Running replica, otherwise the lowest ordinal —
-  and it always points at *that* replica's own host port. If replica 0 is
-  `Stopped`, the route fails over to replica 1 and uses replica 1's port.
-- **`restart` + reconcile = self-healing.** Without it, a crash surfaces as
-  `Failed`. With it, the replica is re-created — and repeated restarts are
-  spaced by a backoff (`2s`, `5s`, `15s`, then `30s`, reset after `60s` of
-  continuous `Running`). A restart the runtime performs on a crashed sandbox
-  itself counts the same as a failed start, so a crash loop cannot restart on
-  every reconcile pass.
+- **Distinct host ports per replica**, with no bookkeeping on your side.
+- **Scale down removes the highest ordinals** and frees their ports.
+- **A recreate starts from the image.** Files the replica wrote outside a
+  volume are gone; see
+  [Use persistent volumes](/documentation/guides/use-persistent-volumes).
+- **Ingress follows a live replica.** A route targets a healthy `Running`
+  replica (or any `Running` one) and that replica's own host port.
 
 ## Next
 
 <Cards cols={2}>
   <Card
-    title="Connect services"
-    description="East–west networking between services."
-    href="/documentation/guides/connect-services"
+    title="Order startup"
+    description="Hold a service back until its dependency is healthy."
+    href="/documentation/guides/order-startup"
   />
   <Card
     title="Services & instances"
-    description="The phase model and service keys."
+    description="Phases, restart policies, and health checks."
     href="/documentation/concepts/services-and-instances"
   />
 </Cards>

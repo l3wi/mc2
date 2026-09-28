@@ -1,81 +1,110 @@
 ---
 title: Glossary
-description: The terms MC2 uses — stack, service, instance, phase, desired state, reconcile loop, and the network planes.
+description: Every MC2 term, defined once — objects, lifecycle, networking, storage, secrets, and access.
 ---
 
-MC2 reuses Docker Compose vocabulary where it can, but a few words carry
-specific meaning. This page defines the terms used across the documentation.
+MC2 reuses Docker Compose vocabulary where it can, but a few words carry a
+specific meaning. Each term is defined once here, with a link to the page
+that explains it.
 
 ## Core objects
 
-- **Stack** — the desired-state document `mc2 up -f <file>` publishes. A
-  Compose-shaped YAML file with a top-level `name` and `services` map, plus
-  optional `volumes`, `networks`, and `ingress`. See
+- **Stack** — the YAML document `mc2 up -f <file>` sends: a `name`, a
+  `services` map, and optional `volumes`, `networks`, and `ingress`. One file
+  is the whole desired state of that stack. See
   [Stacks](/documentation/concepts/stacks).
-- **Service** — one named workload inside a stack: an image, resource limits,
-  and runtime behavior. A stack describes services; services produce
-  instances. See [Services & instances](/documentation/concepts/services-and-instances).
-- **Instance** — one replica of a service: one detached microVM with its own
-  kernel. Addressable as `<stack>/<service>/<ordinal>` (e.g. `shop/web/0`).
-- **Desired state** — what you declared in the stack file. It is durable and
-  idempotent; reality is converged toward it. See
+- **Service** — one named workload in a stack: an image, a command,
+  resources, and runtime behavior. See
+  [Services & instances](/documentation/concepts/services-and-instances).
+- **Instance** — one replica of a service, running in its own microVM.
+  Addressed as `<stack>/<service>/<ordinal>` (e.g. `shop/web/0`) or by UUID.
+- **Ordinal** — an instance's replica number, from `0` to `scale − 1`.
+- **microVM** — a lightweight virtual machine with its own kernel, created
+  by the embedded microsandbox runtime. Also called a *sandbox*; its runtime
+  name is `<stack>--<service>--<ordinal>`.
+- **Node** — the machine `mc2 server` runs on. v1 has exactly one, and it is
+  the server itself.
+
+## Lifecycle
+
+- **Desired state** — what you declared, as accepted by the server and stored
+  in its database. See
   [Desired state & reconciliation](/documentation/concepts/desired-state).
-- **Reconcile loop** — the server's periodic pass that compares desired state
-  to reality and creates, restarts, or tears down instances until they match.
-- **Phase** — an instance's lifecycle state: `Pending` (scheduled, not yet
-  running), `Running`, or `Failed`. Restart policies re-create failed
-  instances instead of leaving them dead.
-- **Node** — the host machine `mc2 server` runs on. In v1 there is one node,
-  and it is the same machine that runs the server.
+- **Apply** — what `mc2 up` does: validate the whole file, plan every change,
+  and commit it in one transaction — or reject it and change nothing.
+- **Reconcile loop** — the server's periodic pass (every
+  `--reconcile-interval-secs`, default 10) that makes the running microVMs
+  match the desired state.
+- **Phase** — an instance's lifecycle state: `Pending`, `Scheduled`,
+  `Creating`, `Running`, `Stopped`, or `Failed`.
+- **Restart policy** — `restart:` — what happens after `Stopped` or
+  `Failed`: `no` (leave it), or `on-failure` / `always` / `unless-stopped`
+  (start a stopped microVM again, recreate a failed one).
+- **Recreate** — delete a microVM and build a new one from the image. Happens
+  after a failure under a restart policy and on any create-time config change;
+  files outside volumes are lost.
+- **Backoff** — the growing wait between restarts (2 s, 5 s, 15 s, 30 s),
+  reset after 60 s of healthy running.
+- **Health check** — `healthcheck:` — a command run in the guest on an
+  interval; failing past `retries` counts as a crash.
+- **Startup gate** — `depends_on:` holding an instance in `Pending` until
+  its dependencies are started or healthy. It applies only to the first
+  start.
+- **Adoption** — on restart, the server takes back the microVMs it created
+  (recognized by its install id label) instead of recreating them.
 
 ## Networking
 
-- **North–south** — traffic in and out of the box: `ports` host forwards and
-  the Traefik `ingress` catalog. Host ports always bind loopback.
-- **East–west** — service-to-service traffic over shared networks: `expose`
-  listeners + default-allow `svc.<network>.svc.mc2` DNS.
-- **Service network** — a server-wide named network services join via
-  `networks:`. Sharing a network grants default-allow reachability; the DNS
-  suffix is `.svc.mc2`.
-- **Mediated network** — the only network `mode` in v1. Networking is set up
-  by MC2 on the host (an L4 splice), rather than giving the guest direct
-  access to a bridge.
-- **Network profile** — a service's egress posture via `network.profiles`, a
-  closed set: `public` (default), `private` (no internet egress), `host`
-  (whole host loopback; only with the server flag `--allow-host-profile`), or
-  `none` (no guest networking at all, and then the only entry). Unknown values
-  are rejected, never treated as `public`.
-- **Port claim** — an `expose` port is claimed exclusively server-wide at
-  apply time and its L4 listener is held until the stack is removed. A second
-  stack claiming the same port is rejected with the owner named.
-- **Ingress** — hostname + TCP routes MC2 renders into a Traefik file catalog
-  (`--ingress-config-dir`) that you run. See
-  [Networking](/documentation/concepts/networking).
+- **Host port** — `ports:` — a host port on `127.0.0.1` forwarded to a guest
+  port. See [Networking](/documentation/concepts/networking).
+- **Service network** — a group of services that can reach each other's
+  exposed ports by name. Every stack has an implicit one named after the
+  stack; named networks (`networks:`) are server-wide and can span stacks.
+- **Expose** — `expose:` — a port a service serves to its networks. Exposed
+  ports are exclusive across the whole server.
+- **Splice** — the listener MC2 holds on `127.0.0.1:<port>` for each exposed
+  port, forwarding each connection to a ready replica.
+- **Service DNS name** — `<service>` or `<service>.<stack-or-network>.svc.mc2`,
+  resolvable inside guests.
+- **Egress profile** — `network.profiles:` — what a guest may reach
+  outbound: `public` (default), `private`, `host`, or `none`.
+- **Ingress** — public hostnames and TCP routes MC2 writes as a Traefik
+  file-provider catalog to `--ingress-config-dir`; you run Traefik.
+- **Public hostname** — `--public-hostname` — publishes the MC2 API itself
+  through that catalog.
 
-## Storage & secrets
+## Storage and secrets
 
-- **Volume** — a named directory on the node that survives sandbox recreation
-  and stack removal, mounted into a service at an absolute guest path. Only
-  `kind: dir` in v1. See [Storage](/documentation/concepts/storage).
-- **Secret** — a server-wide, encrypted-at-rest value referenced by name from
-  a stack. The guest never holds the raw value; it is attached per-connection
-  to `allowHosts`. Distinct from plaintext `environment:`. See
+- **Volume** — a named directory on the server, mounted into services, that
+  survives recreates and `mc2 down`. See
+  [Storage](/documentation/concepts/storage).
+- **Volume root** — the directory holding every volume: `<data-dir>/volumes`
+  unless `--volume-dir` says otherwise.
+- **Root disk** — a microVM's own writable disk (`storage_opt.size`, default
+  4 GiB), lost on recreate.
+- **Disk condition** — a warning (≥ 90% used) or full (≥ 99%, or under
+  64 MiB free) state reported in `mc2 ps` `NOTES`.
+- **Secret** — a value stored encrypted on the server, referenced by name
+  from stacks. The guest sees a placeholder; the real value is added only to
+  TLS connections to its `allowHosts`. See
   [Secrets](/documentation/concepts/secrets).
 
-## Identity
+## Server and access
 
-- **Context** — a named bundle of API URL + token so the CLI can switch
-  between servers. Lives in `~/.mc2/config.toml` (mode 0600).
-- **Local vs remote mode** — loopback API (token optional) vs any other host
-  (https + token required, plaintext refused unless opted in). See
+- **Data dir** — `--data-dir`, default `~/.mc2`: the database (`mc2.db`),
+  the secrets key (`secrets.key`), and by default the volume root.
+- **API token** — the bearer token (`mc2at_…`) every `/v1` request needs.
+  The server stores only its hash; replace it with `mc2 server token rotate`.
+- **Context** — a saved API URL and token on the client, in
+  `~/.mc2/config.toml`. See
   [Identity & contexts](/documentation/concepts/identity-and-contexts).
-- **API token** — the operator REST bearer token (`mc2at_…`), shown once on
-  first bootstrap (stderr on a TTY, else `<data-dir>/bootstrap-token` at
-  0600). Treat it like a root password; recover with `mc2 server token
-  rotate`.
+- **Local / remote mode** — whether the API URL is loopback (`http://` fine)
+  or not (`https://` required by the CLI).
+- **Resource budget** — optional `--limit-cpus`, `--limit-memory-mib`, and
+  `--limit-disk-mib` caps that `mc2 up` checks before accepting a stack.
 
 ## Versioning
 
-- **Pre-release (0.x)** — minor versions from `dev` feature work; patch
-  versions from `main` hotfixes; nightly `-dev` prereleases from `dev`. See
+- **Pre-release (0.x)** — minor versions come from `dev`, patch versions
+  from `main` hotfixes, and nightly `-dev` prereleases from `dev`. See
   [Upgrade & migrate](/documentation/operations/upgrade-and-migrate).

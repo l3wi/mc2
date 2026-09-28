@@ -1,60 +1,92 @@
 ---
 title: Tear down & clean up
-description: Removal semantics — what down keeps, what --volumes deletes.
+description: What mc2 down removes and keeps, how to delete volumes safely, and what outlives every stack.
 ---
 
-**You will learn:** remove stacks and their state safely, and understand the
-retention semantics so you never delete data by accident.
+**You will learn:** remove a stack without losing data by accident, delete
+its volumes when you mean to, and clean up the things that live outside any
+stack.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+**Prerequisites:** [Manage a remote server](/documentation/guides/manage-a-remote-server)
+(or any earlier guide) and a stack to remove.
 
-## The command
+## Check before you remove
 
 ```bash
-mc2 down <stack>             # instances + definition removed
-mc2 down <stack> --volumes   # also deletes the stack's named volumes
+mc2 ps --stack <stack>     # its instances
+mc2 volume ls              # volumes on the server, with size and path
 ```
 
-`rm` is an alias for `down`.
+## Choose one command
 
-## What gets removed
+```bash
+mc2 down <stack>             # remove instances and the stack definition
+mc2 down <stack> --volumes   # ...and delete the stack's volumes too
+```
 
-| Artifact | `mc2 down` | `mc2 down --volumes` |
+These are alternatives, not steps. `rm` is an alias for `down`.
+
+| Thing | `mc2 down` | `mc2 down --volumes` |
 | --- | --- | --- |
-| Sandbox instances | Yes | Yes |
-| Stack definition (desired state) | Yes | Yes |
-| Named volumes | **No** | Yes |
-| Secrets / keys | No | No |
-| Contexts | No | No |
+| Instances and their microVMs | removed | removed |
+| Stack definition | removed | removed |
+| Host ports and exposed-port claims | released | released |
+| Volumes | **kept** | deleted |
+| Secrets, SSH keys | kept | kept |
+| CLI contexts (on your machine) | kept | kept |
 
-Secrets and SSH keys are **server-wide** and independent of any stack — a
-stack teardown never touches them. Remove them explicitly:
+```text
+ mc2 down shop ────────────► instances, definition gone; volumes kept
+                                   │
+ mc2 up -f shop.yaml ◄─────────────┘ (volumes reattach with their data)
 
-```bash
-mc2 secret ls && mc2 secret rm <name>
-mc2 ssh keys && mc2 ssh rm-key <name>
+ mc2 down shop --volumes ──► instances, definition, and volumes gone
 ```
 
-## Clean-up hygiene
+<Warning title="Deleting volumes later">
+  `--volumes` finds volumes through the stack's definition. After a plain
+  `mc2 down`, the definition is gone and `mc2 down <stack> --volumes` returns
+  `404 stack not found`. To delete retained volumes later, re-apply the stack
+  first, then run `mc2 down <stack> --volumes`.
+</Warning>
 
-- **Verify before destroying.** `mc2 ps` shows what's running; `mc2 volume ls`
-  lists the named volumes retained on the node (stack, volume, size, path).
-- **Don't hand-edit the data dir.** Back it up, don't mutate it.
-- **Idempotent tear-down.** `mc2 down` on an already-removed stack is a
-  no-op, not an error.
+Running `mc2 down` on a stack that no longer exists returns
+`404 stack not found: <stack>` — it isn't silently ignored.
 
-## What you learned
+## Things that outlive stacks
 
-- `down` stops and forgets; `down --volumes` also destroys data.
-- Server-wide stores (secrets, keys, contexts) are never torn down with a
-  stack.
+Secrets and SSH keys are server-wide and never removed with a stack:
+
+```bash
+mc2 secret ls      && mc2 secret rm <name>
+mc2 ssh keys       && mc2 ssh rm-key <name>
+```
+
+Remove a stack **before** the secrets it uses: deleting a referenced secret
+marks its consumers `Failed` without clearing the value from their running
+microVMs.
+
+Contexts are settings of the CLI on your own machine (`~/.mc2/config.toml`),
+not server state.
+
+## Removing everything
+
+To remove MC2 from a machine:
+
+1. `mc2 down <stack> --volumes` for every stack (`mc2 ps` lists them).
+2. Stop the server.
+3. Delete the data dir (`~/.mc2` by default) — the database, the secrets
+   key, and the volume root. Back it up first if there's any chance you'll
+   want it.
+
+Stopping the server alone doesn't stop running microVMs; `mc2 down` does.
 
 ## Next
 
 <Cards cols={2}>
   <Card
     title="Run the server"
-    description="Server flags, env vars, and day-2 operation."
+    description="Flags, supervision, and backups."
     href="/documentation/operations/run-the-server"
   />
   <Card

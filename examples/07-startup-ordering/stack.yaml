@@ -10,22 +10,22 @@ name: startup-ordering
 services:
   db:
     image: postgres:16
+    # MC2 runs `sleep infinity` when `command` is omitted, not the image CMD.
+    command: ["postgres"]
     scale: 1
     cpus: 1
     mem_limit: 256m
     network:
       profiles: [public]
-    expose:
-      - port: 5432
     environment:
       POSTGRES_PASSWORD: lab
       POSTGRES_DB: app
     healthcheck:
-      test: ["pg_isready", "-q", "-U", "postgres"]
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
       interval: 5s
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
     restart: on-failure
 
   web:

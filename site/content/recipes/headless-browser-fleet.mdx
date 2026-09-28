@@ -1,111 +1,129 @@
 ---
 title: Headless browser fleet
-description: Run N scraper microVMs, each network-locked with network.profiles to only the hosts it talks to, and each disposable with mc2 down.
+description: Run many scraper microVMs from one definition, give each only the network it needs, and dispose of the fleet in one command.
 ---
 
 ## What you'll build
 
-A fleet of N scraper microVMs. Every scraper runs in its own kernel-level
-microVM and is network-locked: `network.profiles: [private]` blocks public
-egress (or `[none]` for fully offline VMs). Verify the isolation with
-`mc2 network`, and dispose of the whole fleet with `mc2 down --volumes`.
+A fleet of headless-browser scrapers, one microVM each: a page that exploits
+the browser lands in a throwaway VM, not on your host or in a neighbour. A
+separate parser service handles the scraped files with networking switched
+off.
+
+```text
+ scraper/0..N  (profile: public)  ──► the websites you scrape
+      │ writes results
+      ▼
+ volume "results"
+      │ reads
+      ▼
+ parser/0      (profile: none)    ──► no network at all
+```
+
+<Note title="Bring your own image">
+  MC2 doesn't build images. You need an OCI image with your browser runtime
+  (Playwright, Puppeteer, …) and your scraper; below it's
+  `registry.example.com/scraper:latest` with an entry point
+  `/usr/local/bin/scrape`. Replace both.
+</Note>
 
 ## The stack
 
-Save this as `scraper-fleet.yaml`:
+Save as `scraper-fleet.yaml`:
 
 ```yaml
 name: scraper-fleet
-
+volumes:
+  results:
+    size: 5GiB
 services:
   scraper:
-    image: <scraper-image>    # e.g. a Playwright or Puppeteer image
-    scale: 30
+    image: registry.example.com/scraper:latest
+    scale: 10
     cpus: 1
-    mem_limit: 512m
+    mem_limit: 2g                  # browsers are hungry
+    storage_opt:
+      size: 8GiB                   # browser caches live on the root disk
+    command: ["/usr/local/bin/scrape", "--job", "prices", "--out", "/results"]
+    volumes:
+      - name: results
+        target: /results
+    restart: on-failure
+  parser:
+    image: python:3.12-alpine
     network:
-      profiles: [private]     # no public egress; only allowed network edges
-    restart: always
-    command: ["/usr/local/bin/scrape", "--job", "prices"]
+      profiles: [none]             # parses untrusted input with no network
+    volumes:
+      - name: results
+        target: /results
 ```
 
-- `scale: 30` — thirty microVMs from one definition; each scraper is isolated
-  in its own VM.
-- `network.profiles: [private]` — the sandbox gets no public internet; it can
-  only use the network edges MC2 grants it. For a scraper that only parses
-  already-fetched input, use `[none]` to disable networking entirely.
-- `restart: always` — a crashed scraper is re-created by the reconcile loop;
-  with `restart: no` a failed scrape stays `Failed` in `mc2 ps`.
+- `scale: 10` — ten scrapers, each a separate microVM with its own kernel.
+- Scrapers keep the default `public` profile: they need the internet.
+  `private` would block public addresses, and `none` removes networking.
+- `restart: on-failure` — a crashed scraper is recreated as a fresh VM. A
+  scraper that finishes normally stops and stays `Stopped`.
+- `parser` shares the `results` volume but has **no network**; even if a
+  scraped file exploits it, there's nowhere to send data.
+- The scrapers write to one shared volume; have each write its own files
+  (for example, name them by `hostname`) so they don't collide.
 
 ## Run it
 
 <Steps>
-<Step title="Apply the fleet">
+
+<Step title="Apply">
 
 ```bash
 mc2 up -f scraper-fleet.yaml
-```
-
-</Step>
-<Step title="Confirm the fleet is running">
-
-```bash
 mc2 ps --stack scraper-fleet
 ```
 
+10 × 2 GiB of memory must fit the host (and any `--limit-memory-mib`), or
+the apply is refused with a breakdown.
+
 </Step>
-<Step title="Tail a scraper's logs">
+
+<Step title="Watch a scraper">
 
 ```bash
-mc2 logs scraper-fleet/scraper/0 --tail 50
 mc2 logs scraper-fleet/scraper/7 --follow
 ```
 
 </Step>
-<Step title="Exec into a scraper">
+
+<Step title="Check the egress split">
 
 ```bash
-mc2 exec scraper-fleet/scraper/4 /bin/sh -c 'echo scrape-ok'
+mc2 exec scraper-fleet/parser/0 /bin/sh -c 'wget -q -T 5 -O /dev/null https://example.com && echo reachable || echo blocked'
+# wget: bad address 'example.com'
+# blocked
+```
+
+With `[none]` there's no DNS or route at all. (With `[private]` you'd see
+`Connection refused` for public addresses instead.)
+
+</Step>
+
+<Step title="Dispose of everything">
+
+```bash
+mc2 down scraper-fleet             # VMs gone, results kept
+mc2 down scraper-fleet --volumes   # results gone too
 ```
 
 </Step>
+
 </Steps>
-
-## Verify
-
-Confirm the fleet's network membership:
-
-```bash
-mc2 network scraper-fleet
-```
-
-lists the fleet's network with its member instances and ports. Isolation is
-enforced by the network profile: a request from a `[private]` VM to a public
-host fails — there is no route out:
-
-```bash
-mc2 exec scraper-fleet/scraper/0 wget -qO- http://example.com
-```
-
-Under `[private]` this cannot connect; under `[none]` the sandbox has no
-networking at all.
-
-Dispose of the fleet when done:
-
-```bash
-mc2 down scraper-fleet --volumes
-```
 
 ## Notes
 
-- Network profiles are `public` (default), `private`, `host`, and `none` — a
-  closed set (unknown values are rejected, not defaulted to public).
-  `[private]` keeps the microVM off the public internet; `[none]` turns off
-  networking entirely. `[host]` gives the guest the whole host loopback and
-  needs the server flag `--allow-host-profile`.
-- Each scraper is a full microVM, so 30 scrapers = 30 VMs — budget CPU and
-  memory on the host.
-- A scraper that legitimately needs the internet should use
-  `network.profiles: [public]`; lock down the others.
-- Same-node only in v1. See [Networking](/documentation/concepts/networking)
-  for the three network planes.
+- **Egress is by address class, not by hostname.** Profiles allow public
+  addresses, private/LAN addresses, both, or nothing. MC2 has no per-hostname
+  egress allow-list; if scrapers need credentials for specific APIs, use
+  [secrets](/documentation/concepts/secrets) with `allowHosts` so the real
+  value only reaches those hosts.
+- **Budget the root disk.** Browser caches and downloads outside a volume
+  fill `storage_opt.size`; `mc2 ps` flags it in `NOTES`.
+- **Throughput vs. isolation.** Each scraper is a whole VM. Run several
+  browser contexts per VM if you need more pages per GiB of RAM.

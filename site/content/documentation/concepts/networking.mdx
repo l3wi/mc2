@@ -1,103 +1,135 @@
 ---
 title: Networking
-description: Three planes — host ports, service networks, and ingress — that compose independently.
+description: Three planes — host ports, service networks, and ingress — plus per-service egress profiles.
 ---
 
-MC2 has three network planes. They solve different problems and compose
-together:
+MC2 connects things in three separate ways. Each solves one problem, and a
+service can use any combination:
 
-1. **Host ports** (`ports`) — *outside-in* access to a single instance.
-2. **Service networks** (`expose` + `networks`) — *inside-in* communication
-   between services.
-3. **Ingress** (`ingress:` + `ports`) — *hostname* routing through a BYO
-   Traefik proxy.
+| Plane | Stack keys | Who connects | To what |
+| --- | --- | --- | --- |
+| **Host ports** | `ports` | you, on the server machine | one instance |
+| **Service networks** | `expose`, `networks` | other services (guests) | a service, by name |
+| **Ingress** | `ingress`, hostname `ports` | the internet, via your Traefik | a service, by hostname |
+
+```text
+ You on the host ──► 127.0.0.1:published ─────────────────► instance:target
+ Another guest   ──► <service>:port ──► MC2 splice ───────► a ready replica
+ Internet        ──► your Traefik ──► 127.0.0.1:published ─► instance:target
+```
 
 ## The analogy
 
-Compose has `ports` and `expose`; Kubernetes has NodePort/Ingress and the pod
-network. MC2 keeps the Compose vocabulary but the model is deliberate: host
-ports are loopback-only by default, services on a shared network reach each
-other by default (Docker-style), and anything you want reachable by name or
-from outside goes through ingress.
+Compose has `ports` and `expose`; Kubernetes has NodePort, Ingress, and the
+pod network. MC2 keeps the Compose vocabulary with stricter defaults:
+published host ports bind loopback only, services on a shared network reach
+each other's exposed ports by default, and public traffic arrives through a
+Traefik proxy you run.
 
-## 1. Host ports (north–south)
+## 1. Host ports
 
-`ports` maps a host port to a guest port. Host ports **always bind loopback**
-— the public path is ingress, not an open host bind.
+`ports` maps a host port to a guest port. Host ports **always bind
+`127.0.0.1`** — nothing is published on a public interface by accident. The
+public path is ingress.
 
 ```yaml
 services:
   web:
     image: alpine:3.20
     ports:
-      - "8080:8000"       # fixed published:target
-      - "8001"            # target-only → auto host port (stable)
-      - "mcp.example.com:3000"  # hostname sugar → ingress route (TLS)
+      - "8080:8000"              # host 8080 → guest 8000
+      - "8001"                   # guest 8001 → an automatic host port
+      - "mcp.example.com:3000"   # hostname → an ingress route to guest 3000
 ```
 
-With `scale > 1`, each replica gets a distinct host port (`8080, 8081,
-8082`); target-only ports get a distinct auto port per replica.
+With `scale: 3`, `8080:8000` becomes host ports 8080, 8081, and 8082, one per
+replica. Automatic ports start at 10000 and stay the same across re-applies.
+The assigned host ports are in each instance's spec: `mc2 ps -o json` (the
+`ports` list inside `spec_json`).
 
-## 2. Service networks (east–west)
+## 2. Service networks
 
-A service declares `expose` (internal listeners). Every other service that
-shares a **network** reaches it by default via the node loop's L4 splice,
-with `<service>.<network>.svc.mc2` DNS. A service needs no `expose` of its own
-to be a client — it still gets an egress edge to each peer port on its
-networks — and replicas of one service can reach their own service's name and
-port (the splice round-robins across them).
+A service lists the ports it serves in `expose`. Any service that shares a
+**network** with it can connect to those ports by name.
+
+- Every stack has an implicit network named after the stack, and every service
+  in the stack joins it. Add `networks: [name]` to also join a named network,
+  which can be shared across stacks.
+- Inside the guest, a peer resolves as just `<service>`, or by its full
+  name: `<service>.<stack>.svc.mc2` for a service in the same stack, and
+  `<service>.<network>.svc.mc2` (the shared named network) for a service in
+  another stack.
+- A client needs no `expose` of its own, and replicas of a service can reach
+  their own service's name.
 
 ```yaml
+name: smoke
 services:
   echo:
-    image: alpine:3.20
-    expose: [8080]
+    image: python:3.12-alpine
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo hello > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 18100"]
+    expose: [18100]
   client:
     image: alpine:3.20
 ```
 
+Save it as `smoke.yaml`, run `mc2 up -f smoke.yaml`, wait for `mc2 ps` to
+show both instances `Running`, then:
+
 ```bash
-mc2 exec smoke/client/0 wget -qO- http://echo.smoke.svc.mc2:8080/
+mc2 exec smoke/client/0 wget -qO- http://echo.smoke.svc.mc2:18100/
+# hello
 ```
 
-- **Default-allow.** No allow edges to declare — sharing a network is enough.
-- **Networks are server-wide.** Named networks need no top-level declaration;
-  stacks can join the same one, so services in *different* stacks can talk.
-- **`mc2 network`** lists every network and its members; `mc2 network <name>`
-  drills in; `mc2 network <stack>/<service>/<ordinal>` shows one instance's
-  observed exposes/edges; it also prints the owner of every claimed port.
-- **Exposed ports are exclusive server-wide, claimed at apply.** A guest
-  resolves every name to the one gateway IP and msb rewrites `gateway:P` to
-  host `127.0.0.1:P` with no remap, so a splice can only tell services apart by
-  port. `mc2 up` therefore rejects an `expose` port another stack already
-  claims (400, naming the owner), a port MC2 already takes (the REST bind, any
-  SSH listener, any published `ports:` host port, or 53), and a port a host
-  process is already listening on — unlike Docker, same-port isolation across
-  networks isn't possible in v1. Pick another port and update the client's
-  connection string.
-- **The listener is held for the claim's lifetime**, from apply until the stack
-  is removed — even while the service has no Running backend. A client then sees
-  *accept-then-close* instead of *connection refused*, and no host process can
-  take the port while the claim lives.
-- **Privileged ports on Linux.** A non-root server can't bind `expose: 80/443`
-  (or any port below `net.ipv4.ip_unprivileged_port_start`), so `mc2 up` rejects
-  them with the exact fix: grant `CAP_NET_BIND_SERVICE` (`setcap` or systemd
-  `AmbientCapabilities`), lower the unprivileged threshold, or choose a port
-  above 1023.
-- **Fail closed.** If the listener somehow can't bind by the time an instance
-  would be created, that instance is reported `Failed` (naming the port and the
-  cause) and its microVM is **not** created: the egress rule is create-time, so
-  a guest whose `Host:tcp:P` rule could reach a foreign process must never start.
-- **Minimal churn.** A sandbox is recreated only when the *set* of allowed
-  ports on its networks changes — not when a neighbour is renamed, restarted, or
-  moved. Adding a new `expose` port recreates the services that can reach it,
-  because their egress rule is create-time.
+### How a connection travels
 
-## 3. Ingress (north–south HTTP/TCP)
+Inside a guest, every service name resolves to the same gateway address, so
+the **port** is what identifies the service. The connection leaves the
+microVM, reaches a listener MC2 holds on the host (a **splice**), and is
+forwarded to one of the service's ready replicas, round-robin:
 
-`ingress:` plus `ports:` produces a Traefik file-provider catalog that MC2
-writes to `--ingress-config-dir`. You run your own Traefik pointing its file
-provider there.
+```text
+ client microVM             host                          echo microVMs
+ ──────────────             ────                          ─────────────
+ echo:8080 ──► gateway ──► 127.0.0.1:8080 (MC2 splice) ──► replica :8080
+                                   │
+                                   └──► round-robin over ready replicas
+```
+
+This design has consequences you'll notice:
+
+- **Exposed ports are exclusive server-wide.** Only one stack can expose a
+  given port, because the port *is* the service's address. `mc2 up` rejects
+  an `expose` port that another stack holds (naming the owner), a port MC2
+  itself uses (the REST port, SSH ports, any published host port, `53`), or
+  a port a host process is already listening on. Pick another port and
+  update the client's connection string.
+- **The listener is held for the stack's lifetime.** From apply until the
+  stack is removed, MC2 keeps `127.0.0.1:<port>` bound — even when no replica
+  is running. Clients then get *accept-then-close* rather than *connection
+  refused*, and no other process can take the port.
+- **Fail closed.** If that listener can't be bound when an instance is about
+  to be created, the instance is reported `Failed` (naming the port) and its
+  microVM is not created.
+- **Privileged ports on Linux.** A non-root server can't bind ports below
+  1024, so `expose: [80]` is rejected with the fix: grant the binary
+  `CAP_NET_BIND_SERVICE`, lower `net.ipv4.ip_unprivileged_port_start`, or use
+  a port above 1023.
+- **Few recreates.** A client's allowed ports are fixed when its microVM is
+  created. It is recreated only when the set of ports it can reach changes
+  (for example, a peer exposes a new port) — not when a neighbour restarts or
+  changes its backend.
+
+`mc2 network` lists every network, its members, and the owner of every
+claimed port; `mc2 network <name>` or `mc2 network <stack>/<service>/<ordinal>`
+drills in.
+
+## 3. Ingress
+
+Ingress gives a service a public hostname. MC2 doesn't run a proxy: it writes
+a [Traefik file-provider](https://doc.traefik.io/traefik/providers/file/)
+catalog to `--ingress-config-dir`, and your Traefik routes traffic to the
+instance's loopback host port.
 
 ```yaml
 ingress:
@@ -105,51 +137,56 @@ ingress:
     enabled: true
     certResolver: le
   rules:
-    - host: shop.local
+    - host: shop.example.com
       paths:
         - path: /
           pathType: Prefix
           service: web
           port: 8000
-  tcp:
-    - name: web-ssh
-      entryPoint: ssh
-      service: web       # requires ssh.enabled with a fixed port
 ```
 
-The control plane can publish *itself* through the same catalog with
-`--public-hostname`, so `https://mc2.example.com` terminates TLS at your
-Traefik and reaches the REST API.
+Routes follow a `Running` replica (a healthy one first) and are rewritten
+only when they change. TCP routes (`ingress.tcp`) exist for SSH; see
+[Open SSH](/documentation/guides/open-ssh). The control plane can publish
+itself through the same catalog with `--public-hostname`.
 
-## Network profiles
+## Egress profiles
 
-Each service also picks an egress profile via `network.profiles`: `public`
-(default), `private`, `host`, or `none`. The set is closed — any other value
-(including the former `local`/`any` spellings) is rejected at apply, never
-silently treated as `public`. `none` must be the only entry and disables the
-guest network entirely; duplicates are rejected. `host` gives the guest the
-whole host loopback — the control API and every published port — so `mc2 up`
-refuses it unless the server was started with `--allow-host-profile` (env
-`MC2_ALLOW_HOST_PROFILE`); see
-[Run the server](/documentation/operations/run-the-server). An empty list keeps
-the `public` default. Network-reachable ports are always allowed via narrow
-rules regardless of profile.
+`network.profiles` controls what a guest may reach **outbound**, besides its
+service-network peers:
+
+| Profile | Guest may reach |
+| --- | --- |
+| `public` (default) | public internet addresses |
+| `private` | private (LAN) address ranges |
+| `host` | the host's own loopback — every published port *and* the REST API |
+| `none` | nothing: networking is disabled, including service networks |
+
+Profiles combine (`[public, private]`); `none` must be the only entry. Any
+other value is rejected. Because `host` exposes the control plane to the
+guest, `mc2 up` refuses it unless the server runs with `--allow-host-profile`.
+
+With networking enabled, MC2 adds narrow allow rules for exactly the peer
+ports a service can reach, so `public` or `private` alone never cut a service
+off from its networks.
 
 ## Key behaviors
 
-- **Three planes, three jobs.** Ports for one instance, networks for
-  service-to-service, ingress for hostnames and TLS.
-- **Loopback-only host binds.** Nothing public is bound by accident.
-- **Server-wide names.** Networks and their DNS live at the server level, not
-  per stack.
-- **Same-node in v1.** L4 splices and DNS are node-local.
+- **Three planes, three jobs.** Ports for you, networks for services, ingress
+  for the internet.
+- **Loopback-only host binds.** Nothing public is bound unless your Traefik
+  binds it.
+- **Default-allow within a network.** Sharing a network is permission; use
+  separate networks to separate services.
+- **One port, one owner.** Exposed ports are unique across the whole server.
+- **Single machine in v1.** Splices and DNS are local to the server.
 
 ## Deeper
 
-- [Ports & expose](/references/stack/ports-expose) — exact syntax.
-- [Networks & ingress](/references/stack/networks-ingress) — exact syntax.
-- [Connect services](/documentation/guides/connect-services) — east–west in
-  practice.
-- [Publish with ingress](/documentation/guides/publish-with-ingress) —
-  north–south in practice.
-- [Security: networking](/security/networking) — the security model.
+- [Connect services](/documentation/guides/connect-services) — service
+  networks in practice.
+- [Publish with ingress](/documentation/guides/publish-with-ingress) — public
+  hostnames and TLS.
+- [Ports & expose](/references/stack/ports-expose) and
+  [Networks & ingress](/references/stack/networks-ingress) — exact syntax.
+- [Security: networking](/security/networking) — the threat model.

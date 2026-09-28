@@ -1,50 +1,91 @@
 ---
 title: Publish with ingress
-description: North–south HTTP via ports, ingress rules, and a BYO Traefik.
+description: Route a hostname to a service through your own Traefik, using the routes MC2 writes.
 ---
 
-**You will learn:** route a hostname to a service through your own Traefik
-instance, using the file catalog MC2 writes.
+**You will learn:** give a service a hostname, have MC2 write the Traefik
+routes for it, and send a request through Traefik to the microVM.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack),
-and Traefik installed. This guide mirrors `examples/04-http-ingress`.
+**Prerequisites:** [Connect services](/documentation/guides/connect-services),
+and [Traefik](https://doc.traefik.io/traefik/getting-started/install-traefik/)
+3.x installed (`traefik version`).
 
-<Callout type="note" title="Lab setup, not production TLS">
-  This is a local HTTP lab, not a production ACME/TLS setup. Traefik is the
-  only supported proxy for MC2 ingress.
-</Callout>
+<Note title="A local HTTP lab">
+  This lab uses plain HTTP on loopback. For a public host with TLS, see
+  [Manage a remote server](/documentation/guides/manage-a-remote-server).
+  Traefik is the only proxy MC2 writes configuration for.
+</Note>
 
-## Start the server with a catalog directory
+## How it fits together
 
-`mc2 setup` already asks for this (default `~/.mc2/ingress`). This lab
-example's Traefik static config is hardcoded to `/tmp/mc2-ingress`, so
-match that path:
-
-```bash
-mc2 server --no-auth --ingress-config-dir /tmp/mc2-ingress
+```text
+ curl -H 'Host: smoke-ingress.local' 127.0.0.1:8088
+        │
+        ▼
+ Traefik :8088 ──reads──► <ingress dir>/traefik/dynamic.yml (MC2 writes)
+        │
+        ▼
+ 127.0.0.1:18110  (the service's published port) ──► microVM :8000
 ```
 
-The `--ingress-config-dir` tells the server where to write the Traefik
-file-provider catalog (`catalog.json`) as instances become Ready. Data dir
-and bind stay at their defaults (`~/.mc2`, `127.0.0.1:7443`).
+MC2 never runs a proxy. It writes a Traefik
+[file-provider](https://doc.traefik.io/traefik/providers/file/) config to
+`<ingress dir>/traefik/dynamic.yml`, containing a route for every ingress
+rule whose backend is running and accepting connections. Traefik watches that
+directory and serves the routes.
 
-## Map the hostname
+<Steps>
+
+<Step title="Give the server an ingress directory">
+
+Stop the server from the quickstart (Ctrl-C) and start it again with the same
+options plus an ingress directory:
 
 ```bash
-echo "127.0.0.1 smoke-ingress.local" | sudo tee -a /etc/hosts
+mc2 server --ingress-config-dir /tmp/mc2-ingress
 ```
 
-## The stack
+Don't start a second server — one server owns the port and the data dir.
+Your CLI context keeps working because the token hasn't changed.
+
+</Step>
+
+<Step title="Start Traefik">
+
+Save a minimal static config as `traefik.yml`:
 
 ```yaml
-name: smoke-ingress
+entryPoints:
+  web:
+    address: "127.0.0.1:8088"
+providers:
+  file:
+    directory: /tmp/mc2-ingress/traefik
+    watch: true
+```
+
+Run it in a third terminal:
+
+```bash
+traefik --configFile=traefik.yml
+```
+
+</Step>
+
+<Step title="Apply a stack with an ingress rule">
+
+Save this as `ingress.yaml`:
+
+```yaml
 services:
   web:
-    image: alpine:3.20
+    image: python:3.12-alpine
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo INGRESS_OK > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
     ports:
-      - "8088:8000"
-    command: 'exec sh -c "while true; do echo -e \"HTTP/1.1 200 OK\n\nINGRESS_OK\" | nc -l -p 8000; done"'
+      - "18110:8000"
 ingress:
+  tls:
+    enabled: false
   rules:
     - host: smoke-ingress.local
       paths:
@@ -54,59 +95,93 @@ ingress:
           port: 8000
 ```
 
-The ingress rule's `port` must equal a `ports[].target` on the service.
-
-## Apply and start Traefik
+The rule's `port` is the **guest** port (`8000`); the service must publish
+it under `ports`. Traefik reaches it through the host port (`18110`).
 
 ```bash
-mc2 up -f examples/04-http-ingress/stack.yaml
-mc2 ps
-
-# Point Traefik's file provider at the catalog directory:
-traefik --configFile=examples/04-http-ingress/traefik.static.yml
+mc2 up -f ingress.yaml
+mc2 ps --stack ingress     # wait for web/0 to be Running
 ```
 
-## Verify
+</Step>
+
+<Step title="Send a request through Traefik">
 
 ```bash
-curl -s -H 'Host: smoke-ingress.local' http://127.0.0.1:8088/
+curl -H 'Host: smoke-ingress.local' http://127.0.0.1:8088/
 # INGRESS_OK
 ```
 
-The server only writes catalog entries for instances that are **Ready**
-(Running + TCP accept), so a dead backend never sits in the proxy. Inspect
-what it wrote:
+The `Host` header stands in for DNS. To use the name in a browser, add
+`127.0.0.1 smoke-ingress.local` to `/etc/hosts`.
+
+</Step>
+
+<Step title="See what MC2 wrote">
 
 ```bash
 mc2 ingress
-curl -s http://127.0.0.1:7443/v1/ingress | jq .
-cat /tmp/mc2-ingress/catalog.json | jq .
+cat /tmp/mc2-ingress/traefik/dynamic.yml
 ```
 
-## Expose the control plane too
+```text
+│ HOST                ┆ PATH ┆ SERVICE ┆ GUEST ┆ HOST_PORT ┆ ...
+│ smoke-ingress.local ┆ /    ┆ web     ┆ 8000  ┆ 18110     ┆ ...
+```
 
-On a remote install, `--public-hostname mc2.example.com` plus a cert
-resolver publishes the REST API itself through the same catalog, so
-`https://mc2.example.com` terminates TLS at your Traefik and reaches the
-server.
+```yaml
+http:
+  routers:
+    ingress-smoke-ingress-local---web-8000:
+      rule: Host(`smoke-ingress.local`)
+      entryPoints:
+      - web
+      service: ingress-smoke-ingress-local---web-8000
+  services:
+    ingress-smoke-ingress-local---web-8000:
+      loadBalancer:
+        servers:
+        - url: http://127.0.0.1:18110
+```
+
+`/tmp/mc2-ingress/catalog.json` next to it lists every route, including ones
+not ready yet — it's for you, not for Traefik.
+
+</Step>
+
+<Step title="Clean up">
+
+```bash
+mc2 down ingress
+```
+
+The route disappears from `dynamic.yml` on the next pass.
+
+</Step>
+
+</Steps>
 
 ## Key behaviors
 
-- **BYO Traefik.** MC2 writes the catalog; you run the proxy and TLS.
-- **Ready-gated files.** No routes until instances are actually reachable.
-- **Failover by replica.** A route picks a Running replica — a healthy one
-  first when the service declares a `healthcheck`, otherwise the lowest
-  ordinal — and points at that replica's own host port.
-- **TLS is delegated.** `ingress.tls.enabled` + `certResolver` just mark
-  routes in the catalog; certs/ACME live in the proxy.
+- **Only live backends get routes.** A route is written once its replica is
+  `Running` and its host port accepts connections, and removed when it
+  stops. The file is rewritten only when routes change.
+- **Routes follow a replica.** With `scale > 1`, the route points at a
+  healthy `Running` replica (or any `Running` one) and that replica's own
+  host port.
+- **TLS is Traefik's job.** `ingress.tls.enabled: true` with a
+  `certResolver` puts the route on Traefik's `websecure` entry point using
+  that resolver; certificates and ACME live in Traefik's own config.
+- **The control plane can use it too.** `mc2 server --public-hostname
+  mc2.example.com` adds a route for the MC2 API itself.
 
 ## Next
 
 <Cards cols={2}>
   <Card
-    title="Add secrets"
-    description="Encrypted, host-gated secret injection."
-    href="/documentation/guides/add-secrets"
+    title="Use persistent volumes"
+    description="Keep data across microVM recreates."
+    href="/documentation/guides/use-persistent-volumes"
   />
   <Card
     title="Networks & ingress reference"

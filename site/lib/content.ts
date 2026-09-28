@@ -41,7 +41,10 @@ export async function renderPage(tab: string, pagePath: string) {
           [
             rehypePrettyCode,
             {
-              themes: { light: "github-light", dark: "github-dark" },
+              theme: {
+                light: "github-light-high-contrast",
+                dark: "github-dark",
+              },
               keepBackground: false,
             },
           ],

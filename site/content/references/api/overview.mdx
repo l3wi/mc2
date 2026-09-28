@@ -1,95 +1,98 @@
 ---
 title: REST API overview
-description: The MC2 control-plane contract — base URL, bearer-token auth, error convention, and every endpoint.
+description: The MC2 control-plane contract — base URL, bearer-token auth, request and error conventions, limits, and every endpoint.
 ---
 
-## Overview
+`mc2 server` serves the REST API that every `mc2` command uses. Anything the
+CLI does, you can do with `curl` or your own client.
 
-The MC2 control plane serves a JSON REST API. The CLI is a thin REST client
-over it, so the same routes back every `mc2` command — see the
-[CLI overview](/references/cli/overview).
+## Basics
 
-- **Base URL.** The operator API is served at the server's bind address
-  (default `127.0.0.1:7443`). Operator endpoints live under `/v1/`; `/health`
-  is the bare readiness probe (unauthenticated).
-- **JSON in/out.** Requests and responses are JSON.
-- **Auth.** Authenticated endpoints require a bearer token in the
-  `Authorization` header; `/health` is unauthenticated.
+- **Base URL** — the server's `--bind` address (default
+  `http://127.0.0.1:7443`), or `https://<public-hostname>` through Traefik.
+- **Versioned paths** — operator endpoints live under `/v1/`. `GET /health`
+  sits outside it.
+- **Instance IDs** — `{id}` in a path is the instance **UUID**. The CLI's
+  `stack/service/ordinal` refs are resolved by the CLI; the API returns `404`
+  for them. Look up UUIDs with `GET /v1/instances`.
+- **JSON bodies** need `Content-Type: application/json`; without it the
+  server answers `415`.
+- **Field casing varies by endpoint** — some responses use `snake_case`
+  (status counters, nodes, instances, volumes, secrets), others `camelCase`
+  (resources, exec, logs, SSH, networks). Each endpoint page shows the exact
+  fields.
 
 ## Authentication
 
-Most endpoints require an operator bearer token:
+Every `/v1` route needs the API token:
 
-```
+```http
 Authorization: Bearer mc2at_...
 ```
 
-The server shows the API token once on first bootstrap — stderr on a TTY,
-otherwise `<data-dir>/bootstrap-token` (mode 0600), with only the path logged.
-Recover a lost token with `mc2 server token rotate`. Requests without a valid
-token return `401`. `GET /health` is the one exception — it requires no auth.
-A server started with `--no-auth` skips the check for that run.
+Only `GET /health` is public. A server started with `--no-auth` skips the
+check for that run. See [Authentication](/security/authentication) for how
+the token is created and rotated.
 
-```bash
-curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/status
-curl -s http://127.0.0.1:7443/health
-```
+## Errors and status codes
 
-## Errors
+| Status | When |
+| --- | --- |
+| `200` | Success with a JSON body. |
+| `204` | Success with no body (deletes). |
+| `400` | Invalid stack, allocation or capacity refusal, malformed JSON syntax. Body: `{"error": "<message>"}`. |
+| `401` | Missing or wrong token. Body: `{"error": "unauthorized", "message": "missing or invalid bearer token"}`. |
+| `404` | No such stack, instance, secret, or key. |
+| `408` | An ordinary request exceeded `--request-timeout-secs` (default 60). |
+| `413` | Request body too large. |
+| `415` | JSON body sent without `Content-Type: application/json`. |
+| `422` | JSON with the wrong shape (e.g. a missing field). The body is plain text from the JSON decoder. |
+| `500` | Internal error. Body: `{"error": "<message with cause>"}`; also logged by the server. |
+| `503` | Connection cap reached (`--max-connections`), or `/health` when the loop isn't converging. |
 
-Errors are returned as JSON with an `error` message. The convention:
+## Limits
 
-| Status | Meaning |
-| ------ | ------- |
-| `400` | Validation / allocation error — malformed body or invalid desired state |
-| `401` | Missing or invalid bearer token |
-| `404` | Resource not found |
-| `500` | Internal server error |
-
-```json
-{ "error": "expose: duplicate port" }
-```
+- Request bodies are limited to 2 MiB, except `exec` (16 MiB).
+- Ordinary requests must finish within `--request-timeout-secs`; `exec` and
+  `logs` are exempt (a command or a log stream can run for a long time).
+- A client must send its request headers within 30 s.
 
 ## Endpoints
 
-| Method | Path | Role |
-| ------ | ---- | ---- |
-| `GET` | `/health` | Readiness probe (no auth). `200` while the node loop is live and current, `503` with a `reason` when it has stopped or gone stale |
-| `GET` | `/v1/status` | Health, version, counts, public hostname, resources |
-| `GET` | `/v1/nodes` | Registered nodes |
-| `POST` | `/v1/stacks:apply` | Apply (up) a stack from YAML |
-| `DELETE` | `/v1/stacks/{name}` | Tear down a stack; `?volumes=true` removes named volumes |
-| `GET` | `/v1/instances` | List instances |
-| `GET` | `/v1/instances/{id}/network` | Observed network status for one instance |
-| `GET` | `/v1/networks` | Server-wide network membership |
-| `GET` | `/v1/volumes` | Named volumes retained on the node |
-| `POST` | `/v1/instances/{id}/exec` | Run a command in an instance's sandbox |
-| `GET` | `/v1/instances/{id}/logs` | Recent sandbox logs; `?follow=true` streams |
-| `GET` | `/v1/ingress` | Desired ingress routes |
-| `GET` | `/v1/secrets` | List secret names (never values) |
-| `PUT` / `DELETE` | `/v1/secrets/{name}` | Create or replace / delete a secret |
-| `GET` | `/v1/ssh/keys` | List authorized SSH keys |
-| `PUT` / `GET` / `DELETE` | `/v1/ssh/keys/{name}` | Manage one authorized SSH key |
-| `GET` | `/v1/ssh/endpoints` | Open SSH endpoints |
-| `GET` / `PUT` / `DELETE` | `/v1/instances/{id}/ssh` | Per-instance SSH state / override |
+| Method | Path | Purpose | Page |
+| --- | --- | --- | --- |
+| `GET` | `/health` | Reconcile-loop readiness (no auth) | [Status](/references/api/status) |
+| `GET` | `/v1/status` | Version, counts, resources | [Status](/references/api/status) |
+| `GET` | `/v1/nodes` | The server's node | [Status](/references/api/status) |
+| `POST` | `/v1/stacks:apply` | Apply a stack | [Stacks & instances](/references/api/stacks-instances) |
+| `DELETE` | `/v1/stacks/{name}` | Remove a stack (`?volumes=true` deletes its volumes) | [Stacks & instances](/references/api/stacks-instances) |
+| `GET` | `/v1/instances` | All instances | [Stacks & instances](/references/api/stacks-instances) |
+| `POST` | `/v1/instances/{id}/exec` | Run a command in a microVM | [Stacks & instances](/references/api/stacks-instances) |
+| `GET` | `/v1/instances/{id}/logs` | Logs; `?follow=true` streams (SSE) | [Stacks & instances](/references/api/stacks-instances) |
+| `GET` | `/v1/volumes` | Volume directories | [Stacks & instances](/references/api/stacks-instances) |
+| `GET` | `/v1/networks` | Networks, members, port claims | [Networking & ingress](/references/api/networking-ingress) |
+| `GET` | `/v1/instances/{id}/network` | One instance's observed network | [Networking & ingress](/references/api/networking-ingress) |
+| `GET` | `/v1/ingress` | Desired ingress routes | [Networking & ingress](/references/api/networking-ingress) |
+| `GET` | `/v1/secrets` | Secret names and timestamps | [Secrets & SSH](/references/api/secrets-ssh) |
+| `PUT`, `DELETE` | `/v1/secrets/{name}` | Set or delete a secret | [Secrets & SSH](/references/api/secrets-ssh) |
+| `GET` | `/v1/ssh/keys` | Authorized SSH keys | [Secrets & SSH](/references/api/secrets-ssh) |
+| `PUT`, `GET`, `DELETE` | `/v1/ssh/keys/{name}` | One SSH key | [Secrets & SSH](/references/api/secrets-ssh) |
+| `GET` | `/v1/ssh/endpoints` | Open SSH endpoints | [Secrets & SSH](/references/api/secrets-ssh) |
+| `GET`, `PUT`, `DELETE` | `/v1/instances/{id}/ssh` | Per-instance SSH state and override | [Secrets & SSH](/references/api/secrets-ssh) |
 
-## Calling from curl
+## Calling it with curl
 
-The CLI already talks to the loopback default. `curl` needs the URL
-explicitly (`http://127.0.0.1:7443`):
+`curl` doesn't read MC2 contexts; pass the URL and token yourself:
 
 ```bash
 export MC2_API=http://127.0.0.1:7443
 export MC2_API_KEY='mc2at_...'
 
-curl -s "$MC2_API/v1/status" | jq .
-curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/instances" | jq .
-curl -s -H "Authorization: Bearer $MC2_API_KEY" \
-  -X POST "$MC2_API/v1/stacks:apply" \
-  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}' | jq .
-```
+curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/status"
 
-<Callout type="note" title="Server flags">
-  The control plane is configured by the server's flags and env vars — see
-  [Run the server](/documentation/operations/run-the-server).
-</Callout>
+curl -s -H "Authorization: Bearer $MC2_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -X POST "$MC2_API/v1/stacks:apply" \
+  -d '{"yaml":"name: demo\nservices:\n  web:\n    image: alpine:3.20\n"}'
+# {"stack":"demo","services":1,"instances":1,"scheduled":1,"pending":0,"ssh":[]}
+```

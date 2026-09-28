@@ -1,80 +1,111 @@
 ---
 title: Identity & contexts
-description: API tokens, local vs remote, and how the CLI picks a server.
+description: The API token, local vs remote connections, and how the CLI decides which server to talk to.
 ---
 
-The `mc2` CLI is a REST client. A **context** names a server (API URL +
-token) so the same commands work on your laptop or a remote VPS. MC2
-distinguishes two trust modes — **local** and **remote** — and refuses
-insecure combinations by default.
+The `mc2` CLI is a REST client. Every command needs two things: **which
+server** (its URL) and **proof you may use it** (the API token). A
+**context** saves both under a name, so the same commands work against the
+server on your laptop or one across the internet.
 
 ## The analogy
 
-Like `kubectl` contexts or `docker context` — a named bundle of connection
-settings, plus a `current` pointer. The difference: MC2 enforces that remote
-connections use TLS and a token.
+Like `kubectl` contexts or `docker context`: named connection settings plus a
+`current` pointer. The difference is that the MC2 CLI refuses to send a token
+to a remote server over plain HTTP unless you explicitly allow it.
 
-## How the CLI resolves its connection
+## The API token
 
-Precedence, highest first:
+```text
+ first start ──► server creates a token ──► shown once: terminal, or
+                         │                  <data-dir>/bootstrap-token
+                         ▼
+                 mc2.db stores only its hash
 
-1. `--api` / `--token` flags
-2. `MC2_API` / `MC2_API_KEY` environment variables
-3. `--context` / `MC2_CONTEXT` flags
-4. the `current` context in `~/.mc2/config.toml`
-5. the loopback default (`127.0.0.1:7443`)
-
-```bash
-# Ad-hoc flags
-mc2 --api https://mc2.example.com --token 'mc2at_…' status
-
-# Named context (saved, then switched)
-mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
-mc2 context use prod
-mc2 status                     # remote: https://mc2.example.com (context: prod)
+ each request ──► Authorization: Bearer mc2at_… ──► hash matches? ──► 200
+                                                                └──► 401
 ```
 
-Contexts live in `~/.mc2/config.toml` (mode 0600). `mc2 context ls` shows
-each context with its mode; `mc2 status` reports which mode is active.
+- The server keeps only a hash of the token, so it can't show it to you
+  again. Store it in your password manager or a context.
+- **Every `/v1` route needs the token**, whether you connect from loopback or
+  remotely. Only `/health` is public.
+- **Lost it?** On the server machine, run `mc2 server token rotate` (add
+  `--data-dir` if you use a non-default one). It prints a new token and the
+  old one stops working immediately — the server doesn't need a restart.
+- **Lab shortcut:** `mc2 server --no-auth` skips the check for that run only.
+  It is refused on a non-loopback `--bind` unless you add
+  `--allow-unauthenticated-remote`, and never allowed with
+  `--public-hostname`.
+
+## Choosing the server
+
+The CLI resolves the URL and the token **separately**, each taking the first
+value it finds:
+
+```text
+ URL:    --api   ▸ MC2_API     ▸ context url     ▸ http://127.0.0.1:7443
+ token:  --token ▸ MC2_API_KEY ▸ context api_key ▸ (none)
+
+ context = --context ▸ MC2_CONTEXT ▸ current in ~/.mc2/config.toml
+```
+
+Because they resolve separately, `--api` alone still sends the current
+context's token. Pass `--token` too when pointing at a different server.
+
+```bash
+# One-off
+mc2 --api https://mc2.example.com --token 'mc2at_…' status
+
+# Saved: create, switch, use
+mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
+mc2 context use prod
+mc2 status
+```
+
+Contexts live in `~/.mc2/config.toml` on the **client** machine (mode 0600,
+token included). `mc2 context ls` lists them with their mode and marks the
+current one.
 
 ## Local vs remote
 
-- **Local** — loopback API (`127.0.0.1` / `localhost` / `::1`); the CLI can
-  omit a token, and a server started with `--no-auth` accepts it.
-- **Remote** — any other host; requires **https + an API key**. Plaintext
-  `http://` is refused unless you opt in with `--allow-insecure-http` /
-  `MC2_ALLOW_INSECURE_HTTP=1`.
+The URL's host decides the mode:
 
-The mode is reported by `mc2 status`, so there is no ambiguity about which
-trust rules applied.
+| Mode | Host | Transport |
+| --- | --- | --- |
+| **Local** | `127.0.0.0/8`, `::1`, `localhost` | `http://` is fine — traffic never leaves the machine |
+| **Remote** | anything else | `https://` required; the CLI refuses `http://` unless you pass `--allow-insecure-http` or set `MC2_ALLOW_INSECURE_HTTP=1` |
 
-## Remote management loop
+The token is required in both modes (unless the server runs `--no-auth`).
+The HTTPS rule is enforced by the CLI; the server itself speaks plain HTTP on
+its bind address and expects TLS to be terminated in front of it — normally
+by Traefik via `--public-hostname`.
 
-Use the wizard on each machine (`mc2 setup` never starts the server or Traefik):
+## Remote management
 
-1. **On the server:** `mc2 setup server`. Accept the defaults or override
-   them (bind, data dir, auth, public hostname, Traefik). Start the printed
-   `mc2 server …` command and save the one-time API token (printed to stderr
-   on a TTY, or written to `<data-dir>/bootstrap-token` at 0600 otherwise).
-   With a public hostname, the control plane itself appears in the Traefik
-   catalog (`https://mc2.example.com`).
-2. **On the client:** `mc2 setup client`. Paste the URL and token (leave the
-   token blank for a `--no-auth` server); it saves and activates the context
-   and can verify the live connection.
+`mc2 setup` is a wizard that prints commands; it never starts the server or
+Traefik itself.
 
-The equivalent hand-typed commands are
-`mc2 server --public-hostname mc2.example.com …` and
-`mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'`.
-See [Manage a remote server](/documentation/guides/manage-a-remote-server).
+1. **On the server:** `mc2 setup server`. Choose the bind, data dir, public
+   hostname, and Traefik settings, then start the `mc2 server …` command it
+   prints. Save the token it shows (or read `<data-dir>/bootstrap-token`).
+2. **On your machine:** `mc2 setup client`. Enter a context name, the URL
+   (e.g. `https://mc2.example.com`), and the token. It saves the context,
+   makes it current, and can test the connection.
+
+The hand-typed equivalent is `mc2 server --public-hostname mc2.example.com …`
+on the server and `mc2 context set prod --api https://mc2.example.com --token
+'mc2at_…'` on your machine. See
+[Manage a remote server](/documentation/guides/manage-a-remote-server).
 
 ## Key behaviors
 
-- **The CLI is stateless.** Everything it knows about a server is in flags,
-  env, or the contexts file.
-- **Remote means https + token.** There is no "trust me, it's fine" remote
-  over plaintext.
-- **One-time bootstrap token.** The API token is shown once; keep it in your
-  secrets manager, not the stack file. Lost it? `mc2 server token rotate`.
+- **The CLI keeps no hidden state.** Everything it knows is in flags, the
+  environment, or the contexts file.
+- **One token, stored as a hash.** Rotate it rather than trying to recover
+  it.
+- **Remote means HTTPS.** Opting out is explicit and per-invocation or
+  per-environment.
 
 ## Deeper
 
@@ -82,4 +113,4 @@ See [Manage a remote server](/documentation/guides/manage-a-remote-server).
   end-to-end walkthrough.
 - [Authentication](/security/authentication) — the threat model.
 - [Contexts file](/references/config/contexts-file) — the on-disk format.
-- [Environment variables](/references/config/environment) — every var.
+- [Environment variables](/references/config/environment) — every variable.

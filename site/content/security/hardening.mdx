@@ -1,129 +1,98 @@
 ---
 title: Hardening checklist
-description: A production checklist for running MC2 securely — server, auth, secrets, networking, and monitoring.
+description: A production checklist for running MC2 — install, host, API access, secrets, networking, and monitoring.
 ---
 
-This is the production hardening checklist. It assumes you are running `mc2
-server` on a machine you control and applying the security model described in
-[Security overview](/security/overview). Each item maps to a real MC2 surface;
-nothing here requires tools MC2 does not ship or document.
+Work through this before exposing an MC2 server to real workloads or a
+network. Each item maps to a documented MC2 behavior; the
+[Security overview](/security/overview) explains the model behind it.
 
-## Baseline posture
+## Install
 
-- [ ] **Auth is on.** Start the server without `--no-auth` and save the token
-      it shows once on first bootstrap (stderr on a TTY, else
-      `<data-dir>/bootstrap-token` at mode 0600 — read it, then delete it).
-- [ ] **The data dir is private.** A dedicated user owns it and nothing else
-      reads it. `secrets.key` and `config.toml` are created 0600; the server
-      refuses to start if an existing `secrets.key` is world-readable, and
-      rejects a symlinked key file.
-- [ ] **Back up `secrets.key` with `mc2.db`.** They are a pair: if the
-      database already holds secrets, a missing key file (or a key that cannot
-      decrypt them) is a startup error, not a new key — the stored ciphertext
-      is unrecoverable without the original.
-- [ ] **`--allow-insecure-http` is off.** Remote endpoints are https-only by
-      default; do not re-enable plaintext.
-- [ ] **Secrets are not in stack files.** Credentials live in the encrypted
-      server-wide store and are referenced by name.
+- [ ] **Install a pinned, verified release.** Download a specific version
+      and check its SHA-256 (and, optionally, `gh attestation verify`) as in
+      the [Quickstart](/documentation/quickstart). Don't pipe an unpinned
+      installer into a shell.
+- [ ] **Run as a dedicated user** that owns the data dir and can open
+      `/dev/kvm` (the `kvm` group), not as root and not as your login user.
+      See the systemd unit in
+      [Run the server](/documentation/operations/run-the-server).
+- [ ] **Keep the host patched** — kernel, hypervisor, and the OS. The host
+      is the trusted ring under every guest.
+- [ ] **Vet your images.** MC2 doesn't sign, pin, or scan them.
 
-## Run the server safely
+## API access
 
-- [ ] Run `mc2 server` as a **dedicated user** with a **private data dir**
-      (`--data-dir`), not as your login user in a shared directory.
-- [ ] Pin the durable volume root with `--volume-dir` so guest volumes land in
-      one place you control and can back up.
-- [ ] Give the process only what it needs: hypervisor access (`/dev/kvm` or
-      HVF) and its data dirs. Prefer a host OS and hypervisor that are patched
-      and minimal.
-- [ ] Vet the images you run. MC2 does not sign or verify image provenance —
-      a malicious image is code running in your microVMs.
+- [ ] **Auth on.** Never start a reachable server with `--no-auth`.
+- [ ] **Loopback bind.** Keep `--bind` at `127.0.0.1:7443` and publish the
+      API through Traefik with `--public-hostname` so TLS is terminated in
+      front of it. The server itself speaks plain HTTP.
+- [ ] **Save the bootstrap token, then delete `bootstrap-token`** from the
+      data dir if the first start wrote one.
+- [ ] **HTTPS from clients.** Don't set `--allow-insecure-http` /
+      `MC2_ALLOW_INSECURE_HTTP` outside a throwaway lab.
+- [ ] **Protect client credentials.** `~/.mc2/config.toml` holds tokens in
+      plaintext (mode 0600). In CI, inject `MC2_API_KEY` from a secret store.
+- [ ] **Know how to rotate.** `mc2 server token rotate --data-dir <dir>`
+      replaces the token instantly; rotate on any suspected leak.
 
-<Callout type="warning" title="Host trust is your outer ring">
-  The isolation model in [Isolation](/security/isolation) contains a guest,
-  but the host under it is trusted. Keep the host, kernel, and hypervisor
-  patched; run the server with least-privilege accounts.
-</Callout>
+## Secrets and state
 
-## Cap and time out the listeners
+- [ ] **Credentials in `mc2 secret set`, never in `environment:`.**
+- [ ] **Narrow `allowHosts`** to exactly the hosts that need each secret, and
+      only hosts you trust with it — an allowed host can echo it back.
+- [ ] **Protect the runtime's copy.** microsandbox keeps running microVMs'
+      secret values in plaintext under `~/.microsandbox` (or `$MSB_HOME`) of
+      the server's user. Keep that directory private and out of shared
+      backups.
+- [ ] **Back up `mc2.db` and `secrets.key` together**, with the server
+      stopped, and store the backup like a secret: with both files, anyone
+      can decrypt your secrets. (The token is only stored as a hash, so the
+      backup doesn't contain it.) Include `--secrets-key-path` and
+      `--volume-dir` if they're outside the data dir.
+- [ ] **Keep the key's permissions strict.** The server refuses a
+      world-readable or symlinked `secrets.key`. Fix with `chmod 600`, never
+      by replacing the file.
+- [ ] **Plan revocation.** Deleting a secret doesn't pull it from running
+      microVMs; rotate at the source, remove the reference, then delete it.
 
-- [ ] **Keep the REST caps on.** `--max-connections` (256) sheds extra
-      connections with a `503` instead of queueing them, and
-      `--request-timeout-secs` (60) bounds ordinary routes. A client that
-      sends no request headers is dropped after 30 s. Lower both on a busy or
-      hostile host; `exec` and `logs` stay exempt by design.
-- [ ] **Keep the SSH caps on.** `--max-ssh-sessions` (64) and
-      `--max-ssh-sessions-per-listener` (16) close connections beyond the
-      cap, and a client has 30 s to finish the handshake. There is no idle
-      timeout, so a quiet shell can hold a slot — size the caps for the
-      sessions you actually expect.
-- [ ] **Do not rely on per-IP limiting.** Behind Traefik every client is
-      `127.0.0.1`, so MC2's caps are global; rate-limit at the proxy if you
-      need per-client fairness.
+## Networking
 
-## Authenticate the control plane
+- [ ] **Separate trust zones with networks.** Services on a shared network
+      reach each other's exposed ports by default.
+- [ ] **Choose egress deliberately.** `private` reaches your LAN, not just
+      MC2 services; use `network.profiles: [none]` for workloads that need no
+      network at all.
+- [ ] **Leave `--allow-host-profile` off** unless a workload truly needs the
+      host's services — it lets guests reach the MC2 API and every published
+      port.
+- [ ] **Publish only through ingress.** Host ports bind loopback; expose
+      what must be public as an `ingress:` rule behind Traefik TLS.
+- [ ] **Firewall the host** so only Traefik's ports (and SSH for admins)
+      are reachable.
 
-- [ ] **Never `--no-auth`.** It is for disposable loopback labs only; it
-      removes the only credential on the API for that run. On a routable bind
-      the server refuses to start unless you also pass
-      `--allow-unauthenticated-remote`, and it never starts with
-      `--public-hostname`.
-- [ ] **Plan for token loss.** `mc2 server token rotate --data-dir <dir>`
-      mints a new token in place (old one dies immediately); no restart or
-      data-dir edit needed.
-- [ ] **Always https + a token remotely.** Bind appropriately and, for remote
-      management, publish the control plane via `--public-hostname` with a
-      cert resolver — then reach it as `https://…` from a saved context.
-- [ ] Use contexts rather than scattering tokens: `mc2 setup client`, or
-      `mc2 context set prod --api https://… --token 'mc2at_…'`.
-- [ ] Restrict who can read `~/.mc2/config.toml` (mode 0600). It holds bearer
-      tokens in plaintext.
+## Listeners
 
-## Protect secrets and state
+- [ ] **Size the caps.** `--max-connections` (256) and
+      `--request-timeout-secs` (60) bound the REST API; `--max-ssh-sessions`
+      (64) and `--max-ssh-sessions-per-listener` (16) bound SSH. Behind
+      Traefik every client looks like `127.0.0.1`, so rate-limit per client
+      at the proxy if you need it.
 
-- [ ] Store credentials with `mc2 secret set NAME --value …`, never in
-      `environment:`. The store is encrypted at rest and values are never
-      listed back.
-- [ ] Keep `allowHosts` non-empty on every secret so injection **fails
-      closed** instead of attaching the value broadly.
-- [ ] Rotate by re-setting the value and re-applying the stack — the old value
-      is not pushed to running sandboxes in place.
-- [ ] **Back up the data dir.** It holds state, volumes, the operator token,
-      and the secret-store key material. Lose it and you lose the ability to
-      decrypt secrets and authenticate as operator — if you only lose the
-      token, rotate it (`mc2 server token rotate`) rather than restoring an
-      older data-dir copy.
-- [ ] Do not hand-edit the data dir; treat it as opaque state.
+## Monitor
 
-<Callout type="warning" title="The data dir is the crown jewels">
-  Because the secret-store key material and the operator token live under the
-  data dir, anyone who can read it can impersonate the operator and decrypt
-  secrets. Restrict access to it as strictly as the token itself.
-</Callout>
-
-## Networking and ingress
-
-- [ ] Keep unrelated workloads on separate networks — east–west is
-      **default-allow** within a shared network, so membership is access
-      control.
-- [ ] Use `network.profiles: none` for sandboxes that must have no network
-      reach at all.
-- [ ] Publish HTTP only through the ingress catalog (`--ingress-config-dir` +
-      `ingress:`); host ports bind loopback and stay private otherwise.
-- [ ] Operate Traefik TLS/ACME and DNS yourself — the public path in is the
-      part MC2 delegates to you.
-
-## Verify and monitor
-
-- [ ] Run `mc2 doctor` and act on its output — it checks host / msb readiness
-      (hypervisor present, expected paths).
-- [ ] Check `/v1/status` for health and version:
+- [ ] **Readiness:** probe `GET /health` (no token) — `200` while the
+      reconcile loop is converging, `503` with a reason when it isn't.
+- [ ] **Status:** `mc2 status`, or with curl:
 
       ```bash
-      curl -s "$MC2_API/v1/status" | jq .
+      curl -s -H "Authorization: Bearer $MC2_API_KEY" "$MC2_API/v1/status"
       ```
 
-- [ ] Export OTLP metrics (`MC2_OTLP_ENDPOINT`) and watch `mc2.server.*` /
-      `mc2.node.*`; configure the msb-metrics sidecar to the same collector
-      for sandbox CPU/mem/net.
-- [ ] After applying a stack, watch for warnings — including the collision
-      warning when a plaintext `environment:` entry overrides a secret.
+- [ ] **Metrics:** set `MC2_OTLP_ENDPOINT` and alert on
+      `mc2.node.reconcile_errors` and `mc2.instance.disk_used_mib` near
+      `mc2.instance.disk_limit_mib`. See
+      [Observability](/documentation/concepts/observability).
+- [ ] **Logs:** keep the server's logs; internal API errors (500s) are logged
+      with their cause, and `environment:`-overrides-secret collisions log a
+      warning.

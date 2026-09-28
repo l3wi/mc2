@@ -12,14 +12,15 @@ generating shell completions.
 ## server
 
 `mc2 server` runs the orchestrator in a single process: SQLite state, REST API,
-scheduler, and the embedded microsandbox runtime. All server flags are also
-env vars; see the [Environment variables](/references/config/environment) table
-and [Run the server](/documentation/operations/run-the-server).
+apply planner, reconcile loop, and the embedded microsandbox runtime. Flags
+override their environment variables where one exists. For supervision,
+backups, and what each option means in practice, see
+[Run the server](/documentation/operations/run-the-server).
 
 | Flag | Env | Default | Role |
 | ---- | --- | ------- | ---- |
 | `--bind <addr>` | `MC2_BIND` | `127.0.0.1:7443` | Address to bind the operator REST API |
-| `--data-dir <dir>` | `MC2_DATA_DIR` | `~/.mc2` | Data directory (SQLite, tokens) |
+| `--data-dir <dir>` | `MC2_DATA_DIR` | `~/.mc2` | Data directory: database, secrets key, default volume root |
 | `--secrets-key-path <path>` | `MC2_SECRETS_KEY_PATH` | `<data-dir>/secrets.key` | Path to the secrets encryption key (32 bytes) |
 | `--node-name <name>` | `MC2_NODE_NAME` | hostname | Local node display name (identity is persisted) |
 | `--label KEY=VALUE` | — | — | Node labels (repeatable) |
@@ -27,10 +28,15 @@ and [Run the server](/documentation/operations/run-the-server).
 | `--ingress-config-dir <dir>` | `MC2_INGRESS_CONFIG_DIR` | — | Directory for Traefik ingress catalog files |
 | `--public-hostname <host>` | `MC2_PUBLIC_HOSTNAME` | — | Public hostname to publish this control plane through the ingress catalog |
 | `--public-tls-cert-resolver <name>` | `MC2_PUBLIC_TLS_CERT_RESOLVER` | `le` | Traefik cert resolver for the control-plane TLS route |
-| `--volume-dir <dir>` | `MC2_VOLUME_DIR` | `~/.mc2/volumes` | Root for MC2-owned volume directories (bind mounts) |
+| `--volume-dir <dir>` | `MC2_VOLUME_DIR` | `<data-dir>/volumes` | Root for MC2-owned volume directories (bind mounts) |
 | `--init-only` | — | — | Bootstrap only: init data dir + tokens + exit (no listen) |
 | `--no-auth` | `MC2_NO_AUTH` | `false` | Skip API auth for this run (lab only) |
 | `--allow-unauthenticated-remote` | `MC2_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | Confirm `--no-auth` on a non-loopback bind |
+| `--allow-host-profile` | `MC2_ALLOW_HOST_PROFILE` | `false` | Permit `network.profiles: [host]` (guests reach host services, including the API) |
+| `--max-connections <n>` | `MC2_MAX_CONNECTIONS` | `256` | Concurrent REST connections; extra ones get `503` (minimum 1) |
+| `--request-timeout-secs <n>` | `MC2_REQUEST_TIMEOUT_SECS` | `60` | Deadline for ordinary REST requests (`exec`/`logs` exempt; `0` disables) |
+| `--max-ssh-sessions <n>` | `MC2_MAX_SSH_SESSIONS` | `64` | Concurrent SSH sessions across all listeners (minimum 1) |
+| `--max-ssh-sessions-per-listener <n>` | `MC2_MAX_SSH_SESSIONS_PER_LISTENER` | `16` | Concurrent SSH sessions per instance listener (minimum 1) |
 | `--limit-cpus <n>` | `MC2_LIMIT_CPUS` | `0` | Max reserved CPUs across the cluster (`0` = unlimited) |
 | `--limit-memory-mib <n>` | `MC2_LIMIT_MEMORY_MIB` | `0` | Max reserved memory MiB (`0` = unlimited) |
 | `--limit-disk-mib <n>` | `MC2_LIMIT_DISK_MIB` | `0` | Max reserved disk MiB: declared volume sizes + root disks × replicas (`0` = unlimited) |
@@ -73,8 +79,10 @@ mc2 server secrets purge --data-dir ~/.mc2 --yes
 
 ## doctor
 
-`mc2 doctor [--msb]` checks host readiness: hypervisor, `msb` (optional), and
-expected paths.
+`mc2 doctor [--msb]` is a quick host check: `/dev/kvm` exists (Linux) or the
+Mac is Apple Silicon, plus the OTLP setting and, optionally, `msb version`.
+Exit code `1` means a missing KVM device or unsupported platform; it doesn't
+boot a VM or check KVM permissions.
 
 | Flag | Default | Meaning |
 | ---- | ------- | ------- |

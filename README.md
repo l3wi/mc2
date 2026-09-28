@@ -37,14 +37,16 @@ tooling, the parts msb leaves to you.
   apply is all-or-nothing, and the file is the *whole* desired state: a service
   you delete from it is torn down by the next `up`. No run-once, no drift.
 - **A local, private sandbox and app host.** The embedded SDK keeps every
-  microVM on your box (or a server you control) — no account, no egress of
-  your code or data. `mc2 exec` and `mc2 logs --follow` are built in.
-- **Secrets that stay secret.** A server-wide, encrypted-at-rest store
-  (`mc2 secret set`) that never echoes values back; the guest sees a
-  placeholder and the real value only on connections to `allowHosts`.
+  microVM on your box (or a server you control) — no account or hosted
+  service. `mc2 exec` and `mc2 logs --follow` are built in.
+- **Secrets the guest never holds.** A server-wide store (`mc2 secret set`),
+  encrypted in MC2's database, that never echoes values back; the guest sees a
+  placeholder and the real value is added only to TLS connections to
+  `allowHosts`.
 - **A service network, not a pod network.** `expose` → default-allow east–west
-  with `<service>.<network>.svc.mc2` DNS across server-wide named networks;
-  `ports` + `ingress:` produce a Traefik catalog. `mc2 network` shows it all.
+  by name (`<service>`, or `<service>.<stack>.svc.mc2`), across stacks through
+  server-wide named networks; `ports` + `ingress:` produce a Traefik catalog.
+  `mc2 network` shows it all.
 - **Per-replica ports, no bookkeeping.** `scale: 3` turns `8080` into
   `8080, 8081, 8082`; target-only ports get stable auto host ports.
 - **One process, one CLI.** `mc2 server` = SQLite + REST + scheduler + a
@@ -62,14 +64,15 @@ tooling, the parts msb leaves to you.
   `docker-compose.yml`, you already know MC2 — the same `services`, `ports`,
   `depends_on`, and `environment` shape now boots each service as a
   hardware-isolated microVM, with no image builds or platform teams.
-- **Remote coding agents over SSH.** `ssh: true` on a dev VM, `mc2 ssh add-key`,
-  and you SSH into it from anywhere over TLS — your keys and code never
-  leave your box.
+- **Remote coding agents over SSH.** `ssh: true` on a dev VM plus a key from
+  `mc2 ssh add-key` gives it an SSH endpoint on the server's loopback; reach
+  it through a tunnel or a Traefik TCP route.
 - **A throwaway test grid.** Bring up N identical VMs, run your suite across
-  all of them, then `mc2 down --volumes` and they're gone — or keep a cache
-  volume for reuse.
-- **A fleet of headless browsers.** Thirty scraper VMs, each network-locked to
-  only the hosts it talks to, each disposable inside its own microVM.
+  all of them, then `mc2 down <stack> --volumes` and they're gone — or keep a
+  cache volume for reuse.
+- **A fleet of headless browsers.** Thirty scraper VMs, each disposable inside
+  its own microVM, each with its own egress profile (`public`, `private`, or
+  `none`).
 
 ## Install
 
@@ -153,9 +156,9 @@ services:
 YAML
 
 mc2 up -f hello.yaml
-mc2 ps
-# after hello is Running:
-curl -s http://127.0.0.1:18091/
+mc2 ps            # repeat until hello/web/0 is Running
+# Published ports bind the server's loopback; run this on the server host:
+curl -fsS http://127.0.0.1:18091/
 ```
 
 Full walkthrough:
@@ -175,7 +178,7 @@ mc2 server --no-auth
 mc2 node ls
 mc2 up -f hello.yaml   # the stack written above; examples/01-hello-service/stack.yaml in a checkout
 mc2 ps
-curl -s http://127.0.0.1:7443/v1/status
+mc2 status
 ```
 
 Save the token from the first normal `mc2 server` start (stderr on a TTY, else
@@ -197,6 +200,7 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | ------- | ---- |
 | `mc2 server` | The orchestrator (SQLite, REST, scheduler, embedded msb runtime) |
 | `mc2 server token rotate [--data-dir d]` | Mint a new operator API token in place (the old one dies immediately) |
+| `mc2 server secrets purge [--data-dir d] --yes` | Delete stored secrets when `secrets.key` is lost, so the server can start again |
 | `mc2 node ls` | Show the local node (capacity, status) |
 | `mc2 up -f stack.yaml` | Bring up a stack (publish desired state, converge) |
 | `mc2 down <stack> [--volumes]` | Tear down a stack (instances + definition; volumes retained unless `--volumes`; `rm` is an alias) |
@@ -215,21 +219,23 @@ export MC2_OTLP_ENDPOINT=http://127.0.0.1:4317
 | `mc2 doctor` | Host / msb readiness checks |
 | `mc2 completions <shell>` | Shell completions (bash/zsh/fish) |
 
-All listing commands accept `-o json`. Instance commands accept
-`<stack>/<service>/<ordinal>` in place of a UUID.
+Server-backed listing commands accept `-o json` (`mc2 context ls` is
+table-only). Instance commands accept `<stack>/<service>/<ordinal>` in place
+of a UUID.
 
-**Local/remote client modes.** The CLI resolves its connection as
-`--api`/`--token` flags > `MC2_API`/`MC2_API_KEY` env > `--context`/`MC2_CONTEXT`
-> the `current` context in `~/.mc2/config.toml` > the loopback default. A URL
+**Local/remote client modes.** The CLI resolves the URL and the token
+separately: `--api` > `MC2_API` > the context's URL > `http://127.0.0.1:7443`,
+and `--token` > `MC2_API_KEY` > the context's token, where the context is
+`--context`/`MC2_CONTEXT` or the `current` one in `~/.mc2/config.toml`. A URL
 host outside loopback is `remote` mode (`mc2 status` reports it); plaintext
 `http://` for a remote endpoint is refused unless you opt in with
 `--allow-insecure-http` / `MC2_ALLOW_INSECURE_HTTP=1`. Pair with the server's
 `--public-hostname`, which publishes the control plane itself through the
 Traefik ingress catalog so `mc2 context set prod --api https://mc2.example.com
 --token mc2at_… && mc2 context use prod` manages a remote install over TLS. See
-[site/content/documentation/quickstart.mdx](site/content/documentation/quickstart.mdx#remote-management).
+[Manage a remote server](site/content/documentation/guides/manage-a-remote-server.mdx).
 
-**Service networks:** `expose` → default-allow east–west with `<service>.<network>.svc.mc2` DNS (server-wide — stacks can share a network); `mc2 network` lists networks, members, and ports. See [examples/03-networks/](examples/03-networks/).
+**Service networks:** `expose` → default-allow east–west by name (`<service>`, `<service>.<stack>.svc.mc2`, or `<service>.<network>.svc.mc2` across stacks on a shared named network); exposed ports are exclusive server-wide; `mc2 network` lists networks, members, and port owners. See [examples/03-networks/](examples/03-networks/).
 
 **Ingress:** stack `ingress:` + `ports:` → the server writes a Traefik file-provider catalog (`--ingress-config-dir`). See [examples/04-http-ingress/](examples/04-http-ingress/).
 

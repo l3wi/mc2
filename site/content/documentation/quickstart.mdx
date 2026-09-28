@@ -1,40 +1,28 @@
 ---
 title: Quickstart
-description: Install MC2, run the setup wizard, and bring up your first service in under five minutes.
+description: Install MC2, start the server, connect the CLI, and run your first service — about five minutes.
 ---
 
-Single-machine path for **Linux (KVM)** and **macOS Apple Silicon (HVF)**.
+In this tutorial you install MC2 on one machine, start the server, point the
+CLI at it, and run a small web service in a microVM. You'll finish with a
+page served from inside the VM and know how to look inside it.
 
-MC2 is a YAML-driven orchestration system for microsandbox: one process
-(`mc2 server`) keeps state in SQLite, serves REST, and drives sandboxes
-through the embedded microsandbox SDK — no separate agent, no daemon, no gRPC
-seam.
+You need two terminals: one for the server, one for the CLI.
 
 ## Prerequisites
 
 | | Linux | macOS |
-| - | ----- | ----- |
-| CPU | amd64 or arm64 | **Apple Silicon only** |
-| Hypervisor | KVM (`/dev/kvm`) | Hypervisor.framework |
-| `mc2` | on your PATH | same |
+| --- | --- | --- |
+| CPU | x86-64 or arm64 | Apple Silicon only |
+| Hypervisor | KVM (`/dev/kvm` readable by your user) | Hypervisor.framework (built in) |
 
-Check host readiness:
+<Steps>
 
-```bash
-mc2 doctor
-```
+<Step title="Install MC2">
 
-<Callout type="note" title="Hypervisor is only needed to run sandboxes">
-  The REST and scheduler side still serve without a hypervisor; instances just
-  fail with a runtime error instead of booting. `mc2 doctor` reports exactly
-  what is missing.
-</Callout>
-
-## Install
-
-Prebuilt binaries for Linux (amd64/arm64) and macOS (Apple Silicon) ship with
-every release. Download the archive for your platform, check it against the
-published SHA-256, then install it:
+Prebuilt binaries for Linux (x86-64, arm64) and macOS (Apple Silicon) ship
+with every release. Download the archive, check it against the published
+SHA-256, then install it:
 
 ```bash
 VERSION=0.1.0                    # pin the version you verified
@@ -44,129 +32,198 @@ ARCHIVE="mc2-${TARGET}.tar.xz"
 
 curl -fsSL -O "$BASE/$ARCHIVE" -O "$BASE/$ARCHIVE.sha256"
 
-# Verify the download against the checksum published with the release.
-# macOS: use `shasum -a 256 -c -` instead of `sha256sum -c -`.
+# Verify the checksum. On macOS use `shasum -a 256 -c -` instead.
 grep -F "$ARCHIVE" "$ARCHIVE.sha256" | sha256sum -c -
 
-# Optional: verify the build's provenance with GitHub Artifact Attestations.
-# Requires the GitHub CLI; only releases published with attestations pass.
+# Optional: verify build provenance (needs the GitHub CLI).
 gh attestation verify "$ARCHIVE" --repo l3wi/mc2
 
 tar -xJf "$ARCHIVE" && sudo install -m 0755 "mc2-${TARGET}/mc2" /usr/local/bin/mc2
 mc2 --version
 ```
 
-`VERSION` is pinned deliberately — `releases/latest` is a moving target, so an
-unpinned installer can silently replace the binary you verified.
+Pinning `VERSION` means you install exactly the binary you verified;
+`releases/latest` can change underneath you. A shell installer
+(`mc2-installer.sh`) is published with each release too — download and read
+it before running it.
 
-Prefer a script? A shell installer is published too — download it, read it,
-then run it:
+</Step>
+
+<Step title="Check the host">
 
 ```bash
-VERSION=0.1.0
-curl -fsSLo mc2-installer.sh "https://github.com/l3wi/mc2/releases/download/v${VERSION}/mc2-installer.sh"
-less mc2-installer.sh   # inspect before running
-sh mc2-installer.sh
+mc2 doctor
 ```
 
-All commands below assume `mc2` is on your PATH.
-
-## Run the orchestrator
-
-First run uses the interactive wizard. It needs a TTY; it only scaffolds
-config and prints the commands to finish — it never starts the server or
-Traefik.
-
-```bash
-mc2 setup
+```text
+mc2 doctor — host checks
+  version: 0.1.0
+  os: macos aarch64
+  hypervisor: Apple Silicon HVF expected
+  runtime: microsandbox Rust SDK (embedded)
+  ...
+doctor: ok
 ```
 
-Jump straight to a tree with `mc2 setup server` (on the host that will run
-VMs) or `mc2 setup client` (on your laptop).
+The `msb` CLI is optional; MC2 embeds the runtime. Without a hypervisor the
+server still starts, but instances fail with a runtime error.
 
-1. **Server tree.** Bind address, data dir, optional public hostname /
-   Traefik, then auth. It offers auth-off only for a loopback bind (and asks
-   for `--allow-unauthenticated-remote` otherwise; never with a public
-   hostname), prints a copy-paste `mc2 server …` command and a finish-setup
-   checklist. Start the server with that command. Auth is on by default; the
-   token is **shown once** on first bootstrap — stderr on a TTY, else
-   `<data-dir>/bootstrap-token` (0600). Save it.
-2. **Client tree.** Context name, control-plane URL, and the token (leave it
-   blank for a `--no-auth` server). It saves and activates a context in
-   `~/.mc2/config.toml` (0600) and can verify the live connection.
+</Step>
 
-Then bring up your first stack:
+<Step title="Start the server (terminal 1)">
 
 ```bash
-mc2 node ls
+mc2 server
+```
 
-# There is no examples/ checkout after a binary-only install, so write the
-# same minimal stack the example ships with (the name defaults to `hello`):
-cat > hello.yaml <<'YAML'
+It creates the data dir (`~/.mc2`), listens on `127.0.0.1:7443`, and prints
+an API token **once**:
+
+```text
+=== MicroCommandControl bootstrap credentials (save these; shown once) ===
+API token  (REST Authorization: Bearer …): mc2at_3715…
+```
+
+Copy the token now. (If the server isn't attached to a terminal — say,
+under systemd — it writes the token to `~/.mc2/bootstrap-token` instead; read
+it, then delete the file.) Leave the server running.
+
+</Step>
+
+<Step title="Connect the CLI (terminal 2)">
+
+Save the server's URL and token as a context, and make it current:
+
+```bash
+mc2 context set local --api http://127.0.0.1:7443 --token 'mc2at_…'
+mc2 context use local
+mc2 status
+```
+
+```text
+mc2 0.1.0 — local: http://127.0.0.1:7443 (context: local)
+  auth: bearer ✓
+  nodes: 1/1 ready · stacks: 0 · instances: 0
+  message: control plane up
+```
+
+Prefer prompts? `mc2 setup client` asks for the same things and saves the
+context for you.
+
+</Step>
+
+<Step title="Write a stack">
+
+A stack is a Compose-style YAML file. Save this as `hello.yaml`:
+
+```yaml
 services:
   web:
     image: python:3.12-alpine
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo 'hello world' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
     ports:
       - "18091:8000"
-    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo 'hello world' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
-YAML
-
-mc2 up -f hello.yaml
-mc2 ps
-curl -s http://127.0.0.1:7443/v1/status | jq .
 ```
 
-The example runs one HTTP service publishing host port `18091`:
+- The stack is named `hello`, after the file.
+- `command` is required for anything that should serve: MC2 doesn't run the
+  image's default command.
+- `ports` publishes guest port 8000 on the host's `127.0.0.1:18091`.
+
+</Step>
+
+<Step title="Bring it up">
 
 ```bash
-curl -s http://127.0.0.1:18091/
+mc2 up -f hello.yaml
+```
+
+```text
+{"stack":"hello","services":1,"instances":1,"scheduled":1,"pending":0,"ssh":[]}
+```
+
+`mc2 up` returns as soon as the server has accepted the stack. The microVM
+starts on the next reconcile pass — the first run also downloads the image,
+so give it a moment. Watch it:
+
+```bash
+mc2 ps
+```
+
+```text
+│ STACK ┆ SERVICE ┆ ORD ┆ PHASE   ┆ NODE     ┆ NOTES ┆ ID       │
+│ hello ┆ web     ┆   0 ┆ Running ┆ 422229db…┆       ┆ c3932671…│
+```
+
+Repeat until the phase is `Running`. If it shows `Failed`, the message in
+`mc2 ps -o json` says why.
+
+</Step>
+
+<Step title="Check it works">
+
+```bash
+curl http://127.0.0.1:18091/
+# hello world
+
+mc2 logs hello/web/0 --tail 5
+# [stderr] 172.16.1.49 - - [...] "GET / HTTP/1.1" 200 -
+
+mc2 exec hello/web/0 cat /tmp/www/index.html
 # hello world
 ```
 
-<Callout type="note" title="Skip the wizard (lab)">
-  Two terminals, no context file, no auth. Defaults are data dir
-  `~/.mc2` and bind `127.0.0.1:7443`; the CLI already talks to that
-  loopback URL.
+`hello/web/0` is the instance: stack `hello`, service `web`, replica `0`.
+`mc2 exec` runs a command inside that microVM.
 
-  ```bash
-  # Terminal 1
-  mc2 server --no-auth
+</Step>
 
-  # Terminal 2
-  mc2 node ls
-  mc2 up -f hello.yaml   # the stack written above
-  ```
+<Step title="Clean up">
+
+```bash
+mc2 down hello
+```
+
+This removes the stack's instances and its definition. The server keeps
+running; stop it with Ctrl-C in terminal 1 (running microVMs would survive
+that — `mc2 down` is what removes them).
+
+</Step>
+
+</Steps>
+
+<Callout type="tip" title="Lab shortcut: no token">
+  For a throwaway local lab, `mc2 server --no-auth` skips the token for that
+  run, and the CLI's default URL (`http://127.0.0.1:7443`) already points at
+  it — no context needed. It only works on a loopback bind; see
+  [Identity & contexts](/documentation/concepts/identity-and-contexts).
 </Callout>
 
 ## What just happened?
 
-Behind that `mc2 up` call:
+1. **`mc2 up` sent the whole file.** The server validated it, filled in
+   defaults (the name, `scale: 1`, `cpus: 1`, `mem_limit: 512m`), reserved
+   host port 18091, and saved the result in one transaction.
+2. **The reconcile loop made it real.** On its next pass it saw an instance
+   with no microVM, created one, and recorded the phase: `Scheduled` →
+   `Running`.
+3. **It keeps it that way.** If the VM disappeared, the next pass would
+   notice. With a `restart` policy, a crash is retried automatically.
 
-1. **Published desired state.** The stack YAML was validated (unknown keys are
-   rejected, not ignored), the missing `name` was filled from the file stem,
-   and the normalized document was persisted in SQLite.
-2. **Scheduled instances.** The service's `scale: 1` became one instance,
-   assigned to the local node, and its declared host port was bound.
-3. **Converged.** The reconcile loop built a desired set and drove the sandbox
-   through its phase model — `Pending` → `Running`. If it had failed, the
-   instance would report `Failed` instead of silently vanishing.
-4. **Verified.** `mc2 ps` reads live phase state; `curl` proves the service is
-   actually reachable on the published port.
-
-This is the core model: **you write what you want, MC2 makes it true and keeps
-it true.** See [Desired state & reconciliation](/documentation/concepts/desired-state).
+You write what you want; MC2 makes it true and keeps it true. See
+[Desired state & reconciliation](/documentation/concepts/desired-state).
 
 ## Next steps
 
 <Cards cols={2}>
   <Card
-    title="Run your first stack"
-    description="Tear down, inspect, and understand what you just brought up."
+    title="Change a running stack"
+    description="Change a running stack, and see what apply does and doesn't touch."
     href="/documentation/guides/run-your-first-stack"
   />
   <Card
     title="Architecture"
-    description="What the single mc2 server process actually does."
+    description="What the single mc2 server process does."
     href="/documentation/concepts/architecture"
   />
 </Cards>

@@ -1,48 +1,149 @@
 ---
 title: Stack YAML overview
-description: The desired-state document mc2 up -f sends to the server — shape, canonical parsing, defaults, and apply-time validation.
+description: The desired-state document mc2 up -f sends to the server — every top-level key, the naming rules, an annotated example, and apply-time validation.
 ---
 
 The desired-state document `mc2 up -f <file>` sends to the MC2 server. It is
 **Docker Compose-shaped**: a top-level `name` plus a `services` map, with
-`volumes`, `networks`, and `ingress` as top-level declarations.
+`volumes`, `networks`, and `ingress` as top-level declarations. You write the
+whole file every time — `mc2 up` makes the running stack match it, creating,
+updating and deleting instances as needed.
 
 ## Document shape
 
+```text
+stack.yaml
+├─ name        optional; filled from the file name  (this page)
+├─ services    required, at least one               (Services)
+│   └─ <service>: image, scale, cpus, mem_limit, storage_opt,
+│                 command, environment, restart, healthcheck,
+│                 depends_on, ports, expose, networks, network,
+│                 secrets, volumes, ssh, labels, nodeName,
+│                 nodeSelector
+├─ volumes     named directories with a size cap    (Secrets & volumes)
+├─ networks    named networks, { mode: mediated }   (Networks & ingress)
+└─ ingress     { tls, rules, tcp }                  (Networks & ingress)
+```
+
+## Top-level keys
+
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `name` | no\* | file stem, else parent dir | Stack name: lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, no `--`, ≤ 40 characters. |
-| `services` | yes | — | Map of service name → service spec. Must be non-empty; names share the stack grammar (≤ 63). |
-| `volumes` | no | `{}` | Declared volumes; service mounts must reference them. Names: `[a-z0-9][a-z0-9._-]*`, no `--`, no trailing `-`, ≤ 63. |
-| `networks` | no | `{}` | Named network groups, server-wide: members reach each other by default. Names share the stack grammar (≤ 63). |
-| `ingress` | no | — | HTTP(S) rules + TCP routes for a BYO Traefik. |
+| `name` | no\* | file stem, else parent dir | Stack name. Lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, no `--`, ≤ 40 characters. |
+| `services` | **yes** | — | Map of service name → service spec; must be non-empty. Names use the same grammar (≤ 63). |
+| `volumes` | no | `{}` | Named directories mounted into guests; every service mount must reference one. |
+| `networks` | no | `{}` | Stack-level network declarations. In v1 the only useful key is `mode: mediated` (the default); membership itself is per-service (`networks: [name]`). |
+| `ingress` | no | — | HTTP(S) rules and TCP routes published to a BYO Traefik. |
 
-\* filled by `mc2 up` when missing.
+\* `mc2 up` fills a missing (or empty) `name:` — see
+[Naming and name derivation](#naming-and-name-derivation).
 
-A service is roughly "a microVM that runs one process." The full service key
-table lives in [Services](./services). For the deeper model, see
-[Stacks](/documentation/concepts/stacks).
+Nothing else exists at the top level. `apiVersion`, `kind`, and `metadata`
+from a Kubernetes manifest are rejected, as is any other unrecognized key.
 
-## Canonical parsing
+## Naming and name derivation
 
-The parser is canonical: **any unrecognized key is rejected** (`unknown field
-…`). There is no legacy compatibility layer, so the old k8s-style
-`apiVersion`/`kind`/`metadata` wrapper and fields like `replicas` /
-`restartPolicy` / `resources` / `health` / `mount` are **errors, not silent
-no-ops**. If a key isn't in this reference, it doesn't apply.
+Names are the identity of a stack, a service, and the directories MC2 creates
+on the node, so the grammar is strict and checked at apply.
 
-<Callout type="warning" title="Do not port Kubernetes manifests">
-  `apiVersion`, `kind`, `metadata`, `replicas`, `resources`, `restartPolicy`,
-  `health`, `allow`, `mount`, `env`, and `host`/`guest` port keys are all
-  rejected at parse time. Rewrite the document into the keys below.
-</Callout>
+| Object | Grammar | Max | Notes |
+| --- | --- | --- | --- |
+| Stack `name` | `[a-z0-9]([a-z0-9_-]*[a-z0-9])?` | 40 | Filled from the file path when absent. |
+| Service key | same grammar | 63 | Becomes part of the DNS name and the sandbox name. |
+| Network name (top-level or `networks[]`) | same grammar | 63 | Underscores are allowed. |
+| Volume name (top-level `volumes`) | `[a-z0-9][a-z0-9._-]*`, no `--`, no trailing `-` | 63 | Dots are allowed here only. |
 
-## Minimal file
+The shared rules, in words: lowercase letters and digits at both ends,
+`-` and `_` inside, **never `--`** (it is the volume separator, see
+[Secrets & volumes](/references/stack/secrets-volumes)), and never uppercase. An invalid name
+is a `400` with a suggested valid alternative when one can be derived, e.g.
+`invalid service name "Web" ... (suggested: "web")`.
 
-`mc2 up` fills a missing top-level `name:` from the sanitized file stem
-(lowercased, invalid characters → `-`, ≤ 40 characters) — or, when the stem is
-the generic `stack` (e.g. `examples/01-hello-service/stack.yaml`), from the
-parent directory name. So this is a complete stack:
+When `name:` is absent, `mc2 up` derives it from the file path: the sanitized
+file stem, or — when the stem is the generic `stack` (so
+`examples/01-hello-service/stack.yaml` works) — the sanitized parent directory
+name. Sanitizing lowercases, maps every other character (including `.`) to `-`,
+collapses `--`, trims edge `-`/`_`, and truncates to 40 characters. So all of
+these are complete stacks:
+
+```yaml
+# stack.yaml inside examples/01-hello-service/ → stack name "01-hello-service"
+services:
+  web:
+    image: alpine:3.20
+```
+
+## Annotated example
+
+Every top-level section and the most-used service keys in one file:
+
+```yaml
+name: shop                       # optional; defaults to the file path
+
+services:
+  db:
+    image: postgres:16           # required, non-empty
+    command: ["postgres"]        # replaces the image CMD; omitted = sleep infinity
+    scale: 1                     # replicas (default 1; must be >= 1)
+    cpus: 1                      # whole vCPUs, 1-255 (default 1)
+    mem_limit: 256m              # guest RAM (default 512m)
+    storage_opt:
+      size: 8GiB                 # writable root disk (default 4 GiB)
+    expose: [5432]               # east-west listener on the service network
+    volumes:
+      - name: data               # must be declared under top-level volumes
+        target: /var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: lab     # map or ["KEY=VALUE", ...]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: on-failure          # no | on-failure | always | unless-stopped
+
+  web:
+    image: python:3.12-alpine
+    scale: 3                     # -> instances web/0, web/1, web/2
+    mem_limit: 128m
+    ports:
+      - "8080:8000"              # host 8080+ordinal -> guest 8000
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]          # join a server-wide named network
+    labels:
+      app: shop                  # free-form labels (metadata only)
+    command: ["python", "-m", "http.server", "8000"]
+
+volumes:
+  data:
+    kind: dir                    # the only kind in v1
+    size: 20GiB                  # quota; data survives recreate and down
+
+networks:
+  backend:
+    mode: mediated               # the only valid mode in v1
+
+ingress:
+  tls:
+    enabled: true
+    certResolver: le             # resolver from the Traefik static config
+  rules:
+    - host: shop.local
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+          port: 8000             # must match a ports[].target on `web`
+```
+
+`mc2 up` also supplies service-level defaults (`scale: 1`, `cpus: 1`,
+`mem_limit: 512m`, `restart: no`, `storage_opt.size: 4GiB`, and so on), so the
+minimal file below is enough to start a microVM. Without `command` it runs
+`sleep infinity` rather than the image's own command — set `command` for
+anything that should serve:
 
 ```yaml
 services:
@@ -50,31 +151,66 @@ services:
     image: alpine:3.20
 ```
 
-`mc2 up` also supplies service-level defaults (`scale: 1`, `cpus: 1`,
-`mem_limit: 512m`, `restart: no`, and so on), so the file above runs as-is.
+## Canonical parsing
+
+The parser is canonical: **any unrecognized key is rejected** with the key's
+name (`unknown field ...`). There is no compatibility layer, so a k8s-style
+`apiVersion`/`kind`/`metadata` wrapper and fields like `replicas` /
+`restartPolicy` / `resources` / `health` / `mount` are **errors, not silent
+no-ops**. A `ports` entry that is a map accepts only
+`target`/`published`/`protocol`/`hostname`; a mistyped key is rejected by name
+(a misspelt `published` used to become a random auto port).
+
+<Callout type="warning" title="Do not port Kubernetes or old MC2 manifests">
+  `apiVersion`, `kind`, `metadata`, `replicas`, `resources`, `restartPolicy`,
+  `health`, `allow`, `mount`, `env` (the key is `environment`), and
+  `host`/`guest` port keys are all rejected at parse time. Rewrite the document
+  into the keys in this reference.
+</Callout>
 
 ## Apply-time validation
 
-Apply returns `400` for:
+Apply is **all-or-nothing**: it plans the whole document (parse, validate,
+capacity, disk reservation, port resolution, port claims, host probes) with no
+writes, then commits the stack and every instance change in one transaction. A
+rejected apply leaves the running stack untouched. Rejections return `400`.
 
-- unknown keys (canonical parser — see above)
-- empty services; a missing `name`; names that violate the grammar or length
-  caps (stack ≤ 40; service/network/volume ≤ 63); `--` anywhere in a name
-- undeclared volume mounts; non-`dir` volume kinds
-- relative or duplicate target paths
-- `scale: 0`; unknown `restart` values; non-mediated networks
-- `network.profiles` values outside `public|private|host|none`, `none` with
-  another profile, or duplicates
-- zero/duplicate `expose` ports; non-unique expose ports across the stack
-- ingress without routes; hosts that are not lowercase RFC 1123 names (no
-  ports, wildcards or trailing dot); paths without a leading `/` or containing
-  whitespace/quotes/backticks/backslashes/control characters;
-  `certResolver`/`entryPoint`/TCP `name` outside `[A-Za-z0-9_-]+`; two routes
-  that collide on a Traefik router key; ingress paths whose backend ports are
-  missing or non-tcp; TCP ingress targeting services without fixed SSH ports
-- `depends_on` references to services outside the stack, unknown conditions, or
-  cycles; `service_healthy` dependencies without a declared healthcheck
+What each section checks (details and exact messages on the linked pages):
 
-See [networks & ingress](./networks-ingress) and
-[secrets & volumes](./secrets-volumes) for the individual constraints that back
-these rejections.
+- **Document** — `services` must be non-empty; a supplied `name` must satisfy
+  the grammar and length cap; every name must be present and valid.
+- **Services** ([Services](/references/stack/services)) — non-empty `image`; `scale >= 1`;
+  `cpus` between 1 and 255; `restart` in the closed set; `network.profiles` in
+  the closed set (`none` alone, no duplicates); non-zero, unique `expose`
+  ports (also unique across the stack); `storage_opt.size` positive and
+  ≤ 1 TiB. (A missing, empty, or `["NONE"]` health check `test` simply
+  disables the check.)
+- **Volumes** ([Secrets & volumes](/references/stack/secrets-volumes)) — volume name grammar;
+  `kind: dir`; `size` positive and ≤ 1 TiB; mounts must reference a declared
+  volume, use an absolute `target`, and not repeat a path within a service. At
+  apply a volume may also not be shrunk below what it already holds.
+- **Networks** ([Networks & ingress](/references/stack/networks-ingress)) — network name
+  grammar; `mode: mediated`.
+- **Ingress** ([Networks & ingress](/references/stack/networks-ingress)) — at least one route
+  when `ingress` is set; RFC 1123 hosts; valid paths and `pathType`; in-stack
+  services; backend ports that match a `ports[].target` (`tcp`); valid Traefik
+  identifiers; no two routes collapsing to the same Traefik router key.
+- **Ports** ([Ports & expose](/references/stack/ports-expose)) — short/long forms decoded; at
+  apply, fixed blocks that overflow 65535, an exhausted auto pool, and host
+  ports MC2 has already assigned are rejected. `expose` ports are also
+  rejected when they collide with the REST bind, SSH listeners, published
+  ports, `:53`, or a port a host process already listens on. Published ports
+  are **not** probed against other host processes at apply; such a clash
+  surfaces when the microVM starts.
+- **`depends_on`** ([Healthchecks & depends_on](/references/stack/health-depends)) — in-stack
+  references, supported conditions, `service_healthy` only with a declared
+  healthcheck, and an acyclic graph.
+
+## Where to go next
+
+- One service's full key table: [Services](/references/stack/services).
+- Ports (north-south) and `expose` (east-west): [Ports & expose](/references/stack/ports-expose).
+- Networks, profiles, and the ingress catalog: [Networks & ingress](/references/stack/networks-ingress).
+- Secrets and volumes: [Secrets & volumes](/references/stack/secrets-volumes).
+- Healthchecks and startup ordering: [Healthchecks & depends_on](/references/stack/health-depends).
+- SSH front ends and placement: [SSH & node placement](/references/stack/ssh-node).

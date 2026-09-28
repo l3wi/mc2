@@ -1,128 +1,156 @@
 ---
 title: Agent swarm
-description: Scale one agent service to 20 hardware-isolated microVMs, keep them alive with restart, and exec or tail logs on any replica.
+description: Scale one service to a fleet of microVMs, reach them all through one name, and have MC2 replace any that stop answering.
 ---
 
 ## What you'll build
 
-One `scale: 20` service definition becomes twenty hardware-isolated microVMs,
-each running your agent image. `restart` keeps them alive through crashes, and
-`mc2 exec` / `mc2 logs --follow` drop you into any replica. Give the swarm its
-own named network so agents can coordinate — or keep them fully isolated.
+One service definition becomes four microVMs, each with its own kernel. They
+share one exposed port, so any caller on the network reaches "the swarm" by
+name and MC2 spreads connections across the replicas. A health check lets
+MC2 replace a replica whose process dies.
 
-This recipe assumes the server is already running (see the
-[quickstart](/documentation/quickstart)).
+```text
+                     agent:18200   (one name, one port)
+                           │
+                  MC2 splice, round-robin
+        ┌─────────────┬────┴────────┬─────────────┐
+        ▼             ▼             ▼             ▼
+   agent/0       agent/1       agent/2       agent/3
+   microVM       microVM       microVM       microVM
+```
+
+You need a running server and a CLI context — see the
+[Quickstart](/documentation/quickstart).
 
 ## The stack
 
-Save this as `agent-swarm.yaml`:
+Save as `agent-swarm.yaml`:
 
 ```yaml
 name: agent-swarm
-
 networks:
   mesh:
     mode: mediated
-
 services:
   agent:
-    image: <your-agent-image>   # e.g. an LLM coding-agent image
-    scale: 20
-    cpus: 1
-    mem_limit: 512m
-    network:
-      profiles: [public]
+    image: python:3.12-alpine
+    scale: 4
+    mem_limit: 256m
     networks: [mesh]
-    expose:
-      - port: 8080
+    expose: [18200]
     restart: always
-    command: ["/usr/local/bin/agent", "--join", "agent.mesh.svc.mc2:8080"]
+    command: ["/bin/sh", "-c", "cat /proc/sys/kernel/random/boot_id > /tmp/index.html && cd /tmp && exec python -m http.server 18200"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:18200/"]
+      interval: 2s
+      retries: 2
+      start_period: 10s
 ```
 
-- `scale: 20` — twenty replicas, each a separate microVM with its own kernel.
-- `restart: always` — the reconcile loop re-creates any replica whose main
-  process exits.
-- `networks: [mesh]` + `expose` — the swarm joins one named network
-  (default-allow), so any agent reaches any other at
-  `agent.mesh.svc.mc2:8080`.
-- Drop the `networks:` and `expose:` lines to keep the swarm fully isolated.
+- `scale: 4` — four replicas, each its own microVM.
+- `expose: [18200]` — one port for the whole service, not one per replica.
+  Exposed ports are unique on the server, so pick one nobody else uses.
+- `networks: [mesh]` — also join a server-wide named network, so agents in
+  **other** stacks can reach this swarm as `agent.mesh.svc.mc2`.
+- `restart: always` + `healthcheck` — replace a replica that stops
+  answering, not just one whose VM stops.
+- The `command` stands in for your agent: it serves the VM's boot ID, so you
+  can see which replica answered.
+
+<Note title="Scale is bounded by the host">
+  `scale × cpus` and `scale × mem_limit` must fit the host (and any
+  `--limit-*` budget), or the apply is refused. `mc2 status` shows capacity
+  and what's reserved.
+</Note>
 
 ## Run it
 
 <Steps>
-<Step title="Apply the stack">
+
+<Step title="Apply">
 
 ```bash
 mc2 up -f agent-swarm.yaml
+mc2 ps --stack agent-swarm      # repeat until all four are Running
 ```
 
 </Step>
-<Step title="Confirm all replicas">
+
+<Step title="Call the swarm from inside it">
 
 ```bash
-mc2 ps --stack agent-swarm
+for i in 1 2 3 4; do mc2 exec agent-swarm/agent/0 wget -qO- http://agent:18200/; done
+# 9a4c1da8-1a67-4c8a-ad05-e2005a3635b6
+# a301ce37-ab32-42ff-b02c-2fe51cd1e6a2
+# f7cf4096-70a8-4a0f-8cb7-f53688d84e95
+# 3aeb6c4b-34b6-4a0a-8b49-4f8490dd3da2
 ```
 
-All 20 instances converge to `Running`.
+Four different boot IDs: connections round-robin over the ready replicas.
+Inside the stack the name is `agent` or `agent.agent-swarm.svc.mc2`; from
+another stack on `mesh`, it's `agent.mesh.svc.mc2`.
 
 </Step>
-<Step title="Inspect the swarm network">
+
+<Step title="Look at the network">
 
 ```bash
 mc2 network mesh
 ```
 
-Lists the network's member instances and ports.
-
-</Step>
-<Step title="Drop into a replica">
-
-```bash
-mc2 exec agent-swarm/agent/7 /bin/sh -c 'uname -a'
+```text
+network 'mesh' (named) — 1 stack, 1 service, 4 instances (4 active)
+  agent-swarm/agent  0  Running  healthy
+      expose: 18200 (agent-swarm/agent)
+  ...
+port claims (exclusive server-wide):
+  18200  agent-swarm/agent
 ```
 
-Instance refs take the form `<stack>/<service>/<ordinal>`.
-
 </Step>
-<Step title="Tail a replica's logs">
+
+<Step title="Get into one replica">
 
 ```bash
-mc2 logs agent-swarm/agent/12 --tail 50
-mc2 logs agent-swarm/agent/12 --follow
+mc2 exec agent-swarm/agent/2 uname -a
+mc2 logs agent-swarm/agent/2 --follow
 ```
 
-`--follow` streams the sandbox log live.
+</Step>
+
+<Step title="Kill one agent and watch it come back">
+
+```bash
+mc2 exec agent-swarm/agent/3 cat /tmp/index.html          # note the boot ID
+mc2 exec agent-swarm/agent/3 /bin/sh -c '(sleep 1; kill "$(pidof python)") >/dev/null 2>&1 &'
+mc2 ps --stack agent-swarm -o json                         # repeat for ~10 s
+mc2 exec agent-swarm/agent/3 cat /tmp/index.html          # a new boot ID
+```
+
+The health check fails twice, MC2 recreates replica 3 as a fresh microVM, and
+the other three never notice.
 
 </Step>
+
+<Step title="Clean up">
+
+```bash
+mc2 down agent-swarm
+```
+
+</Step>
+
 </Steps>
 
-## Verify
+## Variations
 
-```bash
-mc2 ps --stack agent-swarm
-```
-
-shows 20 `Running` replicas. Kill one to see `restart` in action — crash the
-main process and the reconcile loop brings the replica back:
-
-```bash
-mc2 exec agent-swarm/agent/3 /bin/sh -c 'kill 1'
-mc2 ps --stack agent-swarm
-```
-
-The replica briefly leaves `Running` and converges back. This is the same
-desired-state loop that makes `mc2 up` idempotent — see
-[Desired state & reconciliation](/documentation/concepts/desired-state).
-
-## Notes
-
-- Each replica is a full microVM (kernel included), not a container. 20
-  replicas = 20 VMs, so budget CPU and memory on the host.
-- v1 is single-node: the whole swarm runs on one server process.
-- `mc2 network agent-swarm/agent/7` shows one instance's observed
-  exposes/edges; `mc2 network mesh` shows the whole network.
-- For isolated agents, remove `networks: [mesh]` and `expose:` — replicas then
-  share only the stack's default network and publish nothing.
-- Same-network peers reach each other by `<service>.<network>.svc.mc2` DNS; see
-  [Networking](/documentation/concepts/networking) and
-  [Connect services](/documentation/guides/connect-services).
+- **Fully isolated agents.** Drop `networks` and `expose`: replicas then
+  share only the stack's own network and serve nothing to each other. For
+  egress, `network.profiles: [public]` (the default) allows the internet,
+  `[private]` allows only LAN addresses, and `[none]` cuts networking
+  entirely.
+- **Agents that talk to a coordinator.** Put the coordinator in its own
+  service with an `expose` port on `mesh`; the agents reach it by name.
+- **Per-replica inspection.** `mc2 network agent-swarm/agent/2` shows what one
+  replica can reach.

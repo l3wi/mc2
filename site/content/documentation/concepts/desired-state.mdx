@@ -1,112 +1,169 @@
 ---
 title: Desired state & reconciliation
-description: You write what you want; MC2 makes it true and keeps it true.
+description: You write what you want; MC2 records it in one step and a loop keeps reality matching it.
 ---
 
-You write what you want; MC2 makes it true and keeps it true. `mc2 up`
-publishes a stack as the *desired state*, and the server's reconcile loop
-converges real microVMs toward it on an interval. Nothing is run-once and
-nothing drifts.
+You write what you want; MC2 makes it true and keeps it true. `mc2 up` hands
+the server a stack file as the **desired state**. The server records it in
+one step, and its **reconcile loop** then keeps real microVMs matching it:
+starting what's missing, restarting what crashed, and removing what's no
+longer wanted.
 
 ## The analogy
 
 Docker Compose runs a project once and walks away. MC2 behaves more like a
 Kubernetes controller collapsed into one process: the desired document is
-durable, and a loop continuously compares it against reality, creating,
-restarting, and tearing down instances until they match. Unlike Kubernetes,
-there is no multi-node scheduler — just one node and one loop.
+durable, and a loop keeps comparing it with reality until they match. Unlike
+Kubernetes there is no multi-node scheduler — one machine, one loop.
 
 ## How it works
 
-1. **Publish.** `mc2 up -f stack.yaml` validates the file (unknown keys are
-   rejected), fills defaults, and persists the normalized document in SQLite.
-   Applying is *idempotent* — the same file re-applied converges to the same
-   state — and *atomic*: the document and every instance change it implies are
-   written in one transaction, so a rejected apply leaves the previous state
-   untouched. The document is also the **whole** desired state: a service you
-   removed from the file is torn down by the next `up`, and a lower `scale`
-   deletes the extra replicas.
-2. **Schedule.** The scheduler turns each service into concrete instances on
-   the local node, resolving per-replica ports, placement (`nodeName` /
-   `nodeSelector`), and `depends_on` ordering.
-3. **Converge.** The reconcile loop runs on an interval (default 10s). For
-   every instance it builds the *desired set* and drives the sandbox through
-   its phase model: `Pending` → `Running`, or `Failed`. Restart policies
-   (`restart: on-failure | always | unless-stopped`) re-create failed or
-   stopped replicas.
-4. **Report.** `mc2 ps` reads live phase state; `mc2 status` summarizes
-   health and counts.
+Two halves, joined by the database:
 
-## Restarts and sandbox ownership
+```text
+  mc2 up -f stack.yaml
+          │
+          ▼
+  ┌── apply (once) ─────────────┐       ┌── reconcile loop (every 10 s) ──┐
+  │ 1. validate the document    │       │ 1. read desired state           │
+  │ 2. plan: capacity, ports,   │       │ 2. list this install's microVMs │
+  │    instances to add/remove  │       │ 3. create / restart / recreate  │
+  │ 3. commit in one transaction├──────►│    / remove to close the gap    │
+  │    (or reject: no change)   │SQLite │ 4. write observed phases back   │
+  └─────────────────────────────┘       └─────────────────────────────────┘
+```
 
-The server is also the node, so a restart does not lose track of the
-microVMs it started. Every sandbox it creates carries this install's id
-(`mc2.install`), and the first reconcile pass lists the sandboxes with that
-label: sandboxes that match the current desired state are adopted, ones whose
-applied configuration no longer matches are recreated, and labelled sandboxes
-no stack wants any more are removed. Sandboxes without the install label belong
-to something else and are never touched. Ownership of a sandbox is dropped only
-after its removal succeeded, so a transient failure is retried on the next pass
-instead of orphaning a VM.
+### Apply: plan, then commit
 
-The config hash is recorded per instance only after the sandbox was confirmed
-running with it. That is what makes the adoption decision trustworthy: after a
-crash between `mc2 up` and the next pass, the old VM has the old hash, so it is
-recreated rather than silently kept as if it had the new configuration.
+`mc2 up` sends the **whole** stack file. The server:
 
-Two failure modes are deliberate:
+1. **Validates** it. Unknown keys, bad names, and invalid values are
+   rejected with a message pointing at the field.
+2. **Plans** the change without writing anything: checks CPU, memory, and
+   disk budgets; assigns host ports and checks nobody else holds them; works
+   out which instances to create, update, or delete.
+3. **Commits** the stack and every instance change in **one transaction**.
 
-- **One broken instance does not stop the node.** If an instance's desired
-  state cannot be resolved (a secret referenced but not set, an unreadable
-  stored spec), that instance is reported `Failed` with the reason and the rest
-  of the node keeps reconciling. Its existing sandbox is kept, not collected.
-- **A slow pass unbinds nothing.** Placement changes only when you apply,
-  remove a stack, or the store changes; there is no heartbeat timeout that can
-  free a workload because reconcile took a while.
+If validation or planning rejects the file, the apply returns `400` and
+nothing changes: the running stack stays exactly as it was. (An internal
+failure, such as a database error, returns `500` — the transaction still
+means nothing is half-written.) Applies are serialized, so two `mc2 up`
+calls can't interleave.
+
+Because the file is the whole desired state, removals are part of it: drop a
+service from the file, or lower its `scale`, and the next `mc2 up` deletes
+those instances. Re-applying an unchanged file changes nothing.
+
+### Reconcile: converge, then report
+
+The reconcile loop runs every `--reconcile-interval-secs` (default 10). Each
+pass it:
+
+1. Reads every instance's desired spec from SQLite.
+2. Compares it with the microVMs this server owns.
+3. Closes the gap for each instance: creates a missing microVM, restarts a
+   crashed one (per its `restart` policy), **recreates** one whose
+   create-time config changed, and removes microVMs nothing wants.
+4. Writes each instance's observed phase back to SQLite, which is what
+   `mc2 ps` shows.
+
+An instance moves through these phases:
+
+```text
+ Pending ──► Scheduled ──► Creating ──► Running
+                              │            │
+                              ▼            ▼
+                            Failed      Stopped / Failed
+                              │            │
+                              └──► restart policy ──► Creating
+```
+
+`depends_on` can hold an instance before `Creating` until its dependencies
+are started or healthy. See
+[Services & instances](/documentation/concepts/services-and-instances).
+
+### Restart vs recreate
+
+- **Start again** — a microVM whose process exited (`Stopped`) is booted
+  again in place. Its root disk is kept.
+- **Recreate** — the microVM is deleted and a new one is built from the
+  image. This happens when an instance `Failed` (and its `restart` policy
+  allows a retry), and whenever you change anything fixed at creation:
+  image, command, environment, ports, network settings, volumes and their
+  sizes, root disk size, secrets, `cpus`, `mem_limit`. Files outside
+  [volumes](/documentation/concepts/storage) are **not** kept.
+
+## Restarts of the server itself
+
+Stopping `mc2 server` leaves the microVMs running. Every microVM it creates
+carries this install's id as a label. On the next start, the first pass:
+
+- **adopts** labelled microVMs that still match the desired state,
+- **recreates** ones whose recorded config no longer matches,
+- **removes** labelled microVMs no stack wants, and
+- **ignores** microVMs without the label — they belong to something else.
+
+The config hash is recorded only after a microVM is confirmed running with
+it. So if the server crashes between `mc2 up` and the next pass, the old
+microVM still has the old hash and gets recreated, rather than being
+silently kept as if it were up to date. A removal that fails is retried every
+pass until it succeeds.
+
+## Failures stay local
+
+- **One broken instance doesn't stop the pass.** If an instance's desired
+  state can't be resolved (for example, it references a secret that isn't
+  set), that instance is reported `Failed` with the reason. Its existing
+  microVM is kept, and every other instance keeps reconciling.
+- **Crash loops are slowed down.** Repeated restarts wait 2 s, 5 s, 15 s, then
+  30 s between attempts; the counter resets after 60 s of healthy running.
+- **Slow passes free nothing.** Placement only changes when you apply or
+  remove a stack. There is no timeout that moves or drops a workload because
+  a pass took a while.
 
 ## In practice
 
 ```yaml
+# stack.yaml
+name: web-stack
 services:
   db:
     image: postgres:16
+    command: ["postgres"]        # MC2 doesn't run the image's CMD by default
     restart: on-failure
+    environment:
+      POSTGRES_PASSWORD: lab
   web:
     image: python:3.12-alpine
     scale: 3
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_started
 ```
 
 ```bash
-mc2 up -f stack.yaml   # publish + converge
-mc2 ps                 # watch phases
-mc2 down web-stack     # instances + definition removed
+mc2 up -f stack.yaml   # plan + commit; the loop converges within a pass
+mc2 ps                 # watch phases move to Running
+mc2 up -f stack.yaml   # unchanged file: nothing happens
+mc2 down web-stack     # remove the stack's instances and definition
 ```
 
 ## Key behaviors
 
-- **Idempotent.** Re-applying the same file is a no-op if already converged.
-- **Whole-document.** Removals are part of the desired state: dropping a
-  service, or lowering `scale`, removes those instances on the next `up`. An
-  apply that fails validation or allocation changes nothing at all.
-- **No drift.** The loop owns instance lifecycle; a crashed replica is
-  recreated according to `restart` — not left dead. Repeated restarts are
-  spaced by the restart backoff, so a crash loop cannot restart on every pass.
-- **Ordering at startup only.** `depends_on` gates a dependent's *first*
-  start; a running dependent is not re-gated, not dropped from routing and not
-  torn down when its dependency later dies (Compose semantics).
-- **Teardown.** `mc2 down` removes instances *and* the definition; volumes
-  are retained unless you add `--volumes`.
-- **Failed ≠ vanished.** An instance that cannot start reports `Failed`
-  with a reason, so misconfiguration is visible in `mc2 ps`.
+- **Whole-document and all-or-nothing.** One file, one transaction; a
+  rejected apply changes nothing.
+- **Idempotent.** Re-applying the same file is a no-op once converged.
+- **Self-healing.** A crashed instance is restarted according to `restart`,
+  with backoff — not left dead, not restarted every pass.
+- **Visible failure.** An instance that can't start shows `Failed` with a
+  reason in `mc2 ps`.
+- **Durable teardown rules.** `mc2 down` removes instances and the stack
+  definition; volumes stay unless you add `--volumes`.
 
 ## Deeper
 
+- [Stacks](/documentation/concepts/stacks) — the document you apply.
 - [Services & instances](/documentation/concepts/services-and-instances) —
-  the phase model and restart policies.
-- [Run your first stack](/documentation/guides/run-your-first-stack) —
-  publish, inspect, tear down.
-- [Scale & restart](/documentation/guides/scale-and-restart) —
-  per-replica ports and resilience.
+  replicas, restart policies, health, and ordering.
+- [Scale & restart](/documentation/guides/scale-and-restart) — see the loop
+  at work.

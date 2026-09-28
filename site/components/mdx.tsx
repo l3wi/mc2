@@ -93,7 +93,7 @@ export function Step({
     <li className="mc2-step relative pl-12">
       <span className="absolute left-0 top-0 flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-zinc-50 font-mono text-sm font-semibold text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300" />
       <h3 className="mt-0 mb-2 scroll-mt-24 text-sm font-semibold">{title}</h3>
-      <div className="not-prose space-y-3">{children}</div>
+      <div className="mc2-step-body">{children}</div>
     </li>
   );
 }

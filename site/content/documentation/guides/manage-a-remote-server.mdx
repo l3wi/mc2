@@ -1,104 +1,149 @@
 ---
 title: Manage a remote server
-description: Named contexts, the setup wizard, and https-only remote management.
+description: Run MC2 on a VPS behind Traefik and HTTPS, and drive it from your laptop with a context.
 ---
 
-**You will learn:** run MC2 on a VPS and manage it from your laptop with a
-named context over TLS.
+**You will learn:** run `mc2 server` on a VPS, publish its API over HTTPS
+through Traefik, and manage it from your laptop exactly as you manage a local
+server.
 
-**Prerequisites:** [Run your first stack](/documentation/guides/run-your-first-stack).
+**Prerequisites:** [Open SSH](/documentation/guides/open-ssh) (or any earlier
+guide), a Linux VPS with KVM, a DNS name for it (here `mc2.example.com`), and
+Traefik 3.x installed on the VPS.
 
-## Why contexts
-
-The CLI is a REST client — a remote server is just a URL swap. A **context**
-bundles that URL with the API key so switching servers is one command.
-`mc2 status` reports whether you're on **local** (loopback, token optional)
-or **remote** (requires https + token) mode.
-
-## Use the setup wizard
-
-`mc2 setup` is the first-run path on each machine. It never starts the server
-or Traefik.
-
-```bash
-mc2 setup                # choose a tree interactively
-mc2 setup server         # on the VPS
-mc2 setup client         # on the laptop
+```text
+ laptop                          VPS
+ ──────                          ───
+ mc2 CLI ──HTTPS──► Traefik :443 ──► 127.0.0.1:7443 mc2 server ──► microVMs
+ (context "prod")   (Let's Encrypt)   (loopback only)
 ```
 
-**On the VPS** (`mc2 setup server`): bind, data dir (`~/.mc2` by default),
-API key on/off, public hostname, cert resolver, ingress dir. It writes a
-ready-to-run default `traefik.static.yml` once (never overwrites), prints the
-runnable `mc2 server …` command, and a numbered finish-setup checklist.
-Start that command and save the one-time API token (stderr on a TTY, else
-`<data-dir>/bootstrap-token` at 0600).
+The server keeps listening on loopback. Traefik terminates TLS and forwards
+to it; MC2 writes that route itself when you pass `--public-hostname`.
 
-**On the laptop** (`mc2 setup client`): context name, control-plane URL, and
-the token. It saves and activates the context in `~/.mc2/config.toml` (0600)
-and can verify the live connection.
+<Steps>
 
-`--public-hostname` makes the server emit a synthetic control-plane route
-into the catalog (TLS via the cert resolver, backend = the REST listener).
-Point Traefik at the ingress dir the wizard chose (default `~/.mc2/ingress`)
-and it terminates TLS for `https://mc2.example.com`.
-
-<Callout type="note" title="Chicken-and-egg">
-  The client needs the route live on first setup. Get the hostname working
-  once (cert resolver + DNS), then everything below is repeatable.
-</Callout>
-
-Then:
+<Step title="Plan the server with the wizard (on the VPS)">
 
 ```bash
-mc2 status              # remote: https://mc2.example.com (context: prod)
-mc2 node ls && mc2 ps
-mc2 up -f stack.yaml
+mc2 setup server
 ```
 
-## Skip the wizard
+It asks for the bind address (keep `127.0.0.1:7443`), data dir, public
+hostname (`mc2.example.com`), certificate resolver name (`le`), the
+ingress directory (`~/.mc2/ingress`), and whether to write a Traefik static
+config (yes, with your ACME email). It then prints the `mc2 server …`
+command and a checklist. It never starts anything itself.
 
-Equivalent hand-typed commands. Defaults are data dir `~/.mc2` and bind
-`127.0.0.1:7443`; override `--data-dir` when a dedicated service user
-should own state.
+With a public hostname, authentication always stays on.
+
+</Step>
+
+<Step title="Start MC2 and Traefik (on the VPS)">
+
+Run the printed command. It will look like:
 
 ```bash
-# On the VPS
 mc2 server \
   --ingress-config-dir ~/.mc2/ingress \
   --public-hostname mc2.example.com \
   --public-tls-cert-resolver le
+```
 
-# On the laptop
+Save the API token it prints (or read it from `~/.mc2/bootstrap-token` if it
+ran without a terminal, then delete the file). Then start Traefik with the
+generated config:
+
+```bash
+traefik --configFile ~/.mc2/traefik.static.yml
+```
+
+That config listens on `:80` and `:443`, gets certificates from Let's
+Encrypt through the `le` resolver, and watches `~/.mc2/ingress/traefik`.
+
+</Step>
+
+<Step title="Open the network path">
+
+Point DNS for `mc2.example.com` at the VPS and allow inbound TCP 80 and 443.
+Let's Encrypt needs port 80 to issue the certificate. Check from anywhere:
+
+```bash
+curl https://mc2.example.com/health
+# {"service":"mc2-server","status":"ok"}
+```
+
+</Step>
+
+<Step title="Connect from your laptop">
+
+```bash
+mc2 setup client
+```
+
+Enter a context name (`prod`), the URL (`https://mc2.example.com`), and the
+token. The wizard saves the context in `~/.mc2/config.toml` (mode 0600),
+makes it current, and can test the connection. By hand, that's:
+
+```bash
 mc2 context set prod --api https://mc2.example.com --token 'mc2at_…'
 mc2 context use prod
 ```
 
-Resolution precedence: `--api`/`--token` flags > `MC2_API`/`MC2_API_KEY`
-env > `--context` > the `current` context > the loopback default.
+</Step>
 
-## Insecure HTTP is opt-in
+<Step title="Use it">
 
-Plaintext `http://` for a remote endpoint is **refused** unless you set
-`--allow-insecure-http` / `MC2_ALLOW_INSECURE_HTTP=1`. Prefer https — the
-operator token travels in the `Authorization` header.
+```bash
+mc2 status
+# mc2 0.1.0 — remote: https://mc2.example.com (context: prod)
+#   auth: bearer ✓
+mc2 up -f stack.yaml
+mc2 ps
+```
 
-## What you learned
+Every command works as it does locally. Switch back with
+`mc2 context use local` (or pass `--context local` for one command).
 
-- One token bootstrap, one context save, zero reconfiguration after.
-- The control plane can serve itself through your Traefik for TLS.
-- Remote mode enforces https + token; `mc2 status` tells you which mode.
+</Step>
+
+</Steps>
+
+<Note title="Published ports stay on the VPS">
+  `ports` bind the **server's** loopback. `curl 127.0.0.1:18091` on your
+  laptop won't reach them; use an SSH tunnel
+  (`ssh -L 18091:127.0.0.1:18091 you@vps`) or give the service an
+  [ingress](/documentation/guides/publish-with-ingress) hostname.
+</Note>
+
+## Remote means HTTPS
+
+The CLI calls any non-loopback URL **remote** and refuses plain `http://` for
+it, because the token would cross the network unencrypted. To override for a
+trusted private network, pass `--allow-insecure-http` or set
+`MC2_ALLOW_INSECURE_HTTP=1`.
+
+Authentication is separate from that: the server requires the token on
+every `/v1` request, local or remote, unless it was started with `--no-auth`
+— which is refused with `--public-hostname`.
+
+## Running it as a service
+
+For a real VPS, run `mc2 server` and Traefik under systemd rather than in a
+terminal. See [Run the server](/documentation/operations/run-the-server) for
+a unit file, supervision, and backups.
 
 ## Next
 
 <Cards cols={2}>
   <Card
     title="Tear down & clean up"
-    description="Removal semantics and hygiene."
+    description="What each removal command deletes and keeps."
     href="/documentation/guides/tear-down-and-clean-up"
   />
   <Card
     title="Identity & contexts"
-    description="The full resolution and trust model."
+    description="Tokens and how the CLI picks a server."
     href="/documentation/concepts/identity-and-contexts"
   />
 </Cards>
