@@ -46,6 +46,8 @@ pub struct ApplyConfig {
     pub allow_host_profile: bool,
     /// Host-loopback probe for `expose` ports (injectable for tests).
     pub port_probe: PortProbe,
+    /// Ports whose splice listener MC2 itself holds (see `HeldSplicePorts`).
+    pub held_splices: crate::network_serve::HeldSplicePorts,
 }
 
 /// Probes a host-loopback port for `expose`: `Ok(())` when the port is free to
@@ -590,6 +592,12 @@ async fn check_expose_ports(
             return Err(ApplyError::Allocation(format!(
                 "expose port {port} ({stack}/{service}) conflicts with {reason}{hint}"
             )));
+        }
+        // MC2's own listener (still held after the previous owner's `down`,
+        // released or reused on the next pass) is not a foreign process. The
+        // claim check above already proved no other stack owns the port.
+        if cfg.held_splices.lock().contains(port) {
+            continue;
         }
         if let Err(reason) = (cfg.port_probe)(*port) {
             return Err(ApplyError::Allocation(format!(
@@ -1138,6 +1146,23 @@ services:
         assert!(msg.contains("in use"), "{msg}");
     }
 
+    /// `down` then `up` before the next pass: the port's listener is still
+    /// MC2's own splice (claim gone, listener not yet released). It must not be
+    /// reported as a foreign process.
+    #[tokio::test]
+    async fn expose_port_held_by_our_own_splice_is_accepted() {
+        let store = MemoryStore::new();
+        store.init_cluster("").await.unwrap();
+        let splice = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = splice.local_addr().unwrap().port();
+        let cfg = cfg_default();
+        cfg.held_splices.lock().insert(port);
+
+        apply_stack_yaml(store, &cfg, &expose_yaml("web", "api", port))
+            .await
+            .expect("our own held splice is not a foreign listener");
+    }
+
     #[test]
     fn probe_detects_a_held_loopback_port() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1515,6 +1540,7 @@ fn cfg_default() -> ApplyConfig {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     }
 }
 
@@ -1533,6 +1559,7 @@ async fn refuses_apply_over_cpu_limit() {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     };
     let yaml = "name: big\nservices:\n  a:\n    image: alpine\n    cpus: 2\n";
     let err = apply_stack_yaml(store, &cfg, yaml).await.unwrap_err();
@@ -1555,6 +1582,7 @@ async fn refuses_apply_over_memory_limit() {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     };
     let yaml = "name: big\nservices:\n  a:\n    image: alpine\n    mem_limit: 1g\n";
     let err = apply_stack_yaml(store, &cfg, yaml).await.unwrap_err();
@@ -1577,6 +1605,7 @@ async fn refuses_apply_when_disk_reservation_exceeded() {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     };
     // One replica's default root disk (4 GiB) exceeds the 1 GiB budget.
     let yaml = "name: any\nservices:\n  a:\n    image: alpine\n";
@@ -1650,6 +1679,7 @@ async fn refuses_apply_when_a_volume_shrinks_below_its_usage() {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     };
     let yaml = "name: demo\nvolumes:\n  data:\n    kind: dir\n    size: 1MiB\nservices:\n  web:\n    image: alpine\n    volumes:\n      - name: data\n        target: /data\n";
     let err = apply_stack_yaml(store.clone(), &cfg, yaml)
@@ -1683,6 +1713,7 @@ async fn applies_within_limits() {
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
+        held_splices: Default::default(),
     };
     let yaml = "name: ok\nservices:\n  a:\n    image: alpine\n    cpus: 1\n    mem_limit: 512m\n";
     apply_stack_yaml(store, &cfg, yaml)

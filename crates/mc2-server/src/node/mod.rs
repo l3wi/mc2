@@ -51,6 +51,8 @@ pub struct NodeConfig {
     pub public_tls_cert_resolver: String,
     /// REST listener port (backend for the control-plane self-route).
     pub rest_port: u16,
+    /// Published set of held splice ports, read by the apply path.
+    pub held_splices: crate::network_serve::HeldSplicePorts,
 }
 
 /// Register/refresh the local node row; returns its stable node_id.
@@ -112,6 +114,9 @@ pub async fn run(
     // Propagate the process cancellation token to the listeners this loop owns
     // so shutdown stops accepting without waiting for the next pass (D2).
     rt_state.network_table.set_cancel(cancel.clone());
+    rt_state
+        .network_table
+        .share_held_ports(cfg.held_splices.clone());
     rt_state.ssh_table.set_cancel(cancel.clone());
 
     loop {
@@ -451,6 +456,7 @@ mod tests {
             public_hostname: None,
             public_tls_cert_resolver: "le".into(),
             rest_port: 0,
+            held_splices: Default::default(),
         }
     }
 

@@ -685,6 +685,7 @@ pub(crate) mod testing {
             allow_host_profile: false,
             // Hermetic: no real host-port probing in REST tests.
             port_probe: |_p| Ok(()),
+            held_splices: Default::default(),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             liveness: Arc::new(crate::Liveness::with_stale_after(
                 std::time::Duration::from_secs(30),

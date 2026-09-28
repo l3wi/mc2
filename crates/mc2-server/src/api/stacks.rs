@@ -34,6 +34,7 @@ pub async fn apply_stack(
         rest_port: state.rest_port,
         allow_host_profile: state.allow_host_profile,
         port_probe: state.port_probe,
+        held_splices: state.held_splices.clone(),
     };
     match apply_stack_yaml(state.store.clone(), &cfg, &body.yaml).await {
         Ok(r) => Ok(Json(r)),
@@ -116,6 +117,7 @@ mod tests {
             rest_port: 0,
             allow_host_profile: false,
             port_probe: crate::probe_host_loopback_port,
+            held_splices: Default::default(),
         }
     }
 

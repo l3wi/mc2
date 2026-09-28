@@ -46,6 +46,12 @@ struct ExposeBinding {
 /// Shared backend registry: exposed guest port → ready host sockets.
 type BackendRegistry = Arc<Mutex<HashMap<u16, Vec<SocketAddr>>>>;
 
+/// Exposed ports whose splice listener this process holds right now, shared
+/// with the apply path. After `mc2 down` a stack's claim is gone but its
+/// listener lives until the next pass releases it; apply must not mistake
+/// that listener for a foreign process when the port is claimed again.
+pub type HeldSplicePorts = Arc<parking_lot::Mutex<BTreeSet<u16>>>;
+
 /// Per-node network state.
 pub struct NetworkTable {
     /// instance_id → expose bindings (after sandbox create).
@@ -58,6 +64,8 @@ pub struct NetworkTable {
     splices: HashMap<u16, JoinHandle<()>>,
     /// exposed guest port → why its splice could not bind (fail-closed signal).
     failed_splices: HashMap<u16, String>,
+    /// Mirror of `splices`' keys for the apply path (see [`HeldSplicePorts`]).
+    held: HeldSplicePorts,
     /// Ready backend host sockets per exposed guest port; read per connection.
     backends: BackendRegistry,
     /// Round-robin cursor across the table.
@@ -75,6 +83,7 @@ impl NetworkTable {
             hosts_key: HashMap::new(),
             splices: HashMap::new(),
             failed_splices: HashMap::new(),
+            held: HeldSplicePorts::default(),
             backends: Arc::new(Mutex::new(HashMap::new())),
             rr_counter: Arc::new(AtomicUsize::new(0)),
             cancel: CancellationToken::new(),
@@ -87,12 +96,23 @@ impl NetworkTable {
         self.cancel = cancel;
     }
 
+    /// Publish the held-port set into `held` (shared with the apply path).
+    pub fn share_held_ports(&mut self, held: HeldSplicePorts) {
+        self.held = held;
+        self.sync_held();
+    }
+
+    fn sync_held(&self) {
+        *self.held.lock() = self.splices.keys().copied().collect();
+    }
+
     /// Abort every held splice listener. Called as the node loop exits.
     pub fn shutdown(&mut self) {
         for (port, handle) in self.splices.drain() {
             handle.abort();
             debug!(port, "network splice stopped (shutdown)");
         }
+        self.sync_held();
     }
 
     /// Reserve host ports for network exposes and merge into desired ports list.
@@ -222,6 +242,7 @@ impl NetworkTable {
                 }
             }
         }
+        self.sync_held();
     }
 
     /// Rebuild the shared backend registry from the current desired set and the

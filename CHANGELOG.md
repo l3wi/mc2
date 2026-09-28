@@ -21,9 +21,14 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   that read first could deadlock against the loop's status writes and be
   refused with `database is locked`. Internal errors now return and log their
   full cause instead of only the outermost context.
+- **`mc2 down` then an immediate `mc2 up` works.** The stack's splice
+  listener lives until the next reconcile pass; apply now recognises MC2's own
+  held listener instead of rejecting the port as "in use by another process".
+  The node loop publishes its held ports to the apply path.
 - **An empty ingress catalog is valid Traefik config.** With no ready route,
   `traefik/dynamic.yml` is a comment only; `http: {}` made Traefik reject the
-  whole file provider ("http cannot be a standalone element").
+  whole file provider ("http cannot be a standalone element"). `GET /v1/ingress`
+  and the catalog header no longer refer to the removed agent.
 
 ### Port claims and whole vCPUs (breaking, pre-release)
 

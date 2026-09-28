@@ -250,7 +250,7 @@ pub fn render_traefik_dynamic(routes: &[ReadyIngressRoute]) -> String {
 
     let doc = TraefikDynamic { http, tcp };
     let body = serde_yaml::to_string(&doc).unwrap_or_default();
-    format!("# Managed by MC2 — do not edit; agent overwrites.\n{body}")
+    format!("# Managed by MC2 — do not edit; MC2 rewrites this file.\n{body}")
 }
 
 fn traefik_rule(host: &str, path: &str, path_type: &str) -> String {

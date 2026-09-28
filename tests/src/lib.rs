@@ -120,6 +120,7 @@ impl TestCluster {
             allow_host_profile: false,
             // Hermetic: no real host-port probing in integration tests.
             port_probe: |_p| Ok(()),
+            held_splices: Default::default(),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             liveness,
         };

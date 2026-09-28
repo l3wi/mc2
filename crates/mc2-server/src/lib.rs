@@ -209,6 +209,8 @@ pub struct AppState {
     pub allow_host_profile: bool,
     /// Host-loopback probe for `expose` ports (real in production, stubbed in tests).
     pub port_probe: apply::PortProbe,
+    /// Exposed ports whose splice the node loop holds (shared with apply).
+    pub held_splices: network_serve::HeldSplicePorts,
     /// Serializes applies (and stack deletes) so `expose` port claims cannot race.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// Node-loop readiness for the unauthenticated `/health` probe (D1).
@@ -516,6 +518,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let rest_addr = rest_listener.local_addr().context("rest local_addr")?;
 
     // Embedded node configuration (single node: this process).
+    let held_splices = network_serve::HeldSplicePorts::default();
     let node_cfg = node::NodeConfig {
         name: args
             .node_name
@@ -534,6 +537,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         public_hostname: args.public_hostname.clone(),
         public_tls_cert_resolver: args.public_tls_cert_resolver.clone(),
         rest_port: rest_addr.port(),
+        held_splices: held_splices.clone(),
     };
 
     // Register the node **before** the REST listener accepts: an apply that
@@ -564,6 +568,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         rest_port: rest_addr.port(),
         allow_host_profile: args.allow_host_profile,
         port_probe: apply::probe_host_loopback_port,
+        held_splices,
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         liveness: liveness.clone(),
     };

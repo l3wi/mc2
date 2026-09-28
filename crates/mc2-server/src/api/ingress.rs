@@ -55,6 +55,6 @@ pub async fn list_ingress(State(state): State<AppState>) -> ApiResult<serde_json
     let routes: Vec<serde_json::Value> = by_id.into_values().collect();
     Ok(Json(json!({
         "routes": routes,
-        "note": "file catalog readiness is on the agent (--ingress-config-dir); see catalog.json",
+        "note": "desired routes; the server writes the ready ones to <--ingress-config-dir>/traefik/dynamic.yml (all routes in catalog.json)",
     })))
 }
