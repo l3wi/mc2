@@ -1,4 +1,5 @@
-//! Network naming and desired-state helpers (D13).
+//! Network naming and desired-state helpers for the host-mediated service
+//! network (L4 splice + network-scoped DNS).
 
 use serde::Serialize;
 

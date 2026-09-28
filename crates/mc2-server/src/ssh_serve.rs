@@ -10,8 +10,7 @@
 //! timeout**: `tmux` and agent sessions must survive long quiet periods.
 
 use crate::limits::SshLimits;
-use mc2_runtime::{DesiredSandbox, SshObserved, SshPhase};
-use microsandbox::Sandbox;
+use mc2_runtime::{DesiredSandbox, NodeRuntime, SshObserved, SshPhase};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -90,6 +89,7 @@ impl SshServeTable {
         &mut self,
         desired: &DesiredSandbox,
         sandbox_running: bool,
+        runtime: &Arc<dyn NodeRuntime>,
     ) -> SshObserved {
         let want = desired.ssh.enabled
             && sandbox_running
@@ -125,7 +125,15 @@ impl SshServeTable {
 
         let limits = self.limits;
         let listener_cancel = self.cancel.child_token();
-        match start_serve_sdk(desired, limits, Arc::clone(&self.sessions), listener_cancel).await {
+        match start_serve_sdk(
+            desired,
+            limits,
+            Arc::clone(&self.sessions),
+            listener_cancel,
+            runtime,
+        )
+        .await
+        {
             Ok(active) => {
                 let obs = SshObserved {
                     phase: SshPhase::Open.as_str().into(),
@@ -357,6 +365,7 @@ async fn start_serve_sdk(
     limits: SshLimits,
     sessions: Arc<Semaphore>,
     cancel: CancellationToken,
+    runtime: &Arc<dyn NodeRuntime>,
 ) -> anyhow::Result<ActiveServe> {
     let bind_ip: std::net::IpAddr = desired
         .ssh
@@ -373,31 +382,16 @@ async fn start_serve_sdk(
     let port = local.port();
     let bind = desired.ssh.bind.clone();
 
-    let handle = Sandbox::get(&desired.runtime_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("Sandbox::get({}): {e}", desired.runtime_id))?;
-    let sb = handle
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("Sandbox::connect({}): {e}", desired.runtime_id))?;
-
-    let keys = desired.ssh.authorized_public_keys.clone();
-    let user = desired.ssh.user.clone();
-    let sftp = desired.ssh.sftp;
-    let server = sb
-        .ssh()
-        .server_with(|opts| {
-            let mut o = opts.user(user).sftp(sftp);
-            for k in keys {
-                o = o.authorized_key(k);
-            }
-            o
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("ssh server_with: {e}"))?;
+    let server = runtime
+        .ssh_server(
+            &desired.runtime_id,
+            &desired.ssh.user,
+            &desired.ssh.authorized_public_keys,
+            desired.ssh.sftp,
+        )
+        .await?;
 
     let caps = SessionCaps::new(sessions, limits.max_sessions_per_listener);
-    let server = Arc::new(server);
     let join = tokio::spawn(ssh_accept_loop(
         listener,
         caps,
@@ -405,7 +399,7 @@ async fn start_serve_sdk(
         move |conn| {
             let server = Arc::clone(&server);
             async move {
-                if let Err(e) = server.serve(conn).await {
+                if let Err(e) = server.serve(Box::new(conn)).await {
                     debug!(error = %e, "ssh connection ended");
                 }
             }

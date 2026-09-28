@@ -82,7 +82,9 @@ pub fn conditions_for(
     let mut out = Vec::new();
     if let Some(usage) = root_disk {
         let limit = usage.limit_mib(spec.root_disk_mib());
-        if let Some(c) = DiskCondition::root_disk(usage.used_mib, limit) {
+        // The suggestion doubles the *declared* size: `limit` is the smaller
+        // guest-visible capacity (ext4 metadata).
+        if let Some(c) = DiskCondition::root_disk(usage.used_mib, limit, spec.root_disk_mib()) {
             out.push(c);
         }
     }
@@ -274,6 +276,23 @@ mod tests {
     }
 
     #[test]
+    fn root_disk_suggestion_uses_the_declared_size_not_the_capacity() {
+        // Declared 256 MiB, guest-visible capacity 180 MiB: the guest is full,
+        // and the fix doubles the declared size (512MiB) not the capacity
+        // (which would suggest 360MiB).
+        let spec = spec(256, &[]);
+        let usage = DiskUsage {
+            used_mib: 180,
+            capacity_mib: Some(180),
+        };
+        let conds = conditions_for(&spec, Some(usage), |_| 0);
+        assert_eq!(conds.len(), 1, "{conds:?}");
+        assert_eq!(conds[0].declared_mib, Some(256));
+        let text = conds[0].message_text("shop", "web", 0);
+        assert!(text.contains("size: 512MiB"), "{text}");
+    }
+
+    #[test]
     fn volume_usage_is_measured_from_the_directory() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("mc2-shop--data");
@@ -350,7 +369,7 @@ mod tests {
 
     #[test]
     fn change_logging_only_fires_on_transitions() {
-        let full = vec![DiskCondition::root_disk(4096, 4096).unwrap()];
+        let full = vec![DiskCondition::root_disk(4096, 4096, 4096).unwrap()];
         log_change("i-transition", &[]);
         log_change("i-transition", &full);
         log_change("i-transition", &full);

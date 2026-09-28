@@ -1,7 +1,7 @@
 //! Access commands: `exec`, `logs`.
 
 use crate::cli::{ExecArgs, LogsArgs};
-use crate::client::{api_error, resolve_instance_id, urlencoding_simple};
+use crate::client::{api_error, checked_body, instance_url, resolve_instance_id};
 use crate::context::Conn;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -10,14 +10,13 @@ use std::io::Write;
 /// Run a command inside the instance's sandbox; mirror output and exit with
 /// the command's exit code. Piped stdin is forwarded to the sandbox.
 pub(crate) async fn exec_cmd(args: ExecArgs, conn: &Conn) -> Result<()> {
-    let base = conn.url.trim_end_matches('/');
     let id = resolve_instance_id(conn, &args.instance).await?;
     // Surface an active disk condition before entering the VM, so the operator
     // sees why writes fail before hitting ENOSPC inside.
     if let Some(record) = crate::cmd::observe::fetch_instance(conn, &id).await {
         crate::cmd::observe::eprint_disk_conditions(&record);
     }
-    let url = format!("{base}/v1/instances/{}/exec", urlencoding_simple(&id));
+    let url = instance_url(&conn.url, &id, "/exec");
     let stdin = {
         if std::io::stdin().is_terminal() {
             None
@@ -40,11 +39,7 @@ pub(crate) async fn exec_cmd(args: ExecArgs, conn: &Conn) -> Result<()> {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("POST {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("exec", status, &body));
-    }
+    let body = checked_body("exec", res).await?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     let (stdout, stderr, code) = decode_exec_response(&v)?;
     // stdout/stderr are raw base64: guest output need not be valid UTF-8, so it
@@ -87,14 +82,13 @@ fn decode_exec_response(v: &serde_json::Value) -> Result<(Vec<u8>, Vec<u8>, i64)
 
 /// Print recent sandbox logs for an instance; `--follow` streams new entries.
 pub(crate) async fn logs_cmd(args: LogsArgs, conn: &Conn) -> Result<()> {
-    let base = conn.url.trim_end_matches('/');
     let id = resolve_instance_id(conn, &args.instance).await?;
     // Same pre-flight notice as `exec`: someone reading logs after a failed
     // write should see the cause and the fix.
     if let Some(record) = crate::cmd::observe::fetch_instance(conn, &id).await {
         crate::cmd::observe::eprint_disk_conditions(&record);
     }
-    let mut url = format!("{base}/v1/instances/{}/logs", urlencoding_simple(&id));
+    let mut url = instance_url(&conn.url, &id, "/logs");
     let mut params: Vec<String> = Vec::new();
     if let Some(tail) = args.tail {
         params.push(format!("tail={tail}"));
@@ -111,14 +105,9 @@ pub(crate) async fn logs_cmd(args: LogsArgs, conn: &Conn) -> Result<()> {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(api_error("logs", status, &body));
-    }
 
     if !args.follow {
-        let body = res.text().await.unwrap_or_default();
+        let body = checked_body("logs", res).await?;
         let v: serde_json::Value = serde_json::from_str(&body)?;
         let entries = v["entries"].as_array().cloned().unwrap_or_default();
         if entries.is_empty() {
@@ -131,7 +120,15 @@ pub(crate) async fn logs_cmd(args: LogsArgs, conn: &Conn) -> Result<()> {
         return Ok(());
     }
 
-    // Follow: consume the SSE stream (`data: <json>` frames) as it arrives.
+    // Follow: the response is an SSE stream, so the body cannot be buffered —
+    // check the status directly and read an error body only on failure.
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(api_error("logs", status, &body));
+    }
+
+    // Consume the SSE stream (`data: <json>` frames) as it arrives.
     use futures::StreamExt;
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();

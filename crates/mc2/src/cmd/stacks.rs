@@ -1,11 +1,18 @@
 //! Stack lifecycle commands: `up`, `down` (alias `rm`), `config`.
 
 use crate::cli::{ConfigArgs, DownArgs, UpArgs};
-use crate::client::{api_error, operator_get, operator_post, urlencoding_simple};
+use crate::client::{checked_body, operator_post, urlencoding_simple};
 use crate::context::Conn;
 use anyhow::{Context, Result};
 
 /// Bring up a stack: publish desired state and converge (idempotent).
+///
+/// Disk conditions are deliberately not printed after the apply: the instance
+/// rows still carry the conditions from before this apply (the node refreshes
+/// them on its next reconcile pass), so a volume resized by this very apply
+/// would show a stale "full" notice. Operators see current conditions in
+/// `mc2 ps` (NOTES column) and in the pre-flight notice printed by `mc2 exec`,
+/// `mc2 ssh open` and `mc2 logs`.
 pub(crate) async fn up_cmd(args: UpArgs, conn: &Conn) -> Result<()> {
     // Token optional when server was bootstrapped with --no-auth.
     let raw = std::fs::read_to_string(&args.file).with_context(|| format!("read {}", args.file))?;
@@ -17,56 +24,10 @@ pub(crate) async fn up_cmd(args: UpArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("up", status, &body));
-    }
+    let body = checked_body("up", res).await?;
     println!("{body}");
     print_ssh_endpoints(&body);
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-        if let Some(stack) = v["stack"].as_str() {
-            print_disk_conditions(conn, stack).await;
-        }
-    }
     Ok(())
-}
-
-/// After `mc2 up`, print the full disk-condition text for that stack's
-/// instances (nothing when they are healthy).
-async fn print_disk_conditions(conn: &Conn, stack: &str) {
-    let url = format!("{}/v1/instances", conn.url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let Ok(res) = operator_get(&client, &url, conn.token.as_deref())
-        .send()
-        .await
-    else {
-        return;
-    };
-    if !res.status().is_success() {
-        return;
-    }
-    let Ok(body) = res.text().await else {
-        return;
-    };
-    let Ok(instances) = serde_json::from_str::<Vec<mc2_store::InstanceRecord>>(&body) else {
-        return;
-    };
-    let mut header = false;
-    for i in instances.iter().filter(|i| i.stack == stack) {
-        let Some(message) = i.message.as_deref() else {
-            continue;
-        };
-        let text = mc2_api::disk::full_text_from_message(message, &i.stack, &i.service, i.ordinal);
-        if text.is_empty() {
-            continue;
-        }
-        if !header {
-            println!("disk:");
-            header = true;
-        }
-        println!("{text}");
-    }
 }
 
 /// After `mc2 up`, print the declared SSH front ends and their ingress
@@ -124,17 +85,13 @@ pub(crate) async fn down_cmd(args: DownArgs, conn: &Conn) -> Result<()> {
         req = req.bearer_auth(t);
     }
     let res = req.send().await.with_context(|| format!("DELETE {url}"))?;
-    let status = res.status();
-    if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
-        if args.volumes {
-            println!("stack '{}' down (volumes deleted)", args.stack);
-        } else {
-            println!("stack '{}' down", args.stack);
-        }
-        return Ok(());
+    checked_body("down", res).await?;
+    if args.volumes {
+        println!("stack '{}' down (volumes deleted)", args.stack);
+    } else {
+        println!("stack '{}' down", args.stack);
     }
-    let body = res.text().await.unwrap_or_default();
-    Err(api_error("down", status, &body))
+    Ok(())
 }
 
 /// Validate and print the normalized stack config (what `mc2 up` would send).

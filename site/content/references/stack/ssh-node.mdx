@@ -15,8 +15,8 @@ or the long map form:
 | Key | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Turns on the host-side microsandbox SSH server. |
-| `bind` | `127.0.0.1` | Agent listener address. |
-| `port` | `0` | Agent backend port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
+| `bind` | `127.0.0.1` | Host-side SSH listener address (loopback). |
+| `port` | `0` | Host-side SSH listener port; `0` = auto-allocate. Ingress TCP routes need a fixed port. |
 | `user` | `root` | SSH username presented to the SDK. |
 | `sftp` | `true` | Enable SFTP on the session. |
 | `authorizedKeys` | `[]` | Names from the key registry (`mc2 ssh add-key`). Empty → **all registered keys** authenticate. |

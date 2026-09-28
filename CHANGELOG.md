@@ -4,6 +4,27 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### CLI, docs and boundary cleanup (Wave 6)
+
+- **SSH refs.** `mc2 ssh open|show|close` accept `stack/service/ordinal`;
+  `mc2 ssh ls` shows a copyable `REF` and the full instance id.
+- **CLI robustness.** Path segments are percent-encoded from UTF-8;
+  `127.0.0.0/8`, `::1` and `localhost` count as loopback; every request path
+  checks the HTTP status and shows the server's error (a 401 reads
+  `unauthorized: missing or invalid bearer token`). `mc2 up` no longer prints
+  possibly-stale disk conditions (see `mc2 ps` NOTES).
+- **Setup wizard** ends with `mc2 up -f <stack.yaml>` and renders the chosen
+  Traefik resolver name (validated) instead of a hard-coded `le`.
+- **Runtime boundary.** The server no longer depends on the microsandbox SDK
+  directly: logs, guest `/etc/hosts` injection and SSH go through
+  `NodeRuntime`.
+- **Disk-full hint** suggests twice the *declared* root-disk size.
+- **Docs.** Contexts file reference matches the real format; quickstart and
+  README work after a binary-only install; `up --help` no longer mentions
+  `apiVersion`/`kind`; stale agent/gRPC and default-deny wording removed;
+  superseded design decisions marked. Tautological tests removed; the
+  no-token smoke test now asserts against a real listener.
+
 ### Runtime correctness (Wave 5)
 
 - **Ingress follows the live replica.** One selector picks a Running

@@ -302,13 +302,13 @@ pub trait Store: Send + Sync {
         rec: &InstanceSshRecord,
     ) -> Result<InstanceSshRecord, StoreError>;
 
-    /// Clear API override (desired falls back to YAML). Observed phase may be closed by agent.
+    /// Clear API override (desired falls back to YAML). Observed phase may be closed by the runtime.
     async fn clear_instance_ssh_override(
         &self,
         instance_id: &str,
     ) -> Result<Option<InstanceSshRecord>, StoreError>;
 
-    /// Agent ReportStatus: update observed bind/port/phase.
+    /// Reconcile report: update observed bind/port/phase.
     async fn update_instance_ssh_observed(
         &self,
         instance_id: &str,
@@ -320,7 +320,7 @@ pub trait Store: Send + Sync {
 
     async fn list_instance_ssh(&self) -> Result<Vec<InstanceSshRecord>, StoreError>;
 
-    /// Agent ReportStatus: network observed snapshot (JSON).
+    /// Reconcile report: network observed snapshot (JSON).
     async fn update_instance_network_observed(
         &self,
         instance_id: &str,

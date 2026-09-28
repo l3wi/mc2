@@ -102,8 +102,9 @@ services:
     image: alpine:3.20
 ```
 
-`mc2 up` fills the missing `name` from the file name, defaults `scale` to 1,
-and boots one detached microVM. Without an explicit `command`, the default is
+`mc2 up` fills the missing `name` from the file stem (or the parent directory
+when the stem is the generic `stack`), defaults `scale` to 1, and boots one
+detached microVM. Without an explicit `command`, the default is
 `sleep infinity` — a shell-less image stays alive so you can inspect and exec
 into it:
 

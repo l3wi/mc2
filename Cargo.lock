@@ -3017,6 +3017,7 @@ dependencies = [
  "mc2-metrics",
  "mc2-server",
  "mc2-store",
+ "percent-encoding",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3055,6 +3056,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "mc2-api",
  "microsandbox",
  "microsandbox-network",
@@ -3085,7 +3087,6 @@ dependencies = [
  "mc2-metrics",
  "mc2-runtime",
  "mc2-store",
- "microsandbox",
  "nix 0.31.3",
  "num_cpus",
  "rand 0.8.7",

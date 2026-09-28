@@ -1,7 +1,7 @@
 //! Observe commands: `ps`, `status`, `node ls`, `network`, `ingress`.
 
 use crate::cli::{IngressArgs, ListArgs, NetworkArgs, OutputFormat, PsArgs, StatusArgs};
-use crate::client::{api_error, operator_get, resolve_instance_id, urlencoding_simple};
+use crate::client::{checked_body, instance_url, operator_get, resolve_instance_id};
 use crate::context::Conn;
 use anyhow::{bail, Context, Result};
 
@@ -12,11 +12,7 @@ pub(crate) async fn ps_cmd(args: PsArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("ps", status, &body));
-    }
+    let body = checked_body("ps", res).await?;
     let mut instances: Vec<mc2_store::InstanceRecord> =
         serde_json::from_str(&body).with_context(|| format!("parse: {body}"))?;
     if let Some(ref stack) = args.stack {
@@ -101,11 +97,7 @@ pub(crate) async fn node_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("node ls", status, &body));
-    }
+    let body = checked_body("node ls", res).await?;
     if matches!(args.output, OutputFormat::Json) {
         println!("{body}");
         return Ok(());
@@ -160,11 +152,7 @@ pub(crate) async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {base}/v1/status"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("status", status, &body));
-    }
+    let body = checked_body("status", res).await?;
 
     if matches!(args.output, OutputFormat::Json) {
         let mut v: serde_json::Value = serde_json::from_str(&body)?;
@@ -315,11 +303,7 @@ pub(crate) async fn network_cmd(args: NetworkArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("network", status, &body));
-    }
+    let body = checked_body("network", res).await?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     let all = v["networks"].as_array().cloned().unwrap_or_default();
     let claims = v["exposedPorts"].as_array().cloned().unwrap_or_default();
@@ -360,11 +344,7 @@ pub(crate) async fn network_summary_cmd(args: NetworkArgs, conn: &Conn) -> Resul
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("network", status, &body));
-    }
+    let body = checked_body("network", res).await?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     let all = v["networks"].as_array().cloned().unwrap_or_default();
     if matches!(args.output, OutputFormat::Json) {
@@ -383,21 +363,13 @@ pub(crate) async fn network_instance_cmd(
     target: &str,
 ) -> Result<()> {
     let id = resolve_instance_id(conn, target).await?;
-    let url = format!(
-        "{}/v1/instances/{}/network",
-        conn.url.trim_end_matches('/'),
-        urlencoding_simple(&id)
-    );
+    let url = instance_url(&conn.url, &id, "/network");
     let client = reqwest::Client::new();
     let res = operator_get(&client, &url, conn.token.as_deref())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("network", status, &body));
-    }
+    let body = checked_body("network", res).await?;
     if matches!(args.output, OutputFormat::Json) {
         println!("{body}");
         return Ok(());
@@ -571,11 +543,7 @@ pub(crate) async fn ingress_cmd(args: IngressArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("ingress", status, &body));
-    }
+    let body = checked_body("ingress", res).await?;
     if matches!(args.output, OutputFormat::Json) {
         println!("{body}");
         return Ok(());
@@ -630,7 +598,7 @@ mod tests {
         assert_eq!(disk_notes(None), "", "no message → blank column");
         assert_eq!(disk_notes(Some("starting")), "", "no condition → blank");
         let conds = vec![
-            mc2_api::disk::DiskCondition::root_disk(4096, 4096).unwrap(),
+            mc2_api::disk::DiskCondition::root_disk(4096, 4096, 4096).unwrap(),
             mc2_api::disk::DiskCondition::volume("data", "/data", 9216, 10240).unwrap(),
         ];
         let message = format!(

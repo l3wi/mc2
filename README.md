@@ -140,7 +140,19 @@ config — it never starts the server or Traefik.
 
 ```bash
 mc2 node ls
-mc2 up -f examples/01-hello-service/stack.yaml
+
+# There is no examples/ checkout after a binary-only install, so write the
+# same minimal stack the example ships with (the name defaults to `hello`):
+cat > hello.yaml <<'YAML'
+services:
+  web:
+    image: python:3.12-alpine
+    ports:
+      - "18091:8000"
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo 'hello world' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
+YAML
+
+mc2 up -f hello.yaml
 mc2 ps
 # after hello is Running:
 curl -s http://127.0.0.1:18091/
@@ -161,7 +173,7 @@ mc2 server --no-auth
 
 # Terminal 2 — operator
 mc2 node ls
-mc2 up -f examples/01-hello-service/stack.yaml
+mc2 up -f hello.yaml   # the stack written above; examples/01-hello-service/stack.yaml in a checkout
 mc2 ps
 curl -s http://127.0.0.1:7443/v1/status
 ```

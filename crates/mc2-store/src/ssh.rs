@@ -57,7 +57,7 @@ impl Default for InstanceSshRecord {
     }
 }
 
-/// Agent-reported network observed snapshot for one instance.
+/// Reconcile-reported network observed snapshot for one instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceNetworkRecord {

@@ -99,7 +99,19 @@ Then bring up your first stack:
 
 ```bash
 mc2 node ls
-mc2 up -f examples/01-hello-service/stack.yaml
+
+# There is no examples/ checkout after a binary-only install, so write the
+# same minimal stack the example ships with (the name defaults to `hello`):
+cat > hello.yaml <<'YAML'
+services:
+  web:
+    image: python:3.12-alpine
+    ports:
+      - "18091:8000"
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/www && echo 'hello world' > /tmp/www/index.html && cd /tmp/www && exec python -m http.server 8000"]
+YAML
+
+mc2 up -f hello.yaml
 mc2 ps
 curl -s http://127.0.0.1:7443/v1/status | jq .
 ```
@@ -122,7 +134,7 @@ curl -s http://127.0.0.1:18091/
 
   # Terminal 2
   mc2 node ls
-  mc2 up -f examples/01-hello-service/stack.yaml
+  mc2 up -f hello.yaml   # the stack written above
   ```
 </Callout>
 
@@ -131,7 +143,7 @@ curl -s http://127.0.0.1:18091/
 Behind that `mc2 up` call:
 
 1. **Published desired state.** The stack YAML was validated (unknown keys are
-   rejected, not ignored), the missing `name` was filled from the file name,
+   rejected, not ignored), the missing `name` was filled from the file stem,
    and the normalized document was persisted in SQLite.
 2. **Scheduled instances.** The service's `scale: 1` became one instance,
    assigned to the local node, and its declared host port was bound.

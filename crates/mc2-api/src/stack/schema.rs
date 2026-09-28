@@ -42,7 +42,8 @@ pub struct StackDocument {
     pub services: BTreeMap<String, ServiceSpec>,
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeSpec>,
-    /// Logical network membership only (not a free mesh). See D13.
+    /// Named networks (server-wide). Joining one grants default-allow
+    /// reachability to peers on it.
     #[serde(default)]
     pub networks: BTreeMap<String, StackNetworkSpec>,
     /// North–south HTTP(S) routes (file catalog → Traefik). D7.
@@ -50,7 +51,7 @@ pub struct StackDocument {
     pub ingress: Option<IngressSpec>,
 }
 
-/// Stack-level Ingress (BYO Traefik via agent file export).
+/// Stack-level Ingress (BYO Traefik; the server writes the file catalog).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IngressSpec {
@@ -115,7 +116,7 @@ fn default_path_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StackNetworkSpec {
-    /// Only `mediated` is valid (D13).
+    /// Only `mediated` (host-mediated L4 splice) is valid.
     #[serde(default = "default_network_mode")]
     pub mode: String,
 }
@@ -184,7 +185,8 @@ pub struct ServiceSpec {
     /// recreates the VM; files outside volumes are not kept.
     #[serde(default, rename = "storage_opt")]
     pub storage_opt: Option<StorageOptSpec>,
-    /// Cluster-internal listeners (loopback publish; not LAN). D13 network.
+    /// Cluster-internal listeners on the service network (loopback publish;
+    /// not LAN).
     #[serde(default, deserialize_with = "de_expose")]
     pub expose: Vec<ExposeSpec>,
     /// Server-wide network membership (default-allow). Absent → the stack's
@@ -215,7 +217,7 @@ pub struct SshSpec {
     pub enabled: bool,
     #[serde(default = "default_ssh_bind")]
     pub bind: String,
-    /// Host port on the agent; `0` = auto-allocate.
+    /// Host port on the server host; `0` = auto-allocate.
     #[serde(default)]
     pub port: u16,
     #[serde(default = "default_ssh_user")]

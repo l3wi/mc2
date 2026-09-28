@@ -34,8 +34,11 @@ pub use spec_hash::desired_recreate_hash;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Execution backend on a node (microsandbox SDK only).
 #[async_trait]
@@ -87,6 +90,83 @@ pub trait NodeRuntime: Send + Sync {
     async fn root_disk_usage(&self) -> Result<HashMap<String, DiskUsage>> {
         Ok(HashMap::new())
     }
+
+    /// Run a shell `script` inside the guest and return its stdout.
+    ///
+    /// Used for host-file injection (the service-network `/etc/hosts` lines):
+    /// the script runs through the guest shell, and a backend failure is an
+    /// `Err`. Kept deliberately narrow so `mc2-server` never names an SDK type
+    /// to reach into a guest.
+    async fn guest_shell(&self, runtime_id: &str, script: &str) -> Result<String>;
+
+    /// Read recent captured log lines for a sandbox (snapshot, chronological).
+    ///
+    /// `tail` keeps only the last N lines. Errors (e.g. no sandbox) are
+    /// returned, matching the previous direct-SDK behaviour.
+    async fn read_logs(&self, runtime_id: &str, tail: Option<usize>) -> Result<Vec<LogLine>>;
+
+    /// Stream captured log lines for a sandbox, resuming after `from` (an
+    /// opaque cursor taken from a previous [`LogLine::cursor`]) when given.
+    ///
+    /// Items are `Result`s so a mid-stream backend failure ends the stream
+    /// without discarding lines already delivered. The stream follows: it stays
+    /// open past the current end and yields new lines as they are produced.
+    async fn log_stream(
+        &self,
+        runtime_id: &str,
+        from: Option<String>,
+    ) -> Result<BoxStream<'static, Result<LogLine>>>;
+
+    /// Open an in-process SSH server for `runtime_id`, authorizing
+    /// `authorized_public_keys` for `user`, with SFTP enabled when `sftp`.
+    ///
+    /// MC2 owns the host listener and its admission control; the backend only
+    /// produces the endpoint that serves one accepted connection.
+    async fn ssh_server(
+        &self,
+        runtime_id: &str,
+        user: &str,
+        authorized_public_keys: &[String],
+        sftp: bool,
+    ) -> Result<Arc<dyn SshServer>>;
+}
+
+/// A captured guest log line, mapped from the backend's log entry.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    /// Capture time, RFC 3339 (the wire format the logs endpoint emits).
+    pub timestamp: String,
+    /// Lowercase source tag: `stdout` | `stderr` | `output` | `system`.
+    pub source: String,
+    /// Raw line bytes (may not be valid UTF-8; the wire form is lossy).
+    pub data: Vec<u8>,
+    /// Opaque per-source resume handle, passed back to
+    /// [`NodeRuntime::log_stream`] as `from`.
+    pub cursor: String,
+}
+
+/// Ordered duplex stream bound: the byte-stream shape an SSH session needs.
+///
+/// A helper trait because a trait object may name only one non-auto trait;
+/// `dyn DuplexStreamIo` still implements `AsyncRead`/`AsyncWrite`/`Unpin`/`Send`
+/// through these supertraits.
+pub trait DuplexStreamIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStreamIo for T {}
+
+/// A boxed duplex byte stream (one accepted host socket) for
+/// [`SshServer::serve`]. Boxing keeps the concrete socket type — and every SDK
+/// stream type — out of the server crate.
+pub type DuplexStream = Box<dyn DuplexStreamIo>;
+
+/// An in-process SSH endpoint for one sandbox.
+///
+/// Produced by [`NodeRuntime::ssh_server`]; MC2 hands it each accepted TCP
+/// connection. Object-safe so it can be shared as `Arc<dyn SshServer>` across
+/// the accept loop.
+#[async_trait]
+pub trait SshServer: Send + Sync {
+    /// Serve one SSH connection over the ordered duplex `stream`.
+    async fn serve(&self, stream: DuplexStream) -> Result<()>;
 }
 
 /// Captured guest command output.

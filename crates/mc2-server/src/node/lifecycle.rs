@@ -66,7 +66,7 @@ impl NodeRuntimeState {
         // Backoff gate before ensure_running when we recently recreated.
         if let Some(next) = state.next_restart_ok {
             if now < next {
-                let ssh = self.ssh_table.reconcile(d, false).await;
+                let ssh = self.ssh_table.reconcile(d, false, runtime).await;
                 let network = self.network_table.reconcile_not_running(d).await;
                 let report = InstanceReport {
                     instance_id: d.instance_id.clone(),
@@ -105,7 +105,7 @@ impl NodeRuntimeState {
                  the egress rule is create-time, so fix the port conflict and re-apply"
             );
             warn!(instance_id = %d.instance_id, %msg, "network fail-closed");
-            let ssh = self.ssh_table.reconcile(d, false).await;
+            let ssh = self.ssh_table.reconcile(d, false, runtime).await;
             let network = self.network_table.reconcile_not_running(d).await;
             let report = InstanceReport {
                 instance_id: d.instance_id.clone(),
@@ -127,7 +127,7 @@ impl NodeRuntimeState {
 
         if let Err(e) = self.network_table.prepare_exposes(d).await {
             warn!(instance_id = %d.instance_id, error = %e, "network prepare_exposes failed");
-            let ssh = self.ssh_table.reconcile(d, false).await;
+            let ssh = self.ssh_table.reconcile(d, false, runtime).await;
             let network = self.network_table.reconcile_not_running(d).await;
             let report = InstanceReport {
                 instance_id: d.instance_id.clone(),
@@ -193,7 +193,7 @@ impl NodeRuntimeState {
                     error = %e,
                     "remove before recreate failed; keeping the old applied hash"
                 );
-                let ssh = self.ssh_table.reconcile(d, false).await;
+                let ssh = self.ssh_table.reconcile(d, false, runtime).await;
                 let network = self.network_table.reconcile_not_running(d).await;
                 let report = InstanceReport {
                     instance_id: d.instance_id.clone(),
@@ -323,9 +323,9 @@ impl NodeRuntimeState {
                     }
                 };
                 let running = st.phase == SandboxPhase::Running;
-                let ssh = self.ssh_table.reconcile(d, running).await;
+                let ssh = self.ssh_table.reconcile(d, running, runtime).await;
                 let network = if running {
-                    self.network_table.reconcile_running(d).await
+                    self.network_table.reconcile_running(d, runtime).await
                 } else {
                     self.network_table.reconcile_not_running(d).await
                 };
@@ -376,7 +376,7 @@ impl NodeRuntimeState {
                     );
                     state.running_since = None;
                 }
-                let ssh = self.ssh_table.reconcile(d, false).await;
+                let ssh = self.ssh_table.reconcile(d, false, runtime).await;
                 let network = self.network_table.reconcile_not_running(d).await;
                 let report = InstanceReport {
                     instance_id: d.instance_id.clone(),

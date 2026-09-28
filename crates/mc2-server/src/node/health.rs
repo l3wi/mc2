@@ -311,6 +311,33 @@ mod tests {
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
             anyhow::bail!("unused")
         }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
+            anyhow::bail!("unused")
+        }
     }
 
     /// `exec_command` fails immediately with a non-zero exit code.
@@ -342,6 +369,33 @@ mod tests {
             _argv: &[String],
             _stdin: &[u8],
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            anyhow::bail!("unused")
+        }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
             anyhow::bail!("unused")
         }
     }
@@ -378,6 +432,33 @@ mod tests {
             _argv: &[String],
             _stdin: &[u8],
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            anyhow::bail!("unused")
+        }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
             anyhow::bail!("unused")
         }
     }

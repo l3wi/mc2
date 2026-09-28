@@ -1,17 +1,18 @@
 //! Microsandbox backend using the official Rust SDK (`Sandbox::builder` / embed).
 //!
 //! Always uses the **local** backend. Host `MSB_API_KEY` / cloud profiles must not
-//! hijack MC2 agent sandboxes.
+//! hijack MC2 sandboxes.
 
 use crate::networks::network_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
 use crate::{
-    DesiredSandbox, DiskUsage, EnsureOutcome, EnsureRunning, ExecResult, NodeRuntime, SandboxPhase,
-    SandboxStatus,
+    DesiredSandbox, DiskUsage, DuplexStream, EnsureOutcome, EnsureRunning, ExecResult, LogLine,
+    NodeRuntime, SandboxPhase, SandboxStatus, SshServer,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
 use microsandbox::{set_default_backend, LocalBackend, NetworkPolicy, NetworkProfile, Sandbox};
 use microsandbox_network::policy::{
@@ -21,9 +22,10 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-/// Ensure process-wide default is LocalBackend once per agent process.
+/// Ensure process-wide default is LocalBackend once per server process.
 static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Real microVM backend via the **microsandbox** crate (local libkrun only).
@@ -115,7 +117,7 @@ fn network_profiles(desired: &DesiredSandbox) -> Vec<NetworkProfile> {
 }
 
 /// Build msb network policy: base profiles + **narrow** Host TCP ports for network
-/// allows. Does **not** add `NetworkProfile::Host` or `Private` for network (D13/Q2).
+/// reachability. Does **not** add `NetworkProfile::Host` or `Private` for network.
 fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
     let profiles = network_profiles(desired);
     let mut policy = NetworkPolicy::from_profiles(profiles);
@@ -539,6 +541,120 @@ impl NodeRuntime for MicrosandboxRuntime {
                 ))
             })
             .collect())
+    }
+
+    /// Run a shell script in the guest and return stdout.
+    ///
+    /// Both `/etc/hosts` injection steps (read the DNS gateway, rewrite the
+    /// file) go through this; the caller owns the script text.
+    async fn guest_shell(&self, runtime_id: &str, script: &str) -> Result<String> {
+        ensure_local_backend().await?;
+        let handle = Sandbox::get(runtime_id)
+            .await
+            .with_context(|| format!("Sandbox::get({runtime_id}) for shell"))?;
+        let sb = handle
+            .connect()
+            .await
+            .with_context(|| format!("SandboxHandle::connect({runtime_id}) for shell"))?;
+        let out = sb
+            .shell(script)
+            .await
+            .with_context(|| format!("Sandbox::shell({runtime_id})"))?;
+        Ok(out.stdout()?)
+    }
+
+    async fn read_logs(&self, runtime_id: &str, tail: Option<usize>) -> Result<Vec<LogLine>> {
+        ensure_local_backend().await?;
+        let opts = microsandbox::logs::LogOptions {
+            tail,
+            ..Default::default()
+        };
+        let entries = microsandbox::logs::read_logs(runtime_id, &opts)
+            .await
+            .with_context(|| format!("logs::read_logs({runtime_id})"))?;
+        Ok(entries.into_iter().map(map_log_entry).collect())
+    }
+
+    async fn log_stream(
+        &self,
+        runtime_id: &str,
+        from: Option<String>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<LogLine>>> {
+        ensure_local_backend().await?;
+        let start = match from {
+            Some(cursor) => microsandbox::logs::LogStreamStart::From(
+                cursor.parse().context("parse log cursor")?,
+            ),
+            None => microsandbox::logs::LogStreamStart::Beginning,
+        };
+        let opts = microsandbox::logs::LogStreamOptions {
+            start,
+            follow: true,
+            ..Default::default()
+        };
+        let stream = microsandbox::logs::log_stream(runtime_id, &opts)
+            .await
+            .with_context(|| format!("logs::log_stream({runtime_id})"))?;
+        Ok(stream
+            .map(|r| r.map(map_log_entry).map_err(anyhow::Error::from))
+            .boxed())
+    }
+
+    async fn ssh_server(
+        &self,
+        runtime_id: &str,
+        user: &str,
+        authorized_public_keys: &[String],
+        sftp: bool,
+    ) -> Result<Arc<dyn SshServer>> {
+        ensure_local_backend().await?;
+        let handle = Sandbox::get(runtime_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Sandbox::get({runtime_id}): {e}"))?;
+        let sb = handle
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Sandbox::connect({runtime_id}): {e}"))?;
+
+        let keys = authorized_public_keys.to_vec();
+        let user = user.to_string();
+        let server = sb
+            .ssh()
+            .server_with(|opts| {
+                let mut o = opts.user(user).sftp(sftp);
+                for k in keys {
+                    o = o.authorized_key(k);
+                }
+                o
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("ssh server_with: {e}"))?;
+        Ok(Arc::new(MsbSshServer { server }))
+    }
+}
+
+/// Map an SDK log entry onto the MC2-owned [`LogLine`] wire shape.
+fn map_log_entry(e: microsandbox::logs::LogEntry) -> LogLine {
+    LogLine {
+        timestamp: e.timestamp.to_rfc3339(),
+        source: format!("{:?}", e.source).to_ascii_lowercase(),
+        data: e.data.to_vec(),
+        cursor: e.cursor.to_string(),
+    }
+}
+
+/// Adapter: the SDK's reusable SSH endpoint behind MC2's [`SshServer`].
+struct MsbSshServer {
+    server: microsandbox::SshServer,
+}
+
+#[async_trait]
+impl SshServer for MsbSshServer {
+    async fn serve(&self, stream: DuplexStream) -> Result<()> {
+        self.server
+            .serve(stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("ssh server: {e}"))
     }
 }
 

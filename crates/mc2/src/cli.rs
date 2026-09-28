@@ -192,12 +192,13 @@ pub struct SshKeyRmArgs {
 
 #[derive(Debug, Parser)]
 pub struct SshInstanceArgs {
-    /// Instance id
+    /// Instance id, or `stack/service/ordinal` (e.g. `demo/web/0`)
     pub id: String,
 }
 
 #[derive(Debug, Parser)]
 pub struct SshOpenArgs {
+    /// Instance id, or `stack/service/ordinal` (e.g. `demo/web/0`)
     pub id: String,
     /// Authorized key names (repeatable)
     #[arg(long = "key", required = true)]
@@ -248,8 +249,16 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Parser)]
 pub struct UpArgs {
-    /// Path to stack YAML. Boilerplate is optional: apiVersion, kind, and
-    /// metadata.name (defaults to the file name) are filled in when missing.
+    /// Path to the stack YAML file: a bare compose document with top-level
+    /// `name:`, `services:`, and optional `volumes:` / `networks:` /
+    /// `ingress:`.
+    ///
+    /// Kubernetes-style boilerplate (`apiVersion`, `kind`, `metadata`) is
+    /// **not** accepted — like any other unknown top-level key it is rejected
+    /// at parse. A missing `name:` is filled from the file stem — or, when the
+    /// stem is the generic `stack` (e.g. `.../01-hello-service/stack.yaml`),
+    /// from the parent directory name — sanitized to the lowercase stack-name
+    /// grammar.
     #[arg(short = 'f', long = "file")]
     pub file: String,
 }

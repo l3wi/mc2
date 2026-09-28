@@ -1,7 +1,7 @@
 //! Volume commands: `mc2 volume ls`.
 
 use crate::cli::{ListArgs, OutputFormat};
-use crate::client::{api_error, operator_get};
+use crate::client::{checked_body, operator_get};
 use crate::context::Conn;
 use anyhow::{Context, Result};
 
@@ -12,11 +12,7 @@ pub(crate) async fn volume_ls(args: ListArgs, conn: &Conn) -> Result<()> {
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(api_error("volume ls", status, &body));
-    }
+    let body = checked_body("volume ls", res).await?;
     if matches!(args.output, OutputFormat::Json) {
         println!("{body}");
         return Ok(());

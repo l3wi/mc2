@@ -741,6 +741,33 @@ mod tests {
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
             anyhow::bail!("unused")
         }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
+            anyhow::bail!("unused")
+        }
     }
 
     async fn store_with_node() -> (Arc<MemoryStore>, String) {
@@ -1583,6 +1610,33 @@ mod tests {
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
             anyhow::bail!("unused")
         }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
+            anyhow::bail!("unused")
+        }
     }
 
     /// The node's `DesiredSandbox` for `service`, built the way the loop does.
@@ -1995,6 +2049,33 @@ mod tests {
             _stdin: &[u8],
         ) -> anyhow::Result<mc2_runtime::ExecResult> {
             std::future::pending().await
+        }
+        async fn guest_shell(&self, _id: &str, _script: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<std::sync::Arc<dyn mc2_runtime::SshServer>> {
+            anyhow::bail!("unused")
         }
     }
 

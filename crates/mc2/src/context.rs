@@ -149,18 +149,43 @@ pub fn is_loopback_url(url: &str) -> bool {
         .and_then(|u| u.host_str().map(str::to_string));
     match host.as_deref() {
         Some(h) => is_loopback_host(h),
-        None => {
-            let s = url.to_ascii_lowercase();
-            s.starts_with("http://127.0.0.1")
-                || s.starts_with("http://localhost")
-                || s.starts_with("http://[::1]")
-        }
+        // `url` rejected the input; best-effort authority extraction so the
+        // loopback check still sees the host (`scheme://[user@]host[:port]`).
+        None => is_loopback_host(fallback_host(url)),
     }
 }
 
-/// True for loopback host literals (`127.0.0.1` / `localhost` / `::1`).
+/// Host part of a URL `url::Url` could not parse: strips the scheme, path,
+/// query, userinfo and (non-bracketed) port.
+fn fallback_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host_port.starts_with('[') {
+        // Bracketed IPv6: keep `[addr]`, drop any `:port` suffix.
+        match host_port.find(']') {
+            Some(end) => &host_port[..=end],
+            None => host_port,
+        }
+    } else {
+        host_port.rsplit_once(':').map_or(host_port, |(h, _)| h)
+    }
+}
+
+/// True for loopback host literals: any address in `127.0.0.0/8`, `::1`, and
+/// the `localhost` name (with or without a trailing dot).
+///
+/// Addresses are parsed and checked with [`std::net::IpAddr::is_loopback`], so
+/// the whole IPv4 loopback /8 counts — not just the literal `127.0.0.1`. IPv6
+/// literals arrive bracketed from `url::Url::host_str` (`[::1]`).
 pub fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") || h.eq_ignore_ascii_case("localhost.") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Mode for a URL: loopback host → local; anything else → remote.
@@ -293,6 +318,36 @@ mod tests {
         assert!(is_loopback_url("http://[::1]:7443"));
         assert_eq!(mode_of("http://127.0.0.1:7443"), ClientMode::Local);
         assert_eq!(mode_of("https://mc2.example.com"), ClientMode::Remote);
+    }
+
+    #[test]
+    fn loopback_host_covers_the_whole_ipv4_loopback_block_and_ipv6() {
+        // Any 127.0.0.0/8 address is loopback, not just the literal 127.0.0.1.
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("127.255.255.254"));
+        assert!(is_loopback_host("::1"));
+        // url::Url::host_str returns IPv6 literals bracketed.
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("localhost."));
+        // Everything else is remote.
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("::2"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host("not-an-ip"));
+    }
+
+    #[test]
+    fn loopback_url_uses_host_parsing_not_string_prefixes() {
+        assert!(is_loopback_url("http://127.0.0.2:7443"));
+        assert!(is_loopback_url("https://[::1]:7443"));
+        assert!(is_loopback_url("http://LOCALHOST:7443"));
+        assert!(!is_loopback_url("http://10.0.0.1:7443"));
+        // Not a URL `url::Url` accepts; the fallback still finds the host.
+        assert!(is_loopback_url("127.0.0.2:7443"));
+        assert!(!is_loopback_url("10.0.0.1:7443"));
     }
 
     #[test]

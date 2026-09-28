@@ -77,6 +77,15 @@ pub struct DiskCondition {
     pub target: DiskTarget,
     pub used_mib: u64,
     pub limit_mib: u64,
+    /// Size the operator declared in stack.yaml (`storage_opt.size` /
+    /// `volumes.<name>.size`).
+    ///
+    /// A root disk's `limit_mib` is the guest-visible capacity, which is
+    /// smaller than the declared size (ext4 metadata), so the suggested fix
+    /// must double the *declared* size instead. `None` (older markers, or a
+    /// condition where declared == limit) falls back to doubling `limit_mib`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_mib: Option<u64>,
     pub severity: DiskSeverity,
 }
 
@@ -108,11 +117,15 @@ pub fn classify(used_mib: u64, limit_mib: u64) -> Option<DiskSeverity> {
 
 impl DiskCondition {
     /// Root-disk condition, or `None` when the usage is below the warning band.
-    pub fn root_disk(used_mib: u64, limit_mib: u64) -> Option<Self> {
+    ///
+    /// `limit_mib` is the guest-visible capacity; `declared_mib` is the size
+    /// from stack.yaml, which the fix suggestion doubles.
+    pub fn root_disk(used_mib: u64, limit_mib: u64, declared_mib: u64) -> Option<Self> {
         Some(Self {
             target: DiskTarget::RootDisk,
             used_mib,
             limit_mib,
+            declared_mib: Some(declared_mib),
             severity: classify(used_mib, limit_mib)?,
         })
     }
@@ -126,6 +139,8 @@ impl DiskCondition {
             },
             used_mib,
             limit_mib,
+            // A volume's quota is exactly the declared size.
+            declared_mib: None,
             severity: classify(used_mib, limit_mib)?,
         })
     }
@@ -157,13 +172,30 @@ impl DiskCondition {
         }
     }
 
+    /// Size to suggest in the fix: 2× the declared size, rounded up to a whole
+    /// GiB at or above 1 GiB.
+    ///
+    /// A root disk's `limit_mib` is the guest-visible capacity, smaller than
+    /// the declared size because of filesystem metadata, so doubling the
+    /// capacity would suggest a size that still leaves the guest full.
+    fn suggestion_mib(&self) -> u64 {
+        let base = self.declared_mib.unwrap_or(self.limit_mib);
+        let doubled = base.saturating_mul(2);
+        if doubled >= 1024 {
+            // Round *up*, so the suggestion is never below 2× the declared size.
+            doubled.div_ceil(1024) * 1024
+        } else {
+            doubled
+        }
+    }
+
     /// Full operator-facing text, tagged with the instance reference and the
     /// exact stack.yaml fix plus the `mc2 up` command that applies it.
     pub fn message_text(&self, stack: &str, service: &str, ordinal: u32) -> String {
         let aref = format!("{stack}/{service}/{ordinal}");
         let used = fmt_size(self.used_mib);
         let limit = fmt_size(self.limit_mib);
-        let suggest = yaml_size(self.limit_mib.saturating_mul(2));
+        let suggest = yaml_size(self.suggestion_mib());
         let head = self.headline();
         match &self.target {
             DiskTarget::RootDisk => format!(
@@ -348,7 +380,7 @@ mod tests {
 
     #[test]
     fn short_notes_are_compact() {
-        let full = DiskCondition::root_disk(4096, 4096).unwrap();
+        let full = DiskCondition::root_disk(4096, 4096, 4096).unwrap();
         assert_eq!(full.short_note(), "root disk full");
         let warn = DiskCondition::volume("data", "/data", 9216, 10 * 1024).unwrap();
         assert_eq!(warn.short_note(), "volume data 90%");
@@ -360,7 +392,7 @@ mod tests {
 
     #[test]
     fn root_disk_message_names_the_yaml_fix_and_the_command() {
-        let c = DiskCondition::root_disk(4076, 4096).unwrap();
+        let c = DiskCondition::root_disk(4076, 4096, 4096).unwrap();
         let text = c.message_text("shop", "web", 0);
         assert!(
             text.starts_with("shop/web/0: root disk full — 3.98 GiB of 4 GiB used."),
@@ -373,6 +405,36 @@ mod tests {
         assert!(text.contains("size: 8GiB"), "{text}");
         assert!(text.contains("mc2 up -f stack.yaml"), "{text}");
         assert!(text.contains("not kept"), "{text}");
+    }
+
+    #[test]
+    fn root_disk_suggestion_doubles_the_declared_size_not_the_capacity() {
+        // Declared 256 MiB → the guest sees ~180 MiB (ext4 metadata). Doubling
+        // the capacity would suggest 360MiB; the fix must double the declared
+        // size instead.
+        let c = DiskCondition::root_disk(180, 180, 256).unwrap();
+        let text = c.message_text("shop", "web", 0);
+        assert!(text.contains("size: 512MiB"), "{text}");
+        assert!(!text.contains("360MiB"), "{text}");
+
+        // 4 GiB declared → 8 GiB (whole-GiB literal).
+        let c = DiskCondition::root_disk(4096, 4096, 4096).unwrap();
+        assert!(c.message_text("s", "w", 0).contains("size: 8GiB"));
+
+        // At or above 1 GiB the suggestion rounds up to a whole GiB.
+        let c = DiskCondition::root_disk(700, 700, 700).unwrap();
+        assert!(c.message_text("s", "w", 0).contains("size: 2GiB"));
+    }
+
+    #[test]
+    fn markers_without_a_declared_size_still_decode() {
+        // A marker written before `declaredMib` existed must still decode, and
+        // fall back to doubling the limit.
+        let legacy = r#"[mc2:disk] {"conditions":[{"target":{"kind":"rootDisk"},"usedMib":180,"limitMib":180,"severity":"full"}]}"#;
+        let conds = decode(legacy);
+        assert_eq!(conds.len(), 1, "{conds:?}");
+        assert_eq!(conds[0].declared_mib, None);
+        assert!(conds[0].message_text("s", "w", 0).contains("size: 360MiB"));
     }
 
     #[test]
@@ -404,7 +466,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_and_strip() {
         let conds = vec![
-            DiskCondition::root_disk(4096, 4096).unwrap(),
+            DiskCondition::root_disk(4096, 4096, 4096).unwrap(),
             DiskCondition::volume("data", "/data", 9216, 10 * 1024).unwrap(),
         ];
         let block = block(&conds, "shop", "web", 2);
@@ -434,7 +496,7 @@ mod tests {
 
     #[test]
     fn message_appends_after_existing_runtime_text() {
-        let conds = vec![DiskCondition::root_disk(4096, 4096).unwrap()];
+        let conds = vec![DiskCondition::root_disk(4096, 4096, 4096).unwrap()];
         let mut message = String::from("microsandbox sdk (local)");
         let block = block(&conds, "s", "w", 0);
         message.push('\n');

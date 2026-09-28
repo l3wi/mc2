@@ -29,7 +29,7 @@ curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/networks |
 ## GET /v1/instances/{id}/network
 
 `GET /v1/instances/{id}/network` returns the observed network status for one
-instance (agent-reported).
+instance (reported by the reconcile loop).
 
 ```
 GET /v1/instances/{id}/network
@@ -37,8 +37,8 @@ Authorization: Bearer mc2at_...
 ```
 
 Response fields: `instanceId`, `phase`, `message`, `updatedAt`, and `observed`
-(the agent's report). Returns `404` when there is no network status for the
-instance.
+(the reconcile loop's last report). Returns `404` when there is no network
+status for the instance.
 
 ```bash
 curl -s -H "Authorization: Bearer mc2at_..." \
@@ -48,8 +48,8 @@ curl -s -H "Authorization: Bearer mc2at_..." \
 ## GET /v1/ingress
 
 `GET /v1/ingress` lists the desired ingress routes derived from stack YAML and
-instance placement. Ready/file status is agent-local (the `catalog.json` under
-`--ingress-config-dir`).
+instance placement. Ready/file status is tracked by the server (the
+`catalog.json` under `--ingress-config-dir`).
 
 ```
 GET /v1/ingress
@@ -65,6 +65,6 @@ curl -s -H "Authorization: Bearer mc2at_..." http://127.0.0.1:7443/v1/ingress | 
 ```
 
 <Callout type="note" title="Ingress file readiness">
-  `GET /v1/ingress` is desired state only — the Traefik file catalog lives on
-  the agent under `--ingress-config-dir` and is written by the reconcile loop.
+  `GET /v1/ingress` is desired state only — the Traefik file catalog lives
+  under `--ingress-config-dir` and is written by the server's reconcile loop.
 </Callout>

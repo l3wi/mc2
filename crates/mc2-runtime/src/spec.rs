@@ -233,16 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn work_item_carries_secrets_and_runtime_id() {
-        let work = build_work_item();
-        assert_eq!(work.runtime_id, "demo--web--0");
-        assert_eq!(work.secrets.len(), 1);
-        assert_eq!(work.secrets[0].env, "API_TOKEN");
-        assert_eq!(work.secrets[0].value, "plaintext-for-agent");
-        assert_eq!(work.secrets[0].allow_hosts, vec!["api.example.com"]);
-    }
-
-    #[test]
     fn volume_bind_plan_maps_spec_order_and_sizes() {
         let mut work = build_work_item();
         work.stack = "demo".into();

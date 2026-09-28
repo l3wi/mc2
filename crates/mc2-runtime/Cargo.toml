@@ -16,6 +16,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "macros", "rt"] }
 tracing = { workspace = true }
+# Boxed log stream handed to `mc2-server` without leaking SDK stream types.
+futures = "0.3"
 # Official microsandbox Rust SDK (libkrun embed). `ssh` = in-process host SSH serve.
 microsandbox = { version = "0.6.8", features = ["ssh"] }
 # Policy Rule / Destination types for narrow network Host:port allows (D13).

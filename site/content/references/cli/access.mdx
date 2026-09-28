@@ -62,10 +62,13 @@ mc2 ssh rm-key laptop
 
 | Command | Meaning |
 | ------- | ------- |
-| `mc2 ssh ls` (alias `list`) | List open SSH endpoints |
-| `mc2 ssh show <id>` | Show SSH state for an instance |
-| `mc2 ssh open <id> --key <name>... [--bind] [--port]` | Open SSH on an instance (API override) |
-| `mc2 ssh close <id>` | Close SSH on an instance |
+| `mc2 ssh ls` (alias `list`) | List open SSH endpoints (prints each endpoint's `<stack>/<service>/<ordinal>` ref and its full instance id) |
+| `mc2 ssh show <ref>` | Show SSH state for an instance |
+| `mc2 ssh open <ref> --key <name>... [--bind] [--port]` | Open SSH on an instance (API override) |
+| `mc2 ssh close <ref>` | Close SSH on an instance |
+
+`<ref>` is `<stack>/<service>/<ordinal>` (e.g. `demo/web/0`) or a full instance
+id — the same form `mc2 exec` and `mc2 logs` accept.
 
 `open` requires at least one `--key <name>` (repeatable, authorized key names)
 and accepts:

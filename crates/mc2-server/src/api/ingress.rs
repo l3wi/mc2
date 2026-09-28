@@ -1,4 +1,4 @@
-//! Ingress route listing (desired state; file readiness is agent-local).
+//! Ingress route listing (desired state; file readiness is server-local).
 
 use crate::api::{ApiError, ApiResult};
 use crate::ingress::build_ingress_routes_for_node;
@@ -8,7 +8,7 @@ use axum::Json;
 use serde_json::json;
 
 /// Desired Ingress routes derived from stack YAML + instance placement (D7).
-/// Ready/file status is agent-local (`catalog.json` under `--ingress-config-dir`).
+/// Ready/file status is server-local (`catalog.json` under `--ingress-config-dir`).
 pub async fn list_ingress(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
     let stacks = state.store.list_stacks().await.map_err(ApiError::store)?;
     let instances = state

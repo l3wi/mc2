@@ -86,28 +86,92 @@ fn secret_help_lists_set_ls_rm() {
 }
 
 #[test]
-fn up_without_token_reaches_server_or_connection_error() {
-    // Token is optional; without a server we get a connection error, not a local "missing token".
+fn up_without_token_reaches_server_without_an_authorization_header() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    // Isolate the client config so a developer's `~/.mc2/config.toml` cannot
+    // inject a token into this run (HOME is the only knob `config_path` uses).
+    let home = tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let stack_path = dir.path().join("hello.yaml");
+    std::fs::write(&stack_path, "services:\n  web:\n    image: alpine:3.20\n").unwrap();
+
+    // A stand-in server: accept one request, capture its head, reply 200.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(sock.try_clone().unwrap());
+
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).expect("request line");
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("header") == 0 || line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+
+        // Drain the request body so the client's write completes.
+        let content_length = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).expect("request body");
+
+        // `{}` keeps the CLI from issuing its follow-up `/v1/instances` read,
+        // so this stand-in server needs to serve exactly one request.
+        let payload = "{}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        sock.write_all(response.as_bytes()).expect("write response");
+        sock.flush().expect("flush");
+        tx.send((request_line, head)).expect("send capture");
+    });
+
+    let api = format!("http://{addr}");
     let out = mc2()
-        .args([
-            "up",
-            "-f",
-            "examples/stacks/smoke.yaml",
-            "--api",
-            "http://127.0.0.1:1",
-        ])
+        .args(["up", "-f", stack_path.to_str().unwrap(), "--api", &api])
+        .env("HOME", home.path())
+        .env_remove("MC2_API")
+        .env_remove("MC2_API_KEY")
+        .env_remove("MC2_CONTEXT")
         .output()
         .expect("run");
-    assert!(!out.status.success());
-    let err = format!(
+
+    let (request_line, head) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the CLI never connected to the stand-in server");
+    let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // The command actually reached the listener with the apply request...
     assert!(
-        !err.contains("missing --token"),
-        "should not require token client-side: {err}"
+        request_line.starts_with("POST /v1/stacks:apply "),
+        "expected the apply request to reach the listener; got {request_line:?}"
     );
+    // ...and, with no token configured, sent no Authorization header.
+    assert!(
+        !head.to_ascii_lowercase().contains("authorization:"),
+        "a no-token run must not send Authorization; request head:\n{head}"
+    );
+    assert!(out.status.success(), "server replied 200: {combined}");
 }
 
 #[test]

@@ -14,24 +14,26 @@ concept.
 
 ## File format
 
-`~/.mc2/config.toml` maps context names to an API URL and an optional token,
-plus a `current` pointer:
+`~/.mc2/config.toml` is a TOML document with a top-level `current` key and one
+`[contexts.<name>]` table per saved context. TOML requires top-level keys
+before the first table, so `current` comes **before** any `[contexts.*]`
+header:
 
 ```toml
-[contexts.prod]
-api = "https://mc2.example.com"
-token = "mc2at_..."
-
 current = "prod"
+
+[contexts.prod]
+url = "https://mc2.example.com"
+api_key = "mc2at_..."
 ```
 
 | Field | Meaning |
 | ----- | ------- |
-| `[contexts.<name>]` | A named context: `api` (control plane REST base URL) and `token` (operator API bearer token) |
-| `current` | The active context name, used when no `--context` / `MC2_CONTEXT` is given |
+| `current` | Top-level key: the active context name, used when no `--context` / `MC2_CONTEXT` is given. Must appear before the first `[contexts.*]` table. |
+| `[contexts.<name>]` | A named context: `url` (control plane REST base URL) and optional `api_key` (operator API bearer token) |
 
-The token is stored in the 0600 config file. Values are written by
-`mc2 context set`, never hand-edited.
+The token is stored in the 0600 config file. These entries are written by
+`mc2 context set` / `mc2 context use`; treat the file as generated.
 
 ## Resolution precedence
 

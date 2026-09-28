@@ -11,10 +11,10 @@ The desired-state document `mc2 up -f <file>` sends to the MC2 server. It is
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `name` | no\* | file stem | Stack name: lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, no `--`, ≤ 40 characters. |
+| `name` | no\* | file stem, else parent dir | Stack name: lowercase `[a-z0-9]([a-z0-9_-]*[a-z0-9])?`, no `--`, ≤ 40 characters. |
 | `services` | yes | — | Map of service name → service spec. Must be non-empty; names share the stack grammar (≤ 63). |
 | `volumes` | no | `{}` | Declared volumes; service mounts must reference them. Names: `[a-z0-9][a-z0-9._-]*`, no `--`, no trailing `-`, ≤ 63. |
-| `networks` | no | `{}` | Logical network groups (membership only in v1). Names share the stack grammar (≤ 63). |
+| `networks` | no | `{}` | Named network groups, server-wide: members reach each other by default. Names share the stack grammar (≤ 63). |
 | `ingress` | no | — | HTTP(S) rules + TCP routes for a BYO Traefik. |
 
 \* filled by `mc2 up` when missing.
@@ -40,8 +40,9 @@ no-ops**. If a key isn't in this reference, it doesn't apply.
 ## Minimal file
 
 `mc2 up` fills a missing top-level `name:` from the sanitized file stem
-(lowercased, invalid characters → `-`, ≤ 40 characters), so this is a complete
-stack:
+(lowercased, invalid characters → `-`, ≤ 40 characters) — or, when the stem is
+the generic `stack` (e.g. `examples/01-hello-service/stack.yaml`), from the
+parent directory name. So this is a complete stack:
 
 ```yaml
 services:

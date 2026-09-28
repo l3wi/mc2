@@ -148,11 +148,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_version_is_v1() {
-        assert_eq!(API_VERSION, "mc2/v1");
-    }
-
-    #[test]
     fn status_stub_serializes() {
         let s = ClusterStatus::bootstrap_stub();
         assert_eq!(s.api_version, "mc2/v1");

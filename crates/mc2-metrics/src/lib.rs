@@ -4,7 +4,7 @@
 //! exported via OTLP/gRPC. Otherwise init is a no-op and record helpers are silent.
 //!
 //! Sandbox CPU/mem/net stay on **msb-metrics**; this crate only covers MC2
-//! control-plane and agent process metrics.
+//! control-plane process metrics (the single server process).
 
 use anyhow::{Context, Result};
 use opentelemetry::metrics::{Counter, Gauge, Meter};
@@ -97,7 +97,7 @@ pub fn otlp_endpoint_from_env() -> Option<String> {
 
 /// Install global meter provider when an OTLP endpoint is configured.
 ///
-/// `service_name` should be `mc2-server` or `mc2-agent`.
+/// `service_name` should be `mc2-server` (the only MC2 process).
 pub fn init(service_name: &str) -> Result<bool> {
     let Some(endpoint) = otlp_endpoint_from_env() else {
         info!(

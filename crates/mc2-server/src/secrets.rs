@@ -61,7 +61,7 @@ pub async fn set_secret(
         .context("store secret")?)
 }
 
-/// Decrypt a secret by name (for agent injection only).
+/// Decrypt a secret by name (for sandbox injection only).
 pub async fn decrypt_secret(store: Arc<dyn Store>, key: &SecretsKey, name: &str) -> Result<String> {
     let blob = store
         .get_secret_blob(name)

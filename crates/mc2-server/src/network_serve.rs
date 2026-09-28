@@ -1,4 +1,4 @@
-//! Same-node mediated service network dataplane (D13).
+//! Host-mediated service network dataplane (L4 splice).
 //!
 //! - **expose**: track msb loopback publish host ports (allocated at create).
 //! - **listeners**: one **held** user-space L4 splice per exposed guest port `P`
@@ -19,7 +19,7 @@
 
 use mc2_runtime::{
     DesiredSandbox, InstanceReport, NetworkAllowDesired, NetworkEdgeStatus, NetworkExposeStatus,
-    NetworkObserved, NetworkPhase,
+    NetworkObserved, NetworkPhase, NodeRuntime,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -292,7 +292,11 @@ impl NetworkTable {
     }
 
     /// After sandbox is Running: inject DNS hosts + report network status.
-    pub async fn reconcile_running(&mut self, desired: &DesiredSandbox) -> NetworkObserved {
+    pub async fn reconcile_running(
+        &mut self,
+        desired: &DesiredSandbox,
+        runtime: &Arc<dyn NodeRuntime>,
+    ) -> NetworkObserved {
         let mut observed = NetworkObserved {
             exposes: vec![],
             edges: vec![],
@@ -347,7 +351,7 @@ impl NetworkTable {
         }
         drop(backends);
 
-        if let Err(e) = self.inject_hosts(desired, &observed).await {
+        if let Err(e) = self.inject_hosts(desired, &observed, runtime).await {
             warn!(
                 instance = %desired.instance_id,
                 error = %e,
@@ -428,6 +432,7 @@ impl NetworkTable {
         &mut self,
         desired: &DesiredSandbox,
         observed: &NetworkObserved,
+        runtime: &Arc<dyn NodeRuntime>,
     ) -> anyhow::Result<()> {
         let ready_names: Vec<(String, String)> = desired
             .network
@@ -445,12 +450,14 @@ impl NetworkTable {
             return Ok(());
         }
 
-        let handle = microsandbox::Sandbox::get(&desired.runtime_id).await?;
-        let sb = handle.connect().await?;
-        let out = sb
-            .shell("awk '/^nameserver /{print $2; exit}' /etc/resolv.conf")
-            .await?;
-        let gw = out.stdout()?.trim().to_string();
+        let gw = runtime
+            .guest_shell(
+                &desired.runtime_id,
+                "awk '/^nameserver /{print $2; exit}' /etc/resolv.conf",
+            )
+            .await?
+            .trim()
+            .to_string();
         if gw.is_empty() {
             anyhow::bail!("empty gateway from resolv.conf");
         }
@@ -480,7 +487,7 @@ impl NetworkTable {
             ));
         }
         script.push_str("cp /tmp/hosts.mc2 /etc/hosts");
-        let _ = sb.shell(script).await?;
+        let _ = runtime.guest_shell(&desired.runtime_id, &script).await?;
         self.hosts_key
             .insert(desired.instance_id.clone(), inject_key);
         debug!(
@@ -645,6 +652,130 @@ mod tests {
             ssh: None,
             network: None,
         }
+    }
+
+    /// Shell-only fake runtime: records every `guest_shell` script and answers
+    /// the DNS-gateway probe with a fixed address.
+    struct ShellRuntime {
+        scripts: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeRuntime for ShellRuntime {
+        async fn ensure_running(
+            &self,
+            _d: &DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
+            anyhow::bail!("unused")
+        }
+        async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn status(&self, _id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            anyhow::bail!("unused")
+        }
+        async fn list_owned(&self, _install_id: &str) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("unused")
+        }
+        async fn exec_command(&self, _id: &str, _argv: &[String]) -> anyhow::Result<i32> {
+            anyhow::bail!("unused")
+        }
+        async fn exec_with_output(
+            &self,
+            _id: &str,
+            _argv: &[String],
+            _stdin: &[u8],
+        ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            anyhow::bail!("unused")
+        }
+        async fn guest_shell(&self, _id: &str, script: &str) -> anyhow::Result<String> {
+            self.scripts.lock().await.push(script.to_string());
+            Ok("10.0.2.2\n".into())
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            _tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            anyhow::bail!("unused")
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            _from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            anyhow::bail!("unused")
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<Arc<dyn mc2_runtime::SshServer>> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    /// F5: `/etc/hosts` injection reaches the guest through
+    /// `NodeRuntime::guest_shell` (the fake records the scripts), keeping the
+    /// `#mc2-network` marker lines and the gateway probe unchanged.
+    #[tokio::test]
+    async fn hosts_injection_uses_the_runtime_guest_shell() {
+        let mut table = NetworkTable::new();
+        let d = desired("i-web-0", "web", 8080, Some(("db", 5432)));
+        let observed = NetworkObserved {
+            exposes: vec![],
+            edges: vec![NetworkEdgeStatus {
+                to_service: "db".into(),
+                port: 5432,
+                phase: "Ready".into(),
+                message: String::new(),
+            }],
+            message: String::new(),
+        };
+        let fake = Arc::new(ShellRuntime {
+            scripts: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let runtime: Arc<dyn NodeRuntime> = fake.clone();
+
+        table
+            .inject_hosts(&d, &observed, &runtime)
+            .await
+            .expect("inject");
+
+        let scripts = fake.scripts.lock().await;
+        assert_eq!(scripts.len(), 2, "{scripts:?}");
+        // 1: read the DNS gateway from the guest's resolv.conf.
+        assert!(scripts[0].contains("nameserver"), "{}", scripts[0]);
+        // 2: rebuild the marker lines and install the file.
+        assert!(
+            scripts[1].contains("grep -v ' #mc2-network$' /etc/hosts"),
+            "{}",
+            scripts[1]
+        );
+        assert!(
+            scripts[1]
+                .contains("printf '%s %s %s #mc2-network\\n' '10.0.2.2' 'db.shop.svc.mc2' 'db'"),
+            "{}",
+            scripts[1]
+        );
+        assert!(
+            scripts[1].contains("cp /tmp/hosts.mc2 /etc/hosts"),
+            "{}",
+            scripts[1]
+        );
+        drop(scripts);
+
+        // Same gateway + names: only the probe re-runs; the rewrite is skipped.
+        table
+            .inject_hosts(&d, &observed, &runtime)
+            .await
+            .expect("inject again");
+        let scripts = fake.scripts.lock().await;
+        assert_eq!(scripts.len(), 3, "{scripts:?}");
+        assert!(!scripts[2].contains("#mc2-network"), "{}", scripts[2]);
     }
 
     /// Echo backend that prefixes its own listen port, so round-robin is observable.

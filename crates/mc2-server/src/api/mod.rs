@@ -557,6 +557,7 @@ services:
 #[cfg(test)]
 pub(crate) mod testing {
     use crate::AppState;
+    use futures::StreamExt;
     use std::sync::Arc;
 
     /// One `exec_with_output` call, captured for assertions.
@@ -567,10 +568,17 @@ pub(crate) mod testing {
     }
 
     /// Minimal NodeRuntime stub: exec returns a canned result (recording each
-    /// call); the rest are unused by the REST handlers under test.
+    /// call); logs and the guest shell replay canned data (recording what the
+    /// handlers asked for); the rest are unused by the REST handlers under test.
     #[derive(Default)]
     pub struct MockRuntime {
         pub exec_calls: tokio::sync::Mutex<Vec<ExecCall>>,
+        /// Lines returned by `read_logs` and replayed by `log_stream`.
+        pub log_lines: Vec<mc2_runtime::LogLine>,
+        /// Every shell script `guest_shell` was asked to run, in order.
+        pub shell_scripts: tokio::sync::Mutex<Vec<String>>,
+        /// stdout `guest_shell` returns (the DNS-gateway probe).
+        pub shell_stdout: String,
     }
 
     #[async_trait::async_trait]
@@ -609,6 +617,48 @@ pub(crate) mod testing {
                 // Deliberately invalid UTF-8: it must survive the wire format.
                 stderr: vec![0xff, 0xfe],
             })
+        }
+        async fn guest_shell(&self, _id: &str, script: &str) -> anyhow::Result<String> {
+            self.shell_scripts.lock().await.push(script.to_string());
+            Ok(self.shell_stdout.clone())
+        }
+        async fn read_logs(
+            &self,
+            _id: &str,
+            tail: Option<usize>,
+        ) -> anyhow::Result<Vec<mc2_runtime::LogLine>> {
+            let mut lines = self.log_lines.clone();
+            if let Some(n) = tail {
+                if lines.len() > n {
+                    lines.drain(0..lines.len() - n);
+                }
+            }
+            Ok(lines)
+        }
+        async fn log_stream(
+            &self,
+            _id: &str,
+            from: Option<String>,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<mc2_runtime::LogLine>>>
+        {
+            // A fake has no live source: a resume cursor means the stream is
+            // already at the end and yields nothing; otherwise it replays the
+            // canned lines in order.
+            let lines = if from.is_some() {
+                Vec::new()
+            } else {
+                self.log_lines.clone()
+            };
+            Ok(futures::stream::iter(lines.into_iter().map(Ok)).boxed())
+        }
+        async fn ssh_server(
+            &self,
+            _id: &str,
+            _user: &str,
+            _keys: &[String],
+            _sftp: bool,
+        ) -> anyhow::Result<Arc<dyn mc2_runtime::SshServer>> {
+            unreachable!("not exercised")
         }
     }
 
