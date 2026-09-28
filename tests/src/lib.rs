@@ -104,13 +104,15 @@ impl TestCluster {
             })
         };
 
+        // Mirrors the server: `<data-dir>/volumes` unless a test overrides it.
+        let volume_dir = volume_dir.unwrap_or_else(|| data_dir.join("volumes"));
         let state = AppState {
             store: store.clone() as Arc<dyn Store>,
             data_dir: data_dir.clone(),
             version: env!("CARGO_PKG_VERSION"),
             secrets_key,
-            volume_dir,
-            runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
+            volume_dir: volume_dir.clone(),
+            runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(volume_dir)),
             limits,
             http_limits: mc2_server::HttpLimits::default(),
             no_auth: false,

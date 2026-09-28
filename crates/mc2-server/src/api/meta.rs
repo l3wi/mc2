@@ -69,19 +69,18 @@ async fn resource_status(state: &AppState) -> mc2_api::ResourceStatus {
     let instances = state.store.list_instances().await.unwrap_or_default();
     let (reserved_cpu, reserved_mem) = crate::scheduler::reserved_capacity(&instances);
 
-    // Host disk: the filesystem hosting MC2's data/volumes.
-    let disk_path = state
-        .volume_dir
-        .as_deref()
-        .unwrap_or(state.data_dir.as_path());
+    // Host disk: the filesystem hosting MC2's data/volumes. The volume root is
+    // the real home of guest data, but a fresh install may not have it yet, so
+    // fall back to the data dir (same filesystem) until it exists.
+    let disk_path = if state.volume_dir.exists() {
+        state.volume_dir.as_path()
+    } else {
+        state.data_dir.as_path()
+    };
     let (disk_total_mib, disk_free_mib) = crate::host_metrics::disk_usage_mib(disk_path);
 
     let mc2_disk_used_mib = crate::host_metrics::dir_size_mib(&state.data_dir)
-        + state
-            .volume_dir
-            .as_deref()
-            .map(crate::host_metrics::dir_size_mib)
-            .unwrap_or(0);
+        + crate::host_metrics::dir_size_mib(&state.volume_dir);
 
     mc2_api::ResourceStatus {
         limits: ResourceLimitsView {

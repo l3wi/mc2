@@ -11,12 +11,12 @@ use std::collections::HashMap;
 /// their declared size limit and measured usage.
 ///
 /// Volumes are filesystem-only in v1 — directories named
-/// `mc2-<stack>--<volume>` under `--volume-dir` (default `~/.mc2/volumes`) —
+/// `mc2-<stack>--<volume>` under `--volume-dir` (default `<data-dir>/volumes`) —
 /// so this lists the root and reports each MC2-named directory. Non-MC2
 /// entries are skipped. Usage is measured best-effort; the limit comes from
 /// the owning stack's stored `volumes.<name>.size`.
 pub async fn list_volumes(State(state): State<AppState>) -> ApiResult<Vec<VolumeView>> {
-    let root = crate::api::stacks::volume_root(state.volume_dir.as_deref());
+    let root = state.volume_dir.as_path();
 
     // Declared limits per (stack, volume), from the stored stack documents.
     let mut declared: HashMap<(String, String), u64> = HashMap::new();
@@ -30,7 +30,7 @@ pub async fn list_volumes(State(state): State<AppState>) -> ApiResult<Vec<Volume
 
     let mut views = Vec::new();
 
-    let Ok(entries) = std::fs::read_dir(&root) else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         // Missing volume root == no volumes.
         return Ok(axum::Json(views));
     };
@@ -105,7 +105,7 @@ mod tests {
             .await
             .unwrap();
         let mut state = test_state_open(store);
-        state.volume_dir = Some(vol_dir);
+        state.volume_dir = vol_dir;
 
         let app = router(state);
         let res = app
@@ -145,7 +145,7 @@ mod tests {
         let store = MemoryStore::new();
         store.init_cluster("").await.unwrap();
         let mut state = test_state_open(store);
-        state.volume_dir = Some(std::path::PathBuf::from("/tmp/definitely-missing-mc2-vol"));
+        state.volume_dir = std::path::PathBuf::from("/tmp/definitely-missing-mc2-vol");
 
         let app = router(state);
         let res = app

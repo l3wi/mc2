@@ -416,7 +416,7 @@ async fn publish_observed(
     // `mc2 ps`, full text + fix printed by `mc2 exec`/`ssh`/`logs`).
     {
         let root_disk_usage = runtime.root_disk_usage().await.unwrap_or_default();
-        disk::annotate_reports(reports, desired, &root_disk_usage, &runtime.volume_root());
+        disk::annotate_reports(reports, desired, &root_disk_usage, runtime.volume_root());
     }
 
     // D4: every observed-state write is checked; a failure is logged with the

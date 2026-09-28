@@ -144,7 +144,8 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   write quota (guest sees ENOSPC, `df` shows the cap) and is resizable with
   data kept; shrinking below usage is a 400. `services.<name>.storage_opt.size`
   (default 4 GiB) sets the VM root disk. Volumes are MC2-owned directories
-  under `~/.mc2/volumes`. `--limit-disk-mib` is now an apply-time reservation
+  under `<data-dir>/volumes` (so `--data-dir /srv/mc2` keeps them with the
+  rest of the state; `--volume-dir` still overrides). `--limit-disk-mib` is now an apply-time reservation
   (volume sizes + root disks × replicas) with a breakdown on refusal.
 - **Disk-full is visible.** `mc2 ps` gains a `NOTES` column; `mc2 exec`,
   `mc2 ssh open`, `mc2 logs` and `mc2 up` print the condition with the exact

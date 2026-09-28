@@ -34,10 +34,11 @@ Fields:
 - `services.<svc>.volumes[].name` — a declared volume name.
 - `services.<svc>.volumes[].target` — absolute guest path; unique per service.
 
-## Node-local behavior
+## Server-local behavior
 
-Volumes are node-local: MC2 owns a plain directory per volume under its volume
-root (default `~/.mc2/volumes`, override with `mc2 server --volume-dir`) and
+Volumes are local to the server: MC2 owns a plain directory per volume under
+its volume root (default `<data-dir>/volumes`, i.e. `~/.mc2/volumes`; override
+with `mc2 server --volume-dir`) and
 mounts `mc2-<stack>--<volume>` into the VM as a bind mount, so user-facing YAML
 names stay unchanged. Every VM start passes an explicit write quota of
 `size − current usage`, which makes the declared size an absolute cap that
@@ -49,13 +50,8 @@ When the volume (or the VM's root disk) fills, the guest sees
 `No space left on device`; `mc2 ps` shows the condition in `NOTES` and
 `mc2 exec` prints the exact `stack.yaml` change to make.
 
-Because the data lives on one node:
-
-- The first instance that consumes a volume binds the service to that node.
-  Instances are never rescheduled off it — if the node goes NotReady they stay
-  Pending until the node returns.
-- Node loss makes the volume unavailable, and data is lost if the node's
-  storage is lost. There is no replication or migration in v1.
+Because the data lives on this one server, there is no replication or
+migration in v1: losing the server's disk loses the data. Back it up.
 
 ## Retention and backup
 
@@ -75,7 +71,7 @@ coordination is the application's responsibility.
 
 Start the server using the
 [quickstart](../../site/content/documentation/quickstart.mdx). Volumes land
-under the default volume root (`~/.mc2/volumes`):
+under the default volume root (`~/.mc2/volumes` with the default data dir):
 
 ```bash
 mc2 up -f examples/06-persistent-volumes/stack.yaml
@@ -92,16 +88,13 @@ mc2 exec smoke-volumes/keep/0 /bin/sh -c 'echo hi > /data/marker'
 mc2 down smoke-volumes
 mc2 up -f examples/06-persistent-volumes/stack.yaml
 
-# 3. Marker survives the recreate; the instance stays on the same node.
+# 3. Marker survives the recreate.
 mc2 exec smoke-volumes/keep/0 cat /data/marker
 mc2 ps
 
 # 4. Volume data remains on disk after stack removal.
 ls ~/.mc2/volumes/mc2-smoke-volumes--data/
 ```
-
-`GET /v1/instances` shows the instance bound to its node while the node is
-NotReady instead of moving.
 
 ## Future work
 

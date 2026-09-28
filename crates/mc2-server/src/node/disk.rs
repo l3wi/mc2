@@ -99,11 +99,14 @@ pub fn conditions_for(
 
 /// Append disk conditions to every report, log condition changes and export
 /// per-instance usage gauges.
+///
+/// `volume_root` is the backend's MC2 volume directory, or `None` for a
+/// backend that owns no MC2 volumes — volume usage then counts as 0.
 pub fn annotate_reports(
     reports: &mut [InstanceReport],
     desired: &[DesiredSandbox],
     root_disk_usage: &HashMap<String, DiskUsage>,
-    volume_root: &Path,
+    volume_root: Option<&Path>,
 ) {
     let by_runtime: HashMap<&str, &DesiredSandbox> =
         desired.iter().map(|d| (d.runtime_id.as_str(), d)).collect();
@@ -113,8 +116,10 @@ pub fn annotate_reports(
             continue;
         };
         let root = root_disk_usage.get(&report.runtime_id).copied();
-        let usage_for =
-            |name: &str| volume_usage_mib(volume_root, &volume_name(&desired.stack, name));
+        let usage_for = |name: &str| match volume_root {
+            Some(dir) => volume_usage_mib(dir, &volume_name(&desired.stack, name)),
+            None => 0,
+        };
 
         if let Some(usage) = root {
             mc2_metrics::record_instance_disk(
@@ -330,7 +335,12 @@ mod tests {
                 capacity_mib: None,
             },
         );
-        annotate_reports(&mut reports, std::slice::from_ref(&d), &usage, root.path());
+        annotate_reports(
+            &mut reports,
+            std::slice::from_ref(&d),
+            &usage,
+            Some(root.path()),
+        );
 
         let message = reports[0].message.clone();
         assert!(message.starts_with("microsandbox sdk (local)"), "{message}");
@@ -362,7 +372,7 @@ mod tests {
             &mut reports,
             std::slice::from_ref(&d),
             &HashMap::new(),
-            root.path(),
+            Some(root.path()),
         );
         assert_eq!(reports[0].message, "ok");
     }

@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use mc2_store::{SecretsKey, SqliteStore, Store};
 use std::future::Future;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -85,7 +85,7 @@ pub struct ServerArgs {
     #[arg(long, default_value = "le", env = "MC2_PUBLIC_TLS_CERT_RESOLVER")]
     pub public_tls_cert_resolver: String,
 
-    /// Root for MC2-owned named-volume directories (default ~/.mc2/volumes).
+    /// Root for MC2-owned named-volume directories (default `<data-dir>/volumes`).
     /// Each volume is a plain host directory mounted into the VM as a bind
     /// mount with a `size` quota; data persists across recreate and stack removal.
     #[arg(long, env = "MC2_VOLUME_DIR")]
@@ -192,8 +192,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub version: &'static str,
     pub secrets_key: Arc<SecretsKey>,
-    /// Named-volume root (for `rm --volumes`); None → msb default.
-    pub volume_dir: Option<PathBuf>,
+    /// Named-volume root: `--volume-dir`, or `<data-dir>/volumes` when unset.
+    pub volume_dir: PathBuf,
     /// Shared microsandbox runtime (exec/logs handlers + node loop).
     pub runtime: Arc<dyn mc2_runtime::NodeRuntime>,
     /// Cluster resource budget (`--limit-*`); all-zero = unlimited.
@@ -405,6 +405,15 @@ async fn drain_or_abort(critical: &mut JoinSet<CriticalOutput>, deadline: Durati
     .await;
 }
 
+/// Resolve the MC2 volume root once at startup: `--volume-dir` (a leading `~/`
+/// expanded against `HOME`, matching `--data-dir`), else `<data-dir>/volumes`.
+fn resolve_volume_dir(arg: Option<&Path>, data_dir: &Path) -> PathBuf {
+    match arg {
+        Some(dir) => expand_data_dir(&dir.to_string_lossy()),
+        None => data_dir.join("volumes"),
+    }
+}
+
 /// Run the orchestrator (REST + scheduler + local node loop).
 pub async fn run(args: ServerArgs) -> Result<()> {
     validate_auth_startup(
@@ -479,8 +488,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Volumes live with the rest of the state unless `--volume-dir` says
+    // otherwise, so `--data-dir /srv/mc2` keeps them under /srv/mc2 too.
+    let volume_dir = resolve_volume_dir(args.volume_dir.as_deref(), &data_dir);
     let runtime: Arc<dyn mc2_runtime::NodeRuntime> = Arc::new(
-        mc2_runtime::MicrosandboxRuntime::new(args.volume_dir.clone())
+        mc2_runtime::MicrosandboxRuntime::new(volume_dir.clone())
             .with_install_id(boot.install_id.clone()),
     );
 
@@ -540,7 +552,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         data_dir: data_dir.clone(),
         version: env!("CARGO_PKG_VERSION"),
         secrets_key: secrets_key.clone(),
-        volume_dir: args.volume_dir.clone(),
+        volume_dir: volume_dir.clone(),
         runtime: runtime.clone(),
         limits: ResourceLimits {
             cpus: args.limit_cpus,
@@ -695,6 +707,28 @@ mod tests {
         std::env::set_var("HOME", "/tmp/home");
         let p = expand_data_dir("~/.mc2");
         assert_eq!(p, PathBuf::from("/tmp/home/.mc2"));
+    }
+
+    #[test]
+    fn resolve_volume_dir_defaults_under_data_dir() {
+        let data_dir = Path::new("/srv/mc2");
+        assert_eq!(
+            resolve_volume_dir(None, data_dir),
+            PathBuf::from("/srv/mc2/volumes")
+        );
+        assert_eq!(
+            resolve_volume_dir(Some(Path::new("/x")), data_dir),
+            PathBuf::from("/x")
+        );
+    }
+
+    #[test]
+    fn resolve_volume_dir_expands_a_leading_tilde() {
+        std::env::set_var("HOME", "/tmp/home");
+        assert_eq!(
+            resolve_volume_dir(Some(Path::new("~/v")), Path::new("/srv/mc2")),
+            PathBuf::from("/tmp/home/v")
+        );
     }
 
     #[test]

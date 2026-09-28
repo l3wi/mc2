@@ -31,10 +31,10 @@ static LOCAL_BACKEND_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Real microVM backend via the **microsandbox** crate (local libkrun only).
 #[derive(Debug)]
 pub struct MicrosandboxRuntime {
-    /// MC2 volume root override (`--volume-dir` / `MC2_VOLUME_DIR`).
-    /// `None` → `~/.mc2/volumes`. MC2 owns the directories under it and mounts
+    /// MC2 volume root (`--volume-dir` / `MC2_VOLUME_DIR`, else
+    /// `<data-dir>/volumes`). MC2 owns the directories under it and mounts
     /// `mc2-{stack}--{volume}` as a bind mount with an explicit quota.
-    volume_dir: Option<PathBuf>,
+    volume_dir: PathBuf,
     /// This install's id (`mc2.install` label / `list_owned` filter). Empty
     /// means "not configured" and refuses to create sandboxes, so a sandbox can
     /// never be created without the label ownership recovery depends on.
@@ -42,7 +42,7 @@ pub struct MicrosandboxRuntime {
 }
 
 impl MicrosandboxRuntime {
-    pub fn new(volume_dir: Option<PathBuf>) -> Self {
+    pub fn new(volume_dir: PathBuf) -> Self {
         Self {
             volume_dir,
             install_id: String::new(),
@@ -147,7 +147,7 @@ fn build_network_policy(desired: &DesiredSandbox) -> NetworkPolicy {
 
 async fn create_detached(
     desired: &DesiredSandbox,
-    volume_dir: Option<&Path>,
+    volume_dir: &Path,
     install_id: &str,
 ) -> Result<()> {
     if install_id.is_empty() {
@@ -200,8 +200,8 @@ async fn create_detached(
     // survives restarts and can be resized (`mc2 up`) with the data kept.
     // A quota is never omitted: without one microsandbox would silently apply
     // its own 4 GiB default. Usage is measured fresh before every create.
-    let root = crate::ensure_volume_dir(&crate::volume_root(volume_dir))
-        .with_context(|| format!("create volume root for {volume_dir:?}"))?;
+    let root = crate::ensure_volume_dir(volume_dir)
+        .with_context(|| format!("create volume root for {}", volume_dir.display()))?;
     let mut usage: HashMap<String, u64> = HashMap::new();
     for m in &desired.spec.volumes {
         let dir = crate::volume_name(&desired.stack, &m.name);
@@ -339,8 +339,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                         RestartAction::Recreate => {
                             warn!(%name, ?policy, "recreating sandbox per restartPolicy");
                             let _ = Sandbox::remove(name).await;
-                            create_detached(desired, self.volume_dir.as_deref(), &self.install_id)
-                                .await?;
+                            create_detached(desired, &self.volume_dir, &self.install_id).await?;
                             EnsureOutcome::Restarted
                         }
                         RestartAction::Start => {
@@ -360,12 +359,8 @@ impl NodeRuntime for MicrosandboxRuntime {
                                     }
                                     warn!(%name, error = %e, "start_detached failed; recreating");
                                     let _ = Sandbox::remove(name).await;
-                                    create_detached(
-                                        desired,
-                                        self.volume_dir.as_deref(),
-                                        &self.install_id,
-                                    )
-                                    .await?;
+                                    create_detached(desired, &self.volume_dir, &self.install_id)
+                                        .await?;
                                 }
                             }
                             EnsureOutcome::Restarted
@@ -374,7 +369,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                 }
             }
             None => {
-                create_detached(desired, self.volume_dir.as_deref(), &self.install_id).await?;
+                create_detached(desired, &self.volume_dir, &self.install_id).await?;
                 EnsureOutcome::Created
             }
         };
@@ -513,8 +508,8 @@ impl NodeRuntime for MicrosandboxRuntime {
         })
     }
 
-    fn volume_root(&self) -> PathBuf {
-        crate::volume_root(self.volume_dir.as_deref())
+    fn volume_root(&self) -> Option<&Path> {
+        Some(&self.volume_dir)
     }
 
     /// Root-disk usage from the microsandbox live metrics registry (one shared
@@ -840,9 +835,11 @@ mod tests {
     /// a restart, so this fails before any backend is touched.
     #[tokio::test]
     async fn refuses_to_create_or_list_without_an_install_id() {
-        let rt = MicrosandboxRuntime::new(None);
+        let rt = MicrosandboxRuntime::new(PathBuf::from("/tmp/mc2-vols"));
         assert!(rt.list_owned("").await.is_err());
         let d = profiled(&["public"]);
-        assert!(create_detached(&d, None, "").await.is_err());
+        assert!(create_detached(&d, Path::new("/tmp/mc2-vols"), "")
+            .await
+            .is_err());
     }
 }

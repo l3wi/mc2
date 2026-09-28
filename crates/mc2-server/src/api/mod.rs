@@ -664,13 +664,15 @@ pub(crate) mod testing {
 
     /// Test AppState wired to an in-memory store + the runtime stub.
     pub fn test_state(store: Arc<dyn mc2_store::Store>) -> AppState {
+        let data_dir = std::path::PathBuf::from("/tmp/mc2-test");
+        let volume_dir = data_dir.join("volumes");
         let mut state = AppState {
             store,
-            data_dir: std::path::PathBuf::from("/tmp/mc2-test"),
+            data_dir,
             version: "0.1.0-test",
             secrets_key: Arc::new(mc2_store::SecretsKey::from_bytes([1u8; 32])),
-            volume_dir: None,
-            runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(None)),
+            volume_dir: volume_dir.clone(),
+            runtime: Arc::new(mc2_runtime::MicrosandboxRuntime::new(volume_dir)),
             limits: crate::ResourceLimits::default(),
             http_limits: crate::HttpLimits::default(),
             no_auth: false,

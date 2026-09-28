@@ -2,8 +2,8 @@
 #
 #   mc2 up -f examples/06-persistent-volumes/stack.yaml
 #
-# The volume `data` is an MC2-owned directory on the node (default
-# ~/.mc2/volumes, override with `mc2 server --volume-dir`), mounted into the VM
+# The volume `data` is an MC2-owned directory on the server (default
+# <data-dir>/volumes, override with `mc2 server --volume-dir`), mounted into the VM
 # with a `size` write quota. Data survives sandbox recreate/restart and stack
 # removal. CI covers apply → desired-set mount material in
 # tests/tests/volumes.rs (no hypervisor).

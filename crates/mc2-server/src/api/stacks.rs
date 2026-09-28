@@ -74,7 +74,7 @@ pub async fn delete_stack(
 
     if params.volumes {
         if let Ok(doc) = mc2_api::parse_stack_yaml(&stack.raw_yaml) {
-            let root = volume_root(state.volume_dir.as_deref());
+            let root = &state.volume_dir;
             for vol in doc.volumes.keys() {
                 let vpath = root.join(mc2_runtime::volume_name(&name, vol));
                 if vpath.exists() {
@@ -94,11 +94,6 @@ pub async fn delete_stack(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Resolve the MC2 volume root: `--volume-dir` if set, else `~/.mc2/volumes`.
-pub(crate) fn volume_root(volume_dir: Option<&std::path::Path>) -> std::path::PathBuf {
-    mc2_runtime::volume_root(volume_dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,10 +108,11 @@ mod tests {
 
     /// ApplyConfig with no limits, for tests that exercise validation only.
     fn unlimited_cfg() -> ApplyConfig {
+        let data_dir = tempfile::tempdir().unwrap().path().to_path_buf();
         ApplyConfig {
             limits: crate::ResourceLimits::default(),
-            data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-            volume_dir: None,
+            volume_dir: data_dir.join("volumes"),
+            data_dir,
             rest_port: 0,
             allow_host_profile: false,
             port_probe: crate::probe_host_loopback_port,
@@ -224,7 +220,7 @@ services:
         std::fs::write(volume_path.join("sub/keep.txt"), "x").unwrap();
 
         let mut state = test_state_open(store);
-        state.volume_dir = Some(root.path().to_path_buf());
+        state.volume_dir = root.path().to_path_buf();
         let app = router(state);
 
         let res = app

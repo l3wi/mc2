@@ -11,8 +11,8 @@ mod spec_hash;
 
 pub use msb_sdk::MicrosandboxRuntime;
 pub use naming::{
-    default_volume_root, dir_size_bytes, dir_size_mib, ensure_volume_dir, parse_volume_name,
-    remaining_quota_mib, sandbox_name, volume_bind_plan, volume_name, volume_root, VolumeMountPlan,
+    dir_size_bytes, dir_size_mib, ensure_volume_dir, parse_volume_name, remaining_quota_mib,
+    sandbox_name, volume_bind_plan, volume_name, VolumeMountPlan,
 };
 pub use restart::{action_for_phase, backoff_secs, RestartAction, RestartPolicy};
 pub mod networks;
@@ -36,7 +36,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -77,10 +77,10 @@ pub trait NodeRuntime: Send + Sync {
 
     /// Directory holding MC2-owned volume directories (bind-mount sources).
     ///
-    /// Defaults to `~/.mc2/volumes` when the backend has no explicit
-    /// `--volume-dir`.
-    fn volume_root(&self) -> PathBuf {
-        naming::volume_root(None)
+    /// `None` for backends that own no MC2 volumes: they never bind-mount a
+    /// volume directory, so callers report volume usage as zero.
+    fn volume_root(&self) -> Option<&Path> {
+        None
     }
 
     /// Observed root-disk usage per running sandbox, keyed by runtime id.

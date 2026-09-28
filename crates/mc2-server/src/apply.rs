@@ -39,7 +39,7 @@ pub enum ApplyError {
 pub struct ApplyConfig {
     pub limits: ResourceLimits,
     pub data_dir: PathBuf,
-    pub volume_dir: Option<PathBuf>,
+    pub volume_dir: PathBuf,
     /// Port the operator REST API binds (never claimable by `expose`); `0` = unknown.
     pub rest_port: u16,
     /// Server `--allow-host-profile`: permit `network.profiles: [host]`.
@@ -434,7 +434,7 @@ async fn disk_reservation(
 /// Shrinking by deleting data is the operator's call, but a declared size the
 /// directory already exceeds would fail every subsequent guest write.
 fn check_volume_shrink(cfg: &ApplyConfig, doc: &StackDocument) -> Result<(), ApplyError> {
-    let root = mc2_runtime::volume_root(cfg.volume_dir.as_deref());
+    let root = &cfg.volume_dir;
     for (name, vol) in &doc.volumes {
         let dir = root.join(mc2_runtime::volume_name(&doc.name, name));
         if !dir.is_dir() {
@@ -1511,7 +1511,7 @@ fn cfg_default() -> ApplyConfig {
     ApplyConfig {
         limits: ResourceLimits::default(),
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: None,
+        volume_dir: tempfile::tempdir().unwrap().path().join("volumes"),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
@@ -1529,7 +1529,7 @@ async fn refuses_apply_over_cpu_limit() {
             disk_mib: 0,
         },
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: None,
+        volume_dir: tempfile::tempdir().unwrap().path().join("volumes"),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
@@ -1551,7 +1551,7 @@ async fn refuses_apply_over_memory_limit() {
             disk_mib: 0,
         },
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: None,
+        volume_dir: tempfile::tempdir().unwrap().path().join("volumes"),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
@@ -1573,7 +1573,7 @@ async fn refuses_apply_when_disk_reservation_exceeded() {
             disk_mib: 1024,
         },
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: None,
+        volume_dir: tempfile::tempdir().unwrap().path().join("volumes"),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
@@ -1646,7 +1646,7 @@ async fn refuses_apply_when_a_volume_shrinks_below_its_usage() {
     let cfg = ApplyConfig {
         limits: ResourceLimits::default(),
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: Some(root.path().to_path_buf()),
+        volume_dir: root.path().to_path_buf(),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,
@@ -1679,7 +1679,7 @@ async fn applies_within_limits() {
             disk_mib: 0,
         },
         data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
-        volume_dir: None,
+        volume_dir: tempfile::tempdir().unwrap().path().join("volumes"),
         rest_port: 0,
         allow_host_profile: false,
         port_probe: probe_host_loopback_port,

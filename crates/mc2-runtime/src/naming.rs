@@ -50,37 +50,6 @@ pub fn parse_volume_name(name: &str) -> Option<(String, String)> {
     Some((stack.to_string(), volume.to_string()))
 }
 
-/// Default MC2-owned volume root: `~/.mc2/volumes`.
-pub fn default_volume_root() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".mc2").join("volumes"),
-        None => PathBuf::from(".mc2").join("volumes"),
-    }
-}
-
-/// Resolve the volume root: `override_dir` (`--volume-dir` / `MC2_VOLUME_DIR`)
-/// or [`default_volume_root`]. Pure — no filesystem access.
-///
-/// A leading `~/` in the override is expanded against `HOME`, matching how the
-/// server resolves `--data-dir`.
-pub fn volume_root(override_dir: Option<&Path>) -> PathBuf {
-    match override_dir {
-        Some(dir) => expand_tilde(dir),
-        None => default_volume_root(),
-    }
-}
-
-fn expand_tilde(dir: &Path) -> PathBuf {
-    let raw = dir.to_string_lossy();
-    let Some(rest) = raw.strip_prefix("~/") else {
-        return dir.to_path_buf();
-    };
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(rest),
-        None => dir.to_path_buf(),
-    }
-}
-
 /// Create `dir` when missing and return its canonical path.
 ///
 /// microsandbox refuses to follow symlinks when resolving a bind-mount host
@@ -252,33 +221,7 @@ mod tests {
         assert_eq!(parse_volume_name(""), None);
     }
 
-    // ---- A9: volume root, sizes and mount quotas -------------------------
-
-    #[test]
-    fn volume_root_prefers_the_override_and_defaults_to_mc2() {
-        assert_eq!(
-            volume_root(Some(Path::new("/tmp/mc2-vols"))),
-            PathBuf::from("/tmp/mc2-vols")
-        );
-        let default = volume_root(None);
-        assert!(
-            default.ends_with(Path::new(".mc2").join("volumes")),
-            "{default:?}"
-        );
-        assert_eq!(default_volume_root(), default);
-    }
-
-    #[test]
-    fn volume_root_expands_a_leading_tilde() {
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(
-                volume_root(Some(Path::new("~/mc2-vols"))),
-                PathBuf::from(home).join("mc2-vols")
-            );
-        }
-        // Anything else is used verbatim.
-        assert_eq!(volume_root(Some(Path::new("vols"))), PathBuf::from("vols"));
-    }
+    // ---- A9: volume sizes and mount quotas -------------------------------
 
     #[test]
     fn ensure_volume_dir_creates_and_canonicalizes() {
