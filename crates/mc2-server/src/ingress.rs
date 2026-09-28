@@ -7,8 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Build ingress routes for stacks that have at least one instance on `node_id`.
 ///
-/// Backend selection: lowest ordinal among instances of the target service on
-/// **this node** that are not Failed/Stopped (prefer Running).
+/// Backend selection is shared by every route kind — see [`select_backend`].
 pub fn build_ingress_routes_for_node(
     node_id: &str,
     stacks_yaml: &[(String, String)], // (stack_name, raw_yaml)
@@ -51,6 +50,91 @@ pub fn build_ingress_routes_for_node(
     out
 }
 
+/// The backend chosen for one route, together with the host port that route
+/// should point at.
+///
+/// The port is resolved from the *selected* instance's stored spec, so a route
+/// can never name one replica while pointing at another replica's port (B9).
+struct SelectedBackend<'a> {
+    instance: Option<&'a InstanceRecord>,
+    host_port: u16,
+}
+
+impl SelectedBackend<'_> {
+    fn instance_id(&self) -> String {
+        self.instance.map(|i| i.id.clone()).unwrap_or_default()
+    }
+
+    fn ordinal(&self) -> u32 {
+        self.instance.map(|i| i.ordinal).unwrap_or(0)
+    }
+}
+
+/// The one backend selector shared by hostname-sugar, HTTP and TCP routes (B9).
+///
+/// Preference order: a Running replica whose healthcheck has passed (only
+/// meaningful when the service declares one) → any Running replica → the
+/// lowest ordinal. `host_port` is the `published` port the selected instance's
+/// stored spec resolves `target` to, falling back to `fallback` (the raw YAML
+/// value, which is `0` for target-only / hostname-sugar ports).
+fn select_backend<'a>(
+    by_service: &HashMap<String, Vec<&'a InstanceRecord>>,
+    service: &str,
+    healthcheck: bool,
+    target: u16,
+    fallback: u16,
+) -> SelectedBackend<'a> {
+    // `list` is sorted by ordinal, so "lowest ordinal" is its first element.
+    let list: &[&InstanceRecord] = match by_service.get(service) {
+        Some(list) => list,
+        None => &[],
+    };
+    let chosen = list
+        .iter()
+        .copied()
+        .find(|i| i.phase == "Running" && (!healthcheck || i.healthy))
+        .or_else(|| list.iter().copied().find(|i| i.phase == "Running"))
+        .or_else(|| list.first().copied());
+
+    let host_port = chosen
+        .and_then(|i| published_port(&i.spec_json, target))
+        .filter(|p| *p != 0)
+        .unwrap_or(fallback);
+
+    SelectedBackend {
+        instance: chosen,
+        host_port,
+    }
+}
+
+/// The `published` host port an instance's stored spec resolves `target` to.
+fn published_port(spec_json: &str, target: u16) -> Option<u16> {
+    let spec: ServiceSpec = serde_json::from_str(spec_json).ok()?;
+    spec.ports
+        .iter()
+        .find(|p| p.target == target)
+        .map(|p| p.published)
+}
+
+/// Instances of `stack` bound to `node_id`, grouped by service and sorted by
+/// ordinal (the order [`select_backend`] relies on).
+fn instances_by_service<'a>(
+    stack: &str,
+    node_id: &str,
+    instances: &'a [InstanceRecord],
+) -> HashMap<String, Vec<&'a InstanceRecord>> {
+    let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
+    for i in instances {
+        if i.stack == stack && i.node_id.as_deref() == Some(node_id) {
+            by_service.entry(i.service.clone()).or_default().push(i);
+        }
+    }
+    for list in by_service.values_mut() {
+        list.sort_by_key(|i| i.ordinal);
+    }
+    by_service
+}
+
 /// `ports` entries with a `hostname` synthesize a TLS ingress route for that
 /// hostname → the service's target port (backed by the resolved host port).
 fn routes_from_port_hostnames(
@@ -59,38 +143,21 @@ fn routes_from_port_hostnames(
     node_id: &str,
     instances: &[InstanceRecord],
 ) -> Vec<DesiredIngressRoute> {
-    let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
-    for i in instances {
-        if i.stack != stack || i.node_id.as_deref() != Some(node_id) {
-            continue;
-        }
-        by_service.entry(i.service.clone()).or_default().push(i);
-    }
-    for list in by_service.values_mut() {
-        list.sort_by_key(|i| i.ordinal);
-    }
+    let by_service = instances_by_service(stack, node_id, instances);
 
     let mut routes = Vec::new();
     for (svc_name, svc) in services {
         for p in &svc.ports {
-            let Some(ref host) = p.hostname else {
+            let Some(host) = &p.hostname else {
                 continue;
             };
-            let backend = by_service.get(svc_name).and_then(|list| {
-                list.iter()
-                    .copied()
-                    .find(|i| i.phase == "Running")
-                    .or_else(|| {
-                        list.iter().copied().find(|i| {
-                            i.phase != "Failed" && i.phase != "Stopped" && i.phase != "Pending"
-                        })
-                    })
-                    .or_else(|| list.first().copied())
-            });
-            let (backend_instance_id, backend_ordinal) = match backend {
-                Some(b) => (b.id.clone(), b.ordinal),
-                None => (String::new(), 0),
-            };
+            let backend = select_backend(
+                &by_service,
+                svc_name,
+                svc.healthcheck.is_some(),
+                p.target,
+                p.published,
+            );
             routes.push(DesiredIngressRoute {
                 id: make_ingress_route_id(stack, host, "/", svc_name, p.target),
                 stack: stack.into(),
@@ -99,42 +166,18 @@ fn routes_from_port_hostnames(
                 path_type: "Prefix".into(),
                 service: svc_name.clone(),
                 guest_port: p.target,
-                host_port: resolved_host_port(&by_service, svc_name, p.target, p.published),
+                host_port: backend.host_port,
                 bind: "127.0.0.1".into(),
                 tls_enabled: true,
                 cert_resolver: "le".into(),
                 tcp: false,
                 entry_point: String::new(),
-                backend_instance_id,
-                backend_ordinal,
+                backend_instance_id: backend.instance_id(),
+                backend_ordinal: backend.ordinal(),
             });
         }
     }
     routes
-}
-
-/// The backend host port for a route. Prefers the resolved (auto-allocated)
-/// `published` from the instance's stored spec over the raw YAML value (which
-/// is `0` for target-only / hostname-sugar ports).
-fn resolved_host_port(
-    by_service: &HashMap<String, Vec<&InstanceRecord>>,
-    service: &str,
-    target: u16,
-    fallback: u16,
-) -> u16 {
-    by_service
-        .get(service)
-        .and_then(|list| {
-            list.iter().find_map(|i| {
-                let spec: ServiceSpec = serde_json::from_str(&i.spec_json).ok()?;
-                spec.ports
-                    .iter()
-                    .find(|p| p.target == target)
-                    .map(|p| p.published)
-            })
-        })
-        .filter(|p| *p != 0)
-        .unwrap_or(fallback)
 }
 
 fn routes_from_ingress(
@@ -147,16 +190,7 @@ fn routes_from_ingress(
     let tls_enabled = ing.tls.enabled;
     let cert_resolver = ing.tls.cert_resolver.clone().unwrap_or_default();
 
-    let mut by_service: HashMap<String, Vec<&InstanceRecord>> = HashMap::new();
-    for i in instances {
-        if i.stack != stack || i.node_id.as_deref() != Some(node_id) {
-            continue;
-        }
-        by_service.entry(i.service.clone()).or_default().push(i);
-    }
-    for list in by_service.values_mut() {
-        list.sort_by_key(|i| i.ordinal);
-    }
+    let by_service = instances_by_service(stack, node_id, instances);
 
     let mut routes = Vec::new();
     for rule in &ing.rules {
@@ -168,22 +202,13 @@ fn routes_from_ingress(
                 continue;
             };
 
-            let backend = by_service.get(&path.service).and_then(|list| {
-                list.iter()
-                    .copied()
-                    .find(|i| i.phase == "Running")
-                    .or_else(|| {
-                        list.iter().copied().find(|i| {
-                            i.phase != "Failed" && i.phase != "Stopped" && i.phase != "Pending"
-                        })
-                    })
-                    .or_else(|| list.first().copied())
-            });
-
-            let (backend_instance_id, backend_ordinal) = match backend {
-                Some(b) => (b.id.clone(), b.ordinal),
-                None => (String::new(), 0),
-            };
+            let backend = select_backend(
+                &by_service,
+                &path.service,
+                svc.healthcheck.is_some(),
+                path.port,
+                ps.published,
+            );
 
             let path_str = if path.path.trim().is_empty() {
                 "/".to_string()
@@ -199,14 +224,14 @@ fn routes_from_ingress(
                 path_type: path.path_type.clone(),
                 service: path.service.clone(),
                 guest_port: path.port,
-                host_port: resolved_host_port(&by_service, &path.service, path.port, ps.published),
+                host_port: backend.host_port,
                 bind: "127.0.0.1".into(),
                 tls_enabled,
                 cert_resolver: cert_resolver.clone(),
                 tcp: false,
                 entry_point: String::new(),
-                backend_instance_id,
-                backend_ordinal,
+                backend_instance_id: backend.instance_id(),
+                backend_ordinal: backend.ordinal(),
             });
         }
     }
@@ -217,20 +242,15 @@ fn routes_from_ingress(
         let Some(ssh) = svc.ssh.as_ref().filter(|ssh| ssh.enabled && ssh.port > 0) else {
             continue;
         };
-        let backend = by_service.get(&tcp.service).and_then(|list| {
-            list.iter()
-                .copied()
-                .find(|i| i.phase == "Running")
-                .or_else(|| {
-                    list.iter().copied().find(|i| {
-                        i.phase != "Failed" && i.phase != "Stopped" && i.phase != "Pending"
-                    })
-                })
-                .or_else(|| list.first().copied())
-        });
-        let (backend_instance_id, backend_ordinal) = backend
-            .map(|b| (b.id.clone(), b.ordinal))
-            .unwrap_or_default();
+        // TCP routes target the host-side SSH endpoint, so the port is the
+        // service's SSH port; only the instance choice comes from the selector.
+        let backend = select_backend(
+            &by_service,
+            &tcp.service,
+            svc.healthcheck.is_some(),
+            0,
+            ssh.port,
+        );
         routes.push(DesiredIngressRoute {
             id: format!("{stack}-tcp-{}-{}", tcp.name, tcp.service),
             stack: stack.into(),
@@ -245,8 +265,8 @@ fn routes_from_ingress(
             cert_resolver: String::new(),
             tcp: true,
             entry_point: tcp.entry_point.clone(),
-            backend_instance_id,
-            backend_ordinal,
+            backend_instance_id: backend.instance_id(),
+            backend_ordinal: backend.ordinal(),
         });
     }
     routes
@@ -527,7 +547,7 @@ services:
     }
 
     #[test]
-    fn resolved_host_port_prefers_instance_spec() {
+    fn select_backend_uses_the_selected_instances_port() {
         // Instance spec carries the auto-allocated `published`; the raw YAML
         // has `0` for target-only / hostname-sugar ports.
         let inst = InstanceRecord {
@@ -559,10 +579,143 @@ services:
         let by_service: HashMap<String, Vec<&InstanceRecord>> =
             HashMap::from([("web".into(), vec![&inst])]);
 
-        assert_eq!(resolved_host_port(&by_service, "web", 3001, 0), 10023);
+        let b = select_backend(&by_service, "web", false, 3001, 0);
+        assert_eq!(b.instance_id(), "demo-web-0");
+        assert_eq!(b.host_port, 10023);
         // No instance port for this target → falls back to the raw value.
-        assert_eq!(resolved_host_port(&by_service, "web", 3002, 0), 0);
-        // Missing service → fallback.
-        assert_eq!(resolved_host_port(&by_service, "other", 3001, 55), 55);
+        assert_eq!(
+            select_backend(&by_service, "web", false, 3002, 0).host_port,
+            0
+        );
+        // Missing service → fallback and no backend.
+        let b = select_backend(&by_service, "other", false, 3001, 55);
+        assert!(b.instance.is_none());
+        assert_eq!(b.host_port, 55);
+    }
+
+    /// Instance with a stored spec resolving each `(target, published)` pair.
+    fn web_instance(id: &str, ordinal: u32, phase: &str, ports: &[(u16, u16)]) -> InstanceRecord {
+        let spec = ServiceSpec {
+            ports: ports
+                .iter()
+                .map(|(target, published)| PortSpec {
+                    published: *published,
+                    target: *target,
+                    protocol: "tcp".into(),
+                    hostname: None,
+                })
+                .collect(),
+            ..bare_spec()
+        };
+        InstanceRecord {
+            id: id.into(),
+            stack: "demo".into(),
+            service: "web".into(),
+            ordinal,
+            node_id: Some("n1".into()),
+            phase: phase.into(),
+            runtime_id: None,
+            message: None,
+            spec_json: serde_json::to_string(&spec).unwrap(),
+            healthy: false,
+            applied_hash: None,
+            updated_at: String::new(),
+        }
+    }
+
+    /// B9: replica 0 Stopped on its own port, replica 1 Running on another.
+    /// Hostname-sugar, HTTP and TCP routes must all name replica 1 *and* point
+    /// at replica 1's port.
+    #[test]
+    fn failover_routes_all_kinds_to_the_running_replica() {
+        let mut svc = bare_spec();
+        svc.ports = vec![
+            PortSpec {
+                published: 8080,
+                target: 8000,
+                protocol: "tcp".into(),
+                hostname: None,
+            },
+            PortSpec {
+                published: 0,
+                target: 9000,
+                protocol: "tcp".into(),
+                hostname: Some("app.local".into()),
+            },
+        ];
+        svc.ssh = Some(mc2_api::SshSpec {
+            enabled: true,
+            bind: "127.0.0.1".into(),
+            port: 2222,
+            user: "root".into(),
+            sftp: true,
+            authorized_keys: vec![],
+        });
+        let services = BTreeMap::from([("web".to_string(), svc)]);
+
+        let ing = IngressSpec {
+            tls: IngressTlsSpec {
+                enabled: true,
+                cert_resolver: Some("le".into()),
+            },
+            rules: vec![IngressRule {
+                host: "demo.local".into(),
+                paths: vec![IngressPath {
+                    path: "/".into(),
+                    path_type: "Prefix".into(),
+                    service: "web".into(),
+                    port: 8000,
+                }],
+            }],
+            tcp: vec![mc2_api::stack::IngressTcpRoute {
+                name: "ssh".into(),
+                entry_point: "ssh".into(),
+                service: "web".into(),
+            }],
+        };
+
+        // Each replica's stored spec carries its own resolved ports.
+        let instances = vec![
+            web_instance("demo-web-0", 0, "Stopped", &[(8000, 8080), (9000, 18080)]),
+            web_instance("demo-web-1", 1, "Running", &[(8000, 8081), (9000, 18081)]),
+        ];
+
+        let http = routes_from_ingress("demo", &ing, &services, "n1", &instances);
+        let http_rule = http.iter().find(|r| !r.tcp).unwrap();
+        assert_eq!(http_rule.backend_instance_id, "demo-web-1");
+        assert_eq!(http_rule.host_port, 8081, "must use replica 1's port");
+
+        let tcp = http.iter().find(|r| r.tcp).unwrap();
+        assert_eq!(tcp.backend_instance_id, "demo-web-1");
+        assert_eq!(tcp.host_port, 2222, "TCP routes publish the SSH port");
+
+        let sugar = routes_from_port_hostnames("demo", &services, "n1", &instances);
+        assert_eq!(sugar.len(), 1);
+        assert_eq!(sugar[0].host, "app.local");
+        assert_eq!(sugar[0].backend_instance_id, "demo-web-1");
+        assert_eq!(sugar[0].host_port, 18081, "must use replica 1's sugar port");
+    }
+
+    /// B9: with a healthcheck declared, a healthy Running replica wins over an
+    /// unhealthy Running one even at a higher ordinal.
+    #[test]
+    fn selector_prefers_healthy_replica_when_service_has_a_healthcheck() {
+        let mut healthy = web_instance("demo-web-1", 1, "Running", &[(8000, 8081)]);
+        healthy.healthy = true;
+        let instances = vec![
+            web_instance("demo-web-0", 0, "Running", &[(8000, 8080)]),
+            healthy,
+        ];
+        let by_service = instances_by_service("demo", "n1", &instances);
+
+        assert_eq!(
+            select_backend(&by_service, "web", true, 8000, 0).instance_id(),
+            "demo-web-1"
+        );
+        // Without a healthcheck the field is meaningless → lowest ordinal.
+        assert_eq!(
+            select_backend(&by_service, "web", false, 8000, 0).instance_id(),
+            "demo-web-0"
+        );
     }
 }

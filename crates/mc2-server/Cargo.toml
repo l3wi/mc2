@@ -18,6 +18,9 @@ sha2 = "0.10"
 hex = "0.4"
 clap = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "io-util"] }
+# Cooperative shutdown signal (`CancellationToken`) for the node loop and the
+# splice / SSH / REST listeners (D2).
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { workspace = true }
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"

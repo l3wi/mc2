@@ -52,8 +52,13 @@ reports healthy, `web` converges to `Running`.
 - **List form** (`depends_on: [db]`) means `condition: service_started`.
 - **`service_healthy`** requires the dependency to declare a non-disabled
   healthcheck.
-- **Ordering only at startup.** If the DB dies later, `web` is *not* torn
-  down (Compose semantics).
+- **Ordering only at startup.** The gate holds back a dependent's *first*
+  start (and a recreate for a changed config). Once `web` is `Running`, a
+  dependency going unhealthy never re-gates it: it is not reported `Pending`,
+  it stays in routing, and its health/ssh/crash handling keeps running.
+- **A dependency is live if any replica is.** At `scale > 1` one `Running`
+  replica — healthy, for `service_healthy` — is enough for dependents to start,
+  whatever the other replicas are doing.
 - **Cycles are rejected** at parse time; references must stay in-stack.
 
 ## Healthcheck keys
@@ -68,7 +73,7 @@ own, so a hung probe never blocks reconcile.
 ## Per-replica ports
 
 With `scale: 3` and `8080:8000`, replicas get **`8080, 8081, 8082`** —
-distinct host ports per replica, ingress targeting replica 0. Check:
+distinct host ports per replica, ingress following the running one. Check:
 
 ```bash
 curl -s http://127.0.0.1:8080/

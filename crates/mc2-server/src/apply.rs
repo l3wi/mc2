@@ -1692,6 +1692,72 @@ async fn refuses_apply_over_node_memory_capacity() {
     assert!(err.to_string().contains("memory"), "{err}");
 }
 
+/// B12: a Failed but still-desired instance whose restart policy will bring it
+/// back keeps its reservation, so a second apply that needs that capacity is
+/// rejected; `restart: no` releases it and the apply succeeds.
+#[cfg(test)]
+async fn apply_onto_a_full_node_with_a_failed_instance(
+    restart: &str,
+) -> Result<ApplyResult, ApplyError> {
+    let store = mc2_store::MemoryStore::new();
+    store.init_cluster("").await.unwrap();
+    store
+        .upsert_local_node(mc2_store::NodeJoin {
+            name: "n1".into(),
+            labels_json: "{}".into(),
+            arch: "aarch64".into(),
+            cpus: 2,
+            memory_mib: 8192,
+        })
+        .await
+        .unwrap();
+    let cfg = cfg_default();
+
+    let app = format!(
+        "name: app\nservices:\n  web:\n    image: alpine\n    cpus: 2\n    restart: {restart}\n"
+    );
+    apply_stack_yaml(store.clone(), &cfg, &app)
+        .await
+        .expect("2 CPUs fit a 2-CPU node");
+
+    let failed = store
+        .list_instances()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.stack == "app")
+        .expect("app instance");
+    assert!(
+        failed.node_id.is_some(),
+        "apply must bind the instance, or it would not reserve capacity"
+    );
+    store
+        .update_instance_status(&failed.id, "Failed", None, None)
+        .await
+        .unwrap();
+
+    // A different stack now wants the node's only spare capacity.
+    let other = "name: other\nservices:\n  w:\n    image: alpine\n";
+    apply_stack_yaml(store, &cfg, other).await
+}
+
+#[tokio::test]
+async fn failed_instance_keeps_capacity_while_it_will_restart() {
+    let err = apply_onto_a_full_node_with_a_failed_instance("always")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+
+    let err = apply_onto_a_full_node_with_a_failed_instance("on-failure")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Capacity(_)), "{err:?}");
+
+    apply_onto_a_full_node_with_a_failed_instance("no")
+        .await
+        .expect("restart: no releases the Failed instance's capacity");
+}
+
 /// C3: a 3-CPU stack on a 4-CPU node must re-apply unchanged, scale down at
 /// capacity, and leave the leftover capacity to *other* stacks only.
 #[tokio::test]

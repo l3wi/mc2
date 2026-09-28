@@ -23,6 +23,12 @@ pub(super) struct InFlightProbe {
 pub(super) struct InstanceRuntimeState {
     pub(super) spec_hash: Option<String>,
     pub(super) running_since: Option<Instant>,
+    /// True once this instance's VM has come up (Running/Creating) in this
+    /// process. `depends_on` is a startup-ordering gate (B11): it holds back a
+    /// sandbox that has never started, and never one that is already up — a
+    /// running instance keeps its health, ssh, network and crash handling when a
+    /// dependency later goes unhealthy.
+    pub(super) started: bool,
     pub(super) restart_count: u32,
     pub(super) next_restart_ok: Option<Instant>,
     pub(super) last_health: Option<Instant>,
@@ -75,10 +81,71 @@ impl PassErrors {
 }
 
 /// Aggregate liveness of one service within a stack, used to gate `depends_on`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ServiceLive {
     pub(super) running: bool,
     pub(super) healthy: bool,
+}
+
+/// One instance's liveness observation for a pass (B11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InstanceLive {
+    pub(super) stack: String,
+    pub(super) service: String,
+    pub(super) running: bool,
+    /// Only a running instance can be healthy.
+    pub(super) healthy: bool,
+}
+
+/// Per-instance liveness observations with one explicit reduction per service
+/// (B11).
+///
+/// The store-seeded observations and the current pass both go through
+/// [`InstanceLiveness::observe`], so a service's liveness is the same reduction of the
+/// same shape of data either way, and the outcome cannot depend on the order
+/// instances happen to be reconciled in: the last replica processed must never
+/// decide for the whole service.
+#[derive(Debug, Default)]
+pub(super) struct InstanceLiveness {
+    /// Keyed by instance id: a later observation of the same instance replaces
+    /// the earlier one (the current pass overrides the store seed).
+    instances: HashMap<String, InstanceLive>,
+}
+
+impl InstanceLiveness {
+    /// Record one instance's observed phase and health.
+    pub(super) fn observe(
+        &mut self,
+        instance_id: &str,
+        stack: &str,
+        service: &str,
+        phase: &str,
+        healthy: bool,
+    ) {
+        let running = phase == mc2_store::InstancePhase::Running.as_str();
+        self.instances.insert(
+            instance_id.to_string(),
+            InstanceLive {
+                stack: stack.to_string(),
+                service: service.to_string(),
+                running,
+                healthy: running && healthy,
+            },
+        );
+    }
+
+    /// Reduce one service's observations: **started** if any replica is
+    /// Running, **healthy** if any running replica is healthy.
+    pub(super) fn service(&self, stack: &str, service: &str) -> ServiceLive {
+        let mut live = ServiceLive::default();
+        for o in self.instances.values() {
+            if o.stack == stack && o.service == service {
+                live.running |= o.running;
+                live.healthy |= o.healthy;
+            }
+        }
+        live
+    }
 }
 
 /// Mutable per-node state threaded through each reconcile pass.

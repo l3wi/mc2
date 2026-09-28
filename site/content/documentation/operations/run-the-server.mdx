@@ -107,7 +107,10 @@ the reserved CPU/RAM budget or the disk limit, or that exceeds the host's
 detected capacity — so an unplaceable stack is rejected up front instead of
 sitting `Pending`. `mc2 status` and `/v1/status` report host capacity,
 configured limits, reserved CPU/RAM from instance specs, and measured disk
-usage.
+usage. A `Failed`/`Stopped` instance keeps reserving its CPU/RAM as long as
+its `restart` policy will bring it back (`always` / `on-failure`); only
+`restart: no` releases the capacity, so a full node can never accept an apply
+it could not run.
 
 ## The node
 
@@ -133,7 +136,12 @@ succeeded (a transient failure is retried on the next pass).
 - **OTLP metrics:** set `MC2_OTLP_ENDPOINT` before boot; the server exports
   `mc2.server.*` / `mc2.node.*`. Sandbox metrics stay on the msb-metrics
   sidecar. See [Observability](/documentation/concepts/observability).
-- **Health:** `mc2 status` and `GET /v1/status`.
+- **Health:** `mc2 status` and `GET /v1/status`. The unauthenticated
+  `GET /health` is the readiness probe: it answers `200` only while the node
+  loop is live and a reconcile pass completed within
+  `3 × --reconcile-interval-secs + 30 s`; once the loop has stopped or gone
+  quiet it returns `503` with a reason, so a service manager or load balancer
+  can act on an orchestrator that is up but no longer converging.
 
 ## Day-2 notes
 
@@ -141,6 +149,15 @@ succeeded (a transient failure is retried on the next pass).
 - **Restart-safe.** Reconcile is idempotent; restarting the server adopts the
   sandboxes it already owns (by install label) and converges again without
   operator action.
+- **Supervised, bounded shutdown.** The node loop and the REST listener are
+  supervised: if either ends or panics the server logs the cause and exits
+  non-zero, so a service manager restarts it instead of leaving a half-dead
+  process. On `SIGINT`/`SIGTERM` the server stops accepting, cancels the node
+  loop and its SSH/splice listeners, drains in-flight REST for up to 5 s, then
+  aborts whatever is left — shutdown finishes within 10 s even with a
+  `logs --follow` stream open or a runtime call wedged. The metrics exporter is
+  non-critical and is restarted with backoff. Running microVMs are **left
+  alone**: they are detached, and adoption on restart picks them up.
 - **Volumes live under `--volume-dir`** by default inside the data dir; move
   them explicitly if your durable state must live elsewhere.
 

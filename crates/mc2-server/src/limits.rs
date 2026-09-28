@@ -30,6 +30,12 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// server stops waiting for them.
 pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Hard ceiling on the whole shutdown sequence (D2). Must exceed
+/// [`SHUTDOWN_DRAIN_TIMEOUT`]: the REST drain runs inside it, and whatever has
+/// not stopped by then is aborted so a wedged runtime call or an open
+/// `logs --follow` stream can never hang the process.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Comment keepalive interval for the `logs?follow=true` SSE stream, so an
 /// idle-follow client (or a proxy) can tell the stream is still alive.
 pub const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);

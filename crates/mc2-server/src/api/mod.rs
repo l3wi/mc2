@@ -158,6 +158,7 @@ mod tests {
 
     use crate::api::router;
     use crate::api::testing::{test_state, test_state_open};
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn apply_network_validation_returns_400() {
@@ -453,18 +454,17 @@ services:
     }
 
     /// Serve the full router on an ephemeral loopback port.
-    async fn serve_app(
-        state: AppState,
-    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    async fn serve_app(state: AppState) -> (std::net::SocketAddr, CancellationToken) {
         let http_limits = state.http_limits;
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let cancel_serve = cancel.clone();
         tokio::spawn(async move {
-            let _ = crate::http_serve::serve(listener, app, http_limits, rx).await;
+            let _ = crate::http_serve::serve(listener, app, http_limits, cancel_serve).await;
         });
-        (addr, tx)
+        (addr, cancel)
     }
 
     /// A10: the request deadline wraps the ordinary group, never the
@@ -521,7 +521,7 @@ services:
 
         let mut state = test_state_open(MemoryStore::new());
         state.http_limits.request_timeout = Duration::from_millis(200);
-        let (addr, _shutdown) = serve_app(state).await;
+        let (addr, _cancel) = serve_app(state).await;
 
         let mut ordinary = TcpStream::connect(addr).await.unwrap();
         ordinary
@@ -578,7 +578,7 @@ pub(crate) mod testing {
         async fn ensure_running(
             &self,
             _d: &mc2_runtime::DesiredSandbox,
-        ) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
             unreachable!("not exercised")
         }
         async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
@@ -629,6 +629,9 @@ pub(crate) mod testing {
             // Hermetic: no real host-port probing in REST tests.
             port_probe: |_p| Ok(()),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            liveness: Arc::new(crate::Liveness::with_stale_after(
+                std::time::Duration::from_secs(30),
+            )),
         };
         state.runtime = Arc::new(MockRuntime::default());
         state

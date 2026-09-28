@@ -4,6 +4,27 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Runtime correctness (Wave 5)
+
+- **Ingress follows the live replica.** One selector picks a Running
+  (healthy-first) or lowest-ordinal replica and uses *that* replica's host
+  port for hostname, HTTP and TCP routes. The catalog is rewritten only when
+  routes change.
+- **Capacity for restartable instances.** Failed/Stopped instances that will
+  restart keep their CPU/RAM reserved; only `restart: no` releases it.
+- **Crash loops back off.** Restarts microsandbox performs itself are reported
+  to the controller and spaced by the restart backoff.
+- **`depends_on` gates startup only.** A running dependent stays Running and
+  routed when its dependency later degrades; service liveness is "any replica
+  running / healthy", independent of processing order.
+- **Supervised server.** The reconcile loop and REST listener are supervised:
+  if one dies the process exits non-zero. `/health` returns 503 with a reason
+  when the loop is dead or stale (> 3 × reconcile interval + 30 s). Metrics are
+  restarted with backoff.
+- **Bounded shutdown.** One cancellation token stops the reconcile loop, splice
+  and SSH listeners and REST; shutdown is capped at 10 s even with open log
+  streams. VMs keep running and are adopted on the next start.
+
 ### VM lifecycle & atomic apply (Wave 4 — breaking, pre-release)
 
 - **`mc2 up` is all-or-nothing.** Apply plans the whole stack (validation,

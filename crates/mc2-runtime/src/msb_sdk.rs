@@ -6,7 +6,10 @@
 use crate::networks::network_host_allow_ports;
 use crate::restart::{action_for_phase, RestartAction, RestartPolicy};
 use crate::spec::start_command_parts;
-use crate::{DesiredSandbox, DiskUsage, ExecResult, NodeRuntime, SandboxPhase, SandboxStatus};
+use crate::{
+    DesiredSandbox, DiskUsage, EnsureOutcome, EnsureRunning, ExecResult, NodeRuntime, SandboxPhase,
+    SandboxStatus,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use microsandbox::sandbox::SandboxStatus as MsbStatus;
@@ -283,40 +286,52 @@ async fn observe(name: &str) -> Result<Option<MsbStatus>> {
 
 #[async_trait]
 impl NodeRuntime for MicrosandboxRuntime {
-    async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus> {
+    async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<EnsureRunning> {
         ensure_local_backend().await?;
         let name = desired.runtime_id.as_str();
 
         let policy = RestartPolicy::parse(&desired.spec.restart);
 
-        match observe(name).await? {
+        // B10: every restart this backend performs (starting a Stopped sandbox,
+        // recreating a Crashed one) is reported as `Restarted` so the
+        // controller counts it against the restart-policy backoff.
+        let outcome = match observe(name).await? {
             Some(st) => {
                 let phase = map_status(st);
                 match phase {
                     SandboxPhase::Running => {
-                        return Ok(SandboxStatus {
-                            runtime_id: name.into(),
-                            phase,
-                            message: Some("microsandbox sdk (local)".into()),
+                        return Ok(EnsureRunning {
+                            status: SandboxStatus {
+                                runtime_id: name.into(),
+                                phase,
+                                message: Some("microsandbox sdk (local)".into()),
+                            },
+                            outcome: EnsureOutcome::AlreadyRunning,
                         });
                     }
                     SandboxPhase::Creating => {
-                        return Ok(SandboxStatus {
-                            runtime_id: name.into(),
-                            phase,
-                            message: Some("starting".into()),
+                        return Ok(EnsureRunning {
+                            status: SandboxStatus {
+                                runtime_id: name.into(),
+                                phase,
+                                message: Some("starting".into()),
+                            },
+                            outcome: EnsureOutcome::AlreadyRunning,
                         });
                     }
                     other => match action_for_phase(policy, other) {
                         RestartAction::Leave => {
-                            return Ok(SandboxStatus {
-                                runtime_id: name.into(),
-                                phase: other,
-                                message: Some(format!(
-                                    "left {} (restart={})",
-                                    other.as_str(),
-                                    desired.spec.restart
-                                )),
+                            return Ok(EnsureRunning {
+                                status: SandboxStatus {
+                                    runtime_id: name.into(),
+                                    phase: other,
+                                    message: Some(format!(
+                                        "left {} (restart={})",
+                                        other.as_str(),
+                                        desired.spec.restart
+                                    )),
+                                },
+                                outcome: EnsureOutcome::Left,
                             });
                         }
                         RestartAction::Recreate => {
@@ -324,6 +339,7 @@ impl NodeRuntime for MicrosandboxRuntime {
                             let _ = Sandbox::remove(name).await;
                             create_detached(desired, self.volume_dir.as_deref(), &self.install_id)
                                 .await?;
+                            EnsureOutcome::Restarted
                         }
                         RestartAction::Start => {
                             info!(%name, ?other, "starting existing sandbox (detached)");
@@ -331,10 +347,13 @@ impl NodeRuntime for MicrosandboxRuntime {
                                 Ok(_) => {}
                                 Err(e) => {
                                     if policy == RestartPolicy::Never {
-                                        return Ok(SandboxStatus {
-                                            runtime_id: name.into(),
-                                            phase: other,
-                                            message: Some(format!("start failed: {e:#}")),
+                                        return Ok(EnsureRunning {
+                                            status: SandboxStatus {
+                                                runtime_id: name.into(),
+                                                phase: other,
+                                                message: Some(format!("start failed: {e:#}")),
+                                            },
+                                            outcome: EnsureOutcome::Left,
                                         });
                                     }
                                     warn!(%name, error = %e, "start_detached failed; recreating");
@@ -347,24 +366,29 @@ impl NodeRuntime for MicrosandboxRuntime {
                                     .await?;
                                 }
                             }
+                            EnsureOutcome::Restarted
                         }
                     },
                 }
             }
             None => {
                 create_detached(desired, self.volume_dir.as_deref(), &self.install_id).await?;
+                EnsureOutcome::Created
             }
-        }
+        };
 
         let phase = match observe(name).await? {
             Some(st) => map_status(st),
             None => SandboxPhase::Creating,
         };
 
-        Ok(SandboxStatus {
-            runtime_id: name.into(),
-            phase,
-            message: Some("microsandbox sdk (local)".into()),
+        Ok(EnsureRunning {
+            status: SandboxStatus {
+                runtime_id: name.into(),
+                phase,
+                message: Some("microsandbox sdk (local)".into()),
+            },
+            outcome,
         })
     }
 

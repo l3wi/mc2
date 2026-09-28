@@ -20,12 +20,15 @@ Instances move through a simple phase model, visible in `mc2 ps`:
 
 | Phase | Meaning |
 | --- | --- |
-| `Pending` | Scheduled but not yet running (e.g. waiting on `depends_on`). |
+| `Pending` | Scheduled but not yet running — a first start waiting on `depends_on`. |
 | `Running` | Sandbox booted; service command running. |
 | `Failed` | Could not start or stay healthy; a reason is shown. |
 
 With a `restart` policy, a failed or stopped instance is removed and
-recreated instead of being left `Failed`.
+recreated instead of being left `Failed`. Repeated restarts are spaced by a
+backoff (`2s`, `5s`, `15s`, then `30s`), reset after `60s` of continuous
+`Running` — including restarts the runtime performs on a crashed sandbox
+itself.
 
 ## Service keys
 
@@ -35,7 +38,10 @@ recreated instead of being left `Failed`.
   target-only ports get distinct auto-allocated ports. Allocations are stable
   across re-applies.
 - **`restart`** — `no` | `on-failure` | `always` | `unless-stopped`. Drives
-  node restart/recreate on failure.
+  node restart/recreate on failure. Every restart attempt is spaced by the
+  backoff schedule (`2s`, `5s`, `15s`, then `30s`), and the counter resets after
+  `60s` of continuous `Running`, so a crash loop cannot restart on every
+  reconcile pass.
 - **`command`** — guest argv as a list or a shell-split string. Omitted
   defaults to `sleep infinity` so a shell-less image stays alive.
 - **`cpus` / `mem_limit`** — vCPU count (float) and guest memory
@@ -80,13 +86,19 @@ services:
   parse time.
 - While waiting, the dependent reports `Pending` with a message like
   `depends_on: waiting for db (service_healthy)`.
+- A dependency counts as live when **any** of its replicas is running
+  (healthy, for `service_healthy`) — one `Failed` replica does not hide a
+  healthy one.
 
 ## Key behaviors
 
-- **Ordering at startup only.** If a dependency later dies, the dependent is
-  not torn down (Compose semantics).
+- **Ordering at startup only.** The gate holds back a dependent's *first*
+  start (and a recreate for a changed config). Once it is `Running`, a
+  dependency going unhealthy does not tear it down, re-gate it or drop it from
+  routing (Compose semantics).
 - **`restart` is the resilience knob.** Without it, failures surface as
-  `Failed`; with it, MC2 re-creates the sandbox.
+  `Failed`; with it, MC2 re-creates the sandbox, spacing repeated restarts by
+  the backoff schedule.
 - **Health drives convergence.** A passing probe sets an instance healthy,
   which unlocks `service_healthy` dependents.
 

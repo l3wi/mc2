@@ -113,10 +113,18 @@ impl IngressFileWriter {
         pending.sort_by(|a, b| a.id.cmp(&b.id));
 
         let traefik = render_traefik_dynamic(&ready);
-        let generated_at = iso_now();
-        let catalog = render_catalog_json(&self.node_name, &generated_at, &ready, &pending);
-
-        let fingerprint = format!("{:x}", simple_hash(&format!("{traefik}\n---\n{catalog}")));
+        // Fingerprint only the stable, already-sorted route data: the rendered
+        // Traefik config (covers `ready`) plus the pending route list. The
+        // catalog's `generatedAt` timestamp is produced when — and only when —
+        // we actually write, so an unchanged plan stops rewriting Traefik's
+        // files every pass (B9).
+        let fingerprint = format!(
+            "{:x}",
+            simple_hash(&format!(
+                "{traefik}\n---\n{}",
+                serde_json::to_string(&pending).unwrap_or_default()
+            ))
+        );
 
         if self.last_fingerprint.as_ref() == Some(&fingerprint) {
             return Ok(IngressRenderStatus {
@@ -129,6 +137,8 @@ impl IngressFileWriter {
         std::fs::create_dir_all(self.dir.join("traefik"))
             .with_context(|| format!("mkdir {}", self.dir.join("traefik").display()))?;
 
+        let generated_at = iso_now();
+        let catalog = render_catalog_json(&self.node_name, &generated_at, &ready, &pending);
         atomic_write(&self.dir.join("catalog.json"), catalog.as_bytes())?;
         atomic_write(
             &self.dir.join("traefik").join("dynamic.yml"),
@@ -376,6 +386,8 @@ mod tests {
         assert_eq!(v["routes"].as_array().unwrap().len(), 0);
     }
 
+    /// B9: an unchanged plan must not rewrite the catalog. The fingerprint
+    /// covers stable route data only, so this is deterministic (no sleeps).
     #[tokio::test]
     async fn fingerprint_skips_rewrite_when_unchanged() {
         let dir = tempfile::tempdir().unwrap();
@@ -391,6 +403,8 @@ mod tests {
         let st2 = writer.reconcile(&routes, &phases, None).await.unwrap();
         assert!(!st2.wrote);
         assert_eq!(st2.ready, 1);
+        let st3 = writer.reconcile(&routes, &phases, None).await.unwrap();
+        assert!(!st3.wrote, "still no rewrite on a later pass");
     }
 
     #[tokio::test]

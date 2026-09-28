@@ -144,10 +144,17 @@ pub(crate) async fn status_cmd(args: StatusArgs, conn: &Conn) -> Result<()> {
         .await
         .with_context(|| format!("GET {base}/health"))?;
     if !health.status().is_success() {
-        bail!(
-            "status failed: {}: server unreachable at {base}",
-            health.status()
-        );
+        // `/health` is a readiness probe: a reachable server whose node loop
+        // has stopped or gone stale answers `503` with a reason.
+        let status = health.status();
+        let body = health.text().await.unwrap_or_default();
+        let reason = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned));
+        match reason {
+            Some(reason) => bail!("status failed: {status}: {reason}"),
+            None => bail!("status failed: {status}: server unreachable at {base}"),
+        }
     }
     let res = operator_get(&client, &format!("{base}/v1/status"), conn.token.as_deref())
         .send()

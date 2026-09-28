@@ -22,9 +22,10 @@ use std::task::{ready, Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Bytes each side must exchange before the handshake deadline is disarmed.
@@ -51,7 +52,9 @@ struct ActiveServe {
     config_hash: String,
     bind: String,
     port: u16,
-    shutdown: Option<oneshot::Sender<()>>,
+    /// Per-listener shutdown (a child of the process token): cancelling it
+    /// stops the accept loop.
+    shutdown: CancellationToken,
     join: JoinHandle<()>,
 }
 
@@ -61,6 +64,9 @@ pub struct SshServeTable {
     limits: SshLimits,
     /// Global session cap, shared by every listener in this process.
     sessions: Arc<Semaphore>,
+    /// Process shutdown token: every listener's accept loop selects on a child
+    /// of it so `run()`'s cancel stops accepting immediately (D2).
+    cancel: CancellationToken,
 }
 
 impl SshServeTable {
@@ -71,7 +77,13 @@ impl SshServeTable {
             active: HashMap::new(),
             limits,
             sessions: Arc::new(Semaphore::new(limits.max_sessions.max(1))),
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Install the process shutdown token. Called once, before the first pass.
+    pub fn set_cancel(&mut self, cancel: CancellationToken) {
+        self.cancel = cancel;
     }
 
     pub async fn reconcile(
@@ -112,7 +124,8 @@ impl SshServeTable {
         }
 
         let limits = self.limits;
-        match start_serve_sdk(desired, limits, Arc::clone(&self.sessions)).await {
+        let listener_cancel = self.cancel.child_token();
+        match start_serve_sdk(desired, limits, Arc::clone(&self.sessions), listener_cancel).await {
             Ok(active) => {
                 let obs = SshObserved {
                     phase: SshPhase::Open.as_str().into(),
@@ -143,12 +156,18 @@ impl SshServeTable {
     }
 
     pub async fn close(&mut self, instance_id: &str) {
-        if let Some(mut active) = self.active.remove(instance_id) {
-            if let Some(tx) = active.shutdown.take() {
-                let _ = tx.send(());
-            }
+        if let Some(active) = self.active.remove(instance_id) {
+            active.shutdown.cancel();
             active.join.abort();
             debug!(instance = %instance_id, "ssh serve closed");
+        }
+    }
+
+    /// Stop every listener. Called as the node loop exits (D2).
+    pub async fn close_all(&mut self) {
+        let ids: Vec<String> = self.active.keys().cloned().collect();
+        for id in ids {
+            self.close(&id).await;
         }
     }
 
@@ -292,12 +311,14 @@ fn set_tcp_keepalive(stream: &TcpStream) {
 ///
 /// `serve_connection` runs a single accepted connection. It is called only
 /// while both session caps have a free slot; beyond that the socket is closed.
+/// The loop stops accepting when `cancel` fires (per-listener close or process
+/// shutdown, D2).
 async fn ssh_accept_loop<F, Fut>(
     listener: TcpListener,
     caps: SessionCaps,
     limits: SshLimits,
     serve_connection: F,
-    mut shutdown: oneshot::Receiver<()>,
+    cancel: CancellationToken,
 ) where
     F: Fn(SshConnection) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -305,7 +326,7 @@ async fn ssh_accept_loop<F, Fut>(
     loop {
         let accepted = tokio::select! {
             biased;
-            _ = &mut shutdown => break,
+            _ = cancel.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -335,6 +356,7 @@ async fn start_serve_sdk(
     desired: &DesiredSandbox,
     limits: SshLimits,
     sessions: Arc<Semaphore>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<ActiveServe> {
     let bind_ip: std::net::IpAddr = desired
         .ssh
@@ -375,7 +397,6 @@ async fn start_serve_sdk(
         .map_err(|e| anyhow::anyhow!("ssh server_with: {e}"))?;
 
     let caps = SessionCaps::new(sessions, limits.max_sessions_per_listener);
-    let (tx, rx) = oneshot::channel::<()>();
     let server = Arc::new(server);
     let join = tokio::spawn(ssh_accept_loop(
         listener,
@@ -389,14 +410,14 @@ async fn start_serve_sdk(
                 }
             }
         },
-        rx,
+        cancel.clone(),
     ));
 
     Ok(ActiveServe {
         config_hash: desired.ssh.config_hash.clone(),
         bind,
         port,
-        shutdown: Some(tx),
+        shutdown: cancel,
         join,
     })
 }
@@ -406,12 +427,12 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Start the accept loop on an ephemeral loopback port. Hold the returned
-    /// sender for the whole test: dropping it stops the accept loop.
+    /// Start the accept loop on an ephemeral loopback port. Cancelling the
+    /// returned token stops the accept loop (and closes the listener).
     async fn start_loop<F, Fut>(
         limits: SshLimits,
         serve_connection: F,
-    ) -> (SocketAddr, oneshot::Sender<()>)
+    ) -> (SocketAddr, CancellationToken)
     where
         F: Fn(SshConnection) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -422,15 +443,34 @@ mod tests {
             Arc::new(Semaphore::new(limits.max_sessions.max(1))),
             limits.max_sessions_per_listener,
         );
-        let (tx, rx) = oneshot::channel::<()>();
+        let cancel = CancellationToken::new();
         tokio::spawn(ssh_accept_loop(
             listener,
             caps,
             limits,
             serve_connection,
-            rx,
+            cancel.clone(),
         ));
-        (addr, tx)
+        (addr, cancel)
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_accepting() {
+        let (addr, cancel) = start_loop(limits(Duration::from_secs(5)), drain_forever).await;
+        // Accepted while live.
+        let _live = TcpStream::connect(addr).await.unwrap();
+        cancel.cancel();
+        // Once the loop returns its listener is dropped and connections are
+        // refused.
+        let mut refused = false;
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refused, "the listener must stop accepting after cancel");
     }
 
     fn limits(handshake_timeout: Duration) -> SshLimits {
@@ -454,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_deadline_closes_a_silent_client() {
-        let (addr, _shutdown) = start_loop(limits(Duration::from_millis(200)), drain_forever).await;
+        let (addr, _cancel) = start_loop(limits(Duration::from_millis(200)), drain_forever).await;
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 16];
@@ -467,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_deadline_is_disarmed_once_the_key_exchange_starts() {
-        let (addr, _shutdown) =
+        let (addr, _cancel) =
             start_loop(limits(Duration::from_millis(200)), |mut conn| async move {
                 let mut buf = [0u8; 256];
                 let mut read = 0usize;
@@ -512,7 +552,7 @@ mod tests {
             max_sessions: 1,
             max_sessions_per_listener: 1,
         };
-        let (addr, _shutdown) = start_loop(limits, drain_forever).await;
+        let (addr, _cancel) = start_loop(limits, drain_forever).await;
 
         // The first connection holds the only session slot.
         let mut first = TcpStream::connect(addr).await.unwrap();

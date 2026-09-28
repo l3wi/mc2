@@ -84,6 +84,13 @@ services:
   parse time.
 - `service_healthy` requires the dependency to declare a **non-disabled**
   healthcheck.
+- The gate holds back a dependent's **first start** (and a recreate for a
+  changed config). Once the dependent is `Running` it is never re-gated: a
+  dependency going unhealthy does not stop it, take it out of routing or pause
+  its health, ssh, ingress and crash handling.
+- With `scale > 1` a dependency counts as live when **any** replica is running
+  (healthy, for `service_healthy`); one `Failed` replica does not hide a healthy
+  one, whichever is reconciled last.
 
 <Callout type="warning" title="Startup only">
   Ordering applies only at startup, not teardown. Dependencies are not stopped

@@ -30,6 +30,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Consecutive accept failures before a splice task gives up; the next pass
@@ -61,6 +62,9 @@ pub struct NetworkTable {
     backends: BackendRegistry,
     /// Round-robin cursor across the table.
     rr_counter: Arc<AtomicUsize>,
+    /// Process shutdown token: every splice listener selects on it so a cancel
+    /// stops accepting immediately (D2).
+    cancel: CancellationToken,
 }
 
 impl NetworkTable {
@@ -73,6 +77,21 @@ impl NetworkTable {
             failed_splices: HashMap::new(),
             backends: Arc::new(Mutex::new(HashMap::new())),
             rr_counter: Arc::new(AtomicUsize::new(0)),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Install the process shutdown token. Called once, before the first pass,
+    /// so held splice listeners stop accepting when `run()` cancels (D2).
+    pub fn set_cancel(&mut self, cancel: CancellationToken) {
+        self.cancel = cancel;
+    }
+
+    /// Abort every held splice listener. Called as the node loop exits.
+    pub fn shutdown(&mut self) {
+        for (port, handle) in self.splices.drain() {
+            handle.abort();
+            debug!(port, "network splice stopped (shutdown)");
         }
     }
 
@@ -185,7 +204,13 @@ impl NetworkTable {
                 Ok(listener) => {
                     let backends = self.backends.clone();
                     let counter = self.rr_counter.clone();
-                    let handle = tokio::spawn(splice_loop(listener, port, backends, counter));
+                    let handle = tokio::spawn(splice_loop(
+                        listener,
+                        port,
+                        backends,
+                        counter,
+                        self.cancel.clone(),
+                    ));
                     self.splices.insert(port, handle);
                     self.failed_splices.remove(&port);
                     info!(port, "network shared splice listening");
@@ -474,15 +499,28 @@ impl NetworkTable {
 /// the connection is accepted and closed. A transient accept error is retried
 /// with backoff; after `MAX_ACCEPT_ERRORS` in a row the task ends so the next
 /// reconcile re-binds a fresh listener.
+///
+/// `cancel` is the process shutdown token: once it fires the listener stops
+/// accepting and the task returns (D2). Connections already accepted are not
+/// touched — the process exits shortly after.
 async fn splice_loop(
     listener: TcpListener,
     port: u16,
     backends: BackendRegistry,
     counter: Arc<AtomicUsize>,
+    cancel: CancellationToken,
 ) {
     let mut consecutive_errors = 0u32;
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!(port, "network splice stopping (shutdown)");
+                return;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((inbound, _)) => {
                 consecutive_errors = 0;
                 let backends = backends.clone();
@@ -664,6 +702,34 @@ mod tests {
             .update_backends(std::slice::from_ref(&d), &[report("i-db-0", "Creating")])
             .await;
         assert_eq!(read_from(guest_port).await.len(), 0);
+    }
+
+    /// D2: cancelling the process token stops a held splice listener from
+    /// accepting (real loopback socket).
+    #[tokio::test]
+    async fn cancel_stops_a_held_splice_listener() {
+        let cancel = CancellationToken::new();
+        let mut table = NetworkTable::new();
+        table.set_cancel(cancel.clone());
+        let guest_port = reserve_ephemeral().await.unwrap();
+        let d = desired("i-db-0", "db", guest_port, None);
+        table.ensure_listeners(std::slice::from_ref(&d)).await;
+        assert!(table.splices.contains_key(&guest_port));
+
+        // Accepted-and-closed while held (no Running backend).
+        assert!(read_from(guest_port).await.is_empty());
+
+        cancel.cancel();
+        // The listener is dropped; connections are refused.
+        let mut refused = false;
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", guest_port)).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refused, "the splice must stop accepting after cancel");
     }
 
     #[tokio::test]

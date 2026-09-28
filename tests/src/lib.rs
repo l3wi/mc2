@@ -91,6 +91,19 @@ impl TestCluster {
 
         let secrets_key = Arc::new(boot.secrets_key);
 
+        // The harness has no node loop; stamp successful passes so readiness
+        // (`/health`) stays green exactly as a live loop would.
+        let liveness = Arc::new(mc2_server::Liveness::for_interval(Duration::from_secs(10)));
+        let liveness_task = {
+            let liveness = liveness.clone();
+            tokio::spawn(async move {
+                loop {
+                    liveness.record_pass();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        };
+
         let state = AppState {
             store: store.clone() as Arc<dyn Store>,
             data_dir: data_dir.clone(),
@@ -106,6 +119,7 @@ impl TestCluster {
             // Hermetic: no real host-port probing in integration tests.
             port_probe: |_p| Ok(()),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            liveness,
         };
 
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -152,7 +166,7 @@ impl TestCluster {
             local_node_id,
             store,
             shutdown: Some(tx),
-            joins: vec![rest_join],
+            joins: vec![rest_join, liveness_task],
         };
 
         cluster.wait_healthy().await?;

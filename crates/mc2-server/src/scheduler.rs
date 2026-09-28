@@ -1,6 +1,7 @@
 //! Spread scheduler: filter Ready nodes, pin/selector, minimize co-location.
 
 use mc2_api::ServiceSpec;
+use mc2_runtime::RestartPolicy;
 use mc2_store::{InstancePhase, InstanceRecord, NodeRecord, NodeStatus};
 use std::collections::HashMap;
 
@@ -103,6 +104,9 @@ fn matches_selector(
 }
 
 /// Build residual capacity from nodes + currently bound instances.
+///
+/// A Failed/Stopped instance still keeps its reservation while its restart
+/// policy will bring it back; see [`still_holds_capacity`].
 pub fn residual_capacity(
     nodes: &[NodeRecord],
     instances: &[InstanceRecord],
@@ -113,13 +117,10 @@ pub fn residual_capacity(
         .collect();
 
     for inst in instances {
-        let Some(ref nid) = inst.node_id else {
+        let Some(nid) = &inst.node_id else {
             continue;
         };
-        if matches!(
-            InstancePhase::parse(&inst.phase),
-            InstancePhase::Failed | InstancePhase::Stopped
-        ) {
+        if !still_holds_capacity(inst) {
             continue;
         }
         let (need_cpu, need_mem) = resources_from_spec_json(&inst.spec_json);
@@ -129,6 +130,35 @@ pub fn residual_capacity(
         }
     }
     res
+}
+
+/// Whether a bound instance still holds its reserved CPU/memory.
+///
+/// A Failed/Stopped instance normally frees its reservation, but one whose
+/// restart policy will bring it back (`always` / `on-failure`) is recreated by
+/// the node — the same capacity is immediately needed again, so it must stay
+/// reserved or a full node would accept an apply it cannot actually run
+/// (B12). `restart: no` is the only policy that leaves a Failed/Stopped
+/// instance down for good, and only then is its capacity released.
+fn still_holds_capacity(inst: &InstanceRecord) -> bool {
+    if !matches!(
+        InstancePhase::parse(&inst.phase),
+        InstancePhase::Failed | InstancePhase::Stopped
+    ) {
+        return true;
+    }
+    restart_policy(&inst.spec_json) != RestartPolicy::Never
+}
+
+/// Restart policy recorded in an instance's stored service spec.
+///
+/// An unparseable spec defaults to `on-failure` (compose's own default), so a
+/// Failed/Stopped instance keeps its reservation rather than silently freeing
+/// capacity the node may need back.
+fn restart_policy(spec_json: &str) -> RestartPolicy {
+    serde_json::from_str::<ServiceSpec>(spec_json)
+        .map(|s| RestartPolicy::parse(&s.restart))
+        .unwrap_or(RestartPolicy::OnFailure)
 }
 
 /// vCPUs the sandbox runtime actually allocates for a declared `cpus`.
@@ -157,6 +187,9 @@ pub fn reserved_capacity(instances: &[InstanceRecord]) -> (u32, u64) {
 /// An apply replaces that stack's instances wholesale, so their current
 /// reservation must not be counted alongside the incoming document; pass the
 /// stack being applied. `None` counts every stack.
+///
+/// Failed/Stopped instances keep their reservation while a restart policy will
+/// bring them back — see [`still_holds_capacity`] (B12).
 pub fn reserved_capacity_excluding(
     instances: &[InstanceRecord],
     exclude: Option<&str>,
@@ -170,10 +203,7 @@ pub fn reserved_capacity_excluding(
         if inst.node_id.is_none() {
             continue;
         }
-        if matches!(
-            InstancePhase::parse(&inst.phase),
-            InstancePhase::Failed | InstancePhase::Stopped
-        ) {
+        if !still_holds_capacity(inst) {
             continue;
         }
         let (need_cpu, need_mem) = resources_from_spec_json(&inst.spec_json);
@@ -453,5 +483,53 @@ mod tests {
             reserved_capacity_excluding(&instances, Some("nope")),
             (5, 1024)
         );
+    }
+
+    /// B12: a Failed/Stopped instance that will be restarted still reserves its
+    /// CPU and memory; only `restart: no` releases them.
+    #[test]
+    fn failed_or_stopped_instance_holds_capacity_unless_restart_is_no() {
+        fn bound(phase: &str, restart: &str) -> InstanceRecord {
+            InstanceRecord {
+                id: "app-web-0".into(),
+                stack: "app".into(),
+                service: "web".into(),
+                ordinal: 0,
+                node_id: Some("n1".into()),
+                phase: phase.into(),
+                runtime_id: None,
+                message: None,
+                spec_json: format!(r#"{{"image":"x","cpus":2,"restart":"{restart}"}}"#),
+                healthy: false,
+                applied_hash: None,
+                updated_at: String::new(),
+            }
+        }
+        let nodes = vec![node("n1", "n1", "{}", 4)];
+
+        for phase in ["Failed", "Stopped"] {
+            // Anything that will restart the sandbox keeps its reservation.
+            for restart in ["always", "on-failure"] {
+                let inst = [bound(phase, restart)];
+                assert_eq!(
+                    reserved_capacity(&inst),
+                    (2, 512),
+                    "{phase}/{restart} must stay reserved"
+                );
+                assert_eq!(
+                    residual_capacity(&nodes, &inst).get("n1").copied(),
+                    Some((2, 7680)),
+                    "{phase}/{restart} must reduce residual capacity"
+                );
+            }
+            // `restart: no` never runs again → capacity is free.
+            let inst = [bound(phase, "no")];
+            assert_eq!(reserved_capacity(&inst), (0, 0), "{phase}/no is released");
+            assert_eq!(
+                residual_capacity(&nodes, &inst).get("n1").copied(),
+                Some((4, 8192)),
+                "{phase}/no must not reduce residual capacity"
+            );
+        }
     }
 }

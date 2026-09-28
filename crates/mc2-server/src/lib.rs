@@ -11,6 +11,7 @@ mod http_serve;
 mod ingress;
 mod ingress_files;
 mod limits;
+mod liveness;
 mod network_serve;
 mod networks;
 mod node;
@@ -29,15 +30,19 @@ pub use bootstrap::{
 };
 pub use desired::{build_desired_set, DesiredFailure, DesiredSet};
 pub use limits::HttpLimits;
+pub use liveness::Liveness;
 pub use secrets::{decrypt_secret, set_secret};
 
 use anyhow::{Context, Result};
 use mc2_store::{SecretsKey, SqliteStore, Store};
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 /// Arguments for `mc2 server` (the single-process orchestrator).
 #[derive(Debug, Clone, clap::Args)]
@@ -206,6 +211,8 @@ pub struct AppState {
     pub port_probe: apply::PortProbe,
     /// Serializes applies (and stack deletes) so `expose` port claims cannot race.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Node-loop readiness for the unauthenticated `/health` probe (D1).
+    pub liveness: Arc<Liveness>,
 }
 
 /// True when a bind spec (`host:port`, bare host, or `[ipv6]:port`) is loopback.
@@ -272,12 +279,22 @@ pub fn validate_public_endpoint_flags(
     Ok(())
 }
 
+/// How often the OTLP gauges are refreshed.
+const METRICS_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Periodically export status gauges (when OTLP is enabled).
-async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
+///
+/// Returns when `cancel` fires. Non-critical: [`supervise_metrics`] restarts it
+/// with backoff and a metrics failure never takes the orchestrator down (D1).
+async fn metrics_loop(store: Arc<dyn Store>, interval: Duration, cancel: CancellationToken) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {}
+        }
         let Ok(counts) = store.cluster_counts().await else {
             continue;
         };
@@ -296,6 +313,96 @@ async fn metrics_loop(store: Arc<dyn Store>, interval: Duration) {
             &phase_counts,
         );
     }
+}
+
+/// Keep the metrics loop running: if it ever stops or panics, restart it with
+/// exponential backoff (1 s → 60 s). Non-critical — readiness and the node loop
+/// are unaffected by a metrics outage.
+async fn supervise_metrics(store: Arc<dyn Store>, cancel: CancellationToken) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let mut task = tokio::spawn(metrics_loop(
+            store.clone(),
+            METRICS_INTERVAL,
+            cancel.clone(),
+        ));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                task.abort();
+                return;
+            }
+            res = &mut task => match res {
+                Ok(()) => warn!("metrics loop stopped"),
+                Err(e) => warn!(error = %e, "metrics loop failed"),
+            },
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+/// A supervised background task: its label and its result.
+type CriticalOutput = (&'static str, Result<()>);
+
+/// Wait for the shutdown signal or the first critical task to end.
+///
+/// * shutdown signal first → `Ok(())`, the caller runs the bounded drain;
+/// * a critical task ending first → `Err`, carrying the task's own error or the
+///   panic/cancel cause, so `run()` exits **non-zero** and a service manager can
+///   restart a process whose node loop or REST listener is gone. Silently
+///   continuing with a dead reconcile loop is exactly what D1 fixes.
+async fn supervise<F>(critical: &mut JoinSet<CriticalOutput>, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()>,
+{
+    tokio::select! {
+        _ = shutdown => Ok(()),
+        joined = critical.join_next() => match joined {
+            Some(Ok((name, Ok(())))) => anyhow::bail!("critical task `{name}` exited unexpectedly"),
+            Some(Ok((name, Err(e)))) => Err(e.context(format!("critical task `{name}` failed"))),
+            Some(Err(e)) if e.is_panic() => anyhow::bail!("critical task panicked: {e}"),
+            Some(Err(e)) => anyhow::bail!("critical task cancelled: {e}"),
+            None => anyhow::bail!("all critical tasks exited unexpectedly"),
+        },
+    }
+}
+
+/// Slice of the shutdown deadline reserved for aborting and reaping tasks that
+/// did not stop on cancellation, so [`drain_or_abort`] stays inside its
+/// deadline as a whole.
+const ABORT_REAP_SLICE: Duration = Duration::from_millis(250);
+
+/// Give the critical tasks `deadline` to stop, then abort whatever is left.
+///
+/// The whole call — graceful join **and** the abort/reap of anything that did
+/// not stop — is bounded by `deadline`: even when a runtime call never returns
+/// or a `logs --follow` stream is still open, the process returns to `main` and
+/// exits within `SHUTDOWN_DEADLINE`.
+async fn drain_or_abort(critical: &mut JoinSet<CriticalOutput>, deadline: Duration) {
+    let graceful = deadline.saturating_sub(ABORT_REAP_SLICE);
+    let drained = tokio::time::timeout(graceful, async {
+        while critical.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_ok() {
+        return;
+    }
+    warn!(
+        deadline_secs = deadline.as_secs(),
+        "shutdown deadline reached; aborting remaining tasks"
+    );
+    critical.abort_all();
+    // An aborted task completes at its next poll, so this returns promptly; the
+    // slice only guards against a task that cannot be interrupted at all.
+    let _ = tokio::time::timeout(ABORT_REAP_SLICE, async {
+        while critical.join_next().await.is_some() {}
+    })
+    .await;
 }
 
 /// Run the orchestrator (REST + scheduler + local node loop).
@@ -425,6 +532,9 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     let node_id = node::ensure_local_node(store_dyn, &node_cfg).await?;
     info!(node_id = %node_id, name = %node_cfg.name, "local node registered");
 
+    let cancel = CancellationToken::new();
+    let liveness = Arc::new(Liveness::for_interval(node_cfg.reconcile_interval));
+
     let state = AppState {
         store: store.clone() as Arc<dyn Store>,
         data_dir: data_dir.clone(),
@@ -443,48 +553,74 @@ pub async fn run(args: ServerArgs) -> Result<()> {
         allow_host_profile: args.allow_host_profile,
         port_probe: apply::probe_host_loopback_port,
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        liveness: liveness.clone(),
     };
 
     let app = router(state);
 
+    // Non-critical background work: the metrics exporter restarts with backoff
+    // and never takes the process down.
     let store_metrics = store.clone() as Arc<dyn Store>;
-    tokio::spawn(async move {
-        metrics_loop(store_metrics, Duration::from_secs(15)).await;
-    });
+    let metrics_cancel = cancel.clone();
+    let metrics_task = tokio::spawn(supervise_metrics(store_metrics, metrics_cancel));
 
-    // Local node loop (embedded microsandbox runtime). Pending instances are
-    // bound by the apply that created them, so there is no periodic scheduler.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-    let store_node = store.clone() as Arc<dyn Store>;
-    let runtime_node = runtime.clone();
-    let node_task = tokio::spawn(async move {
-        if let Err(e) = node::run(
-            store_node,
-            secrets_key,
-            runtime_node,
-            node_id,
-            node_cfg,
-            shutdown_rx,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "local node loop failed");
-        }
-    });
+    // Critical tasks. If either ends before shutdown, the orchestrator can no
+    // longer do its job: `supervise` returns the cause and `run()` exits
+    // non-zero so a service manager restarts the process (D1). The node loop
+    // also stamps readiness so `/health` stops reporting ok while it is wedged.
+    let mut critical: JoinSet<CriticalOutput> = JoinSet::new();
+    {
+        let store_node = store.clone() as Arc<dyn Store>;
+        let runtime_node = runtime.clone();
+        let node_cancel = cancel.clone();
+        let node_liveness = liveness.clone();
+        critical.spawn(async move {
+            let res = node::run(
+                store_node,
+                secrets_key,
+                runtime_node,
+                node_id,
+                node_cfg,
+                node_cancel,
+                node_liveness.clone(),
+            )
+            .await;
+            node_liveness.mark_dead(match &res {
+                Ok(()) => "node loop stopped".to_string(),
+                Err(e) => format!("node loop failed: {e:#}"),
+            });
+            ("node", res)
+        });
+    }
+    {
+        let rest_cancel = cancel.clone();
+        critical.spawn(async move {
+            (
+                "rest",
+                crate::http_serve::serve(rest_listener, app, http_limits, rest_cancel).await,
+            )
+        });
+    }
 
-    let (rest_tx, rest_rx) = tokio::sync::oneshot::channel::<()>();
-    let rest_task = tokio::spawn(crate::http_serve::serve(
-        rest_listener,
-        app,
-        http_limits,
-        rest_rx,
-    ));
+    let outcome = supervise(&mut critical, shutdown_signal()).await;
 
-    shutdown_signal().await;
-    let _ = shutdown_tx.send(());
-    let _ = node_task.await;
-    let _ = rest_tx.send(());
-    let _ = rest_task.await;
+    // Shutdown (D2): cancel everything at once — the node loop stops at the
+    // next await point and the listeners close — drain the REST connections
+    // inside `SHUTDOWN_DEADLINE`, then abort whatever is still running. VMs are
+    // deliberately left alone: they are detached and adoption on restart does
+    // the bookkeeping.
+    cancel.cancel();
+    if let Err(e) = &outcome {
+        tracing::error!(
+            error = format!("{e:#}"),
+            "critical task ended; exiting non-zero"
+        );
+    }
+    drain_or_abort(&mut critical, crate::limits::SHUTDOWN_DEADLINE).await;
+    metrics_task.abort();
+    let _ = metrics_task.await;
+
+    outcome?;
     info!("server stopped");
     Ok(())
 }
@@ -696,5 +832,60 @@ mod tests {
             err.to_string().contains("--allow-unauthenticated-remote"),
             "{err}"
         );
+    }
+
+    /// D1: shutdown (not a task ending) is the normal path.
+    #[tokio::test]
+    async fn supervisor_returns_ok_when_shutdown_fires_first() {
+        let mut critical: JoinSet<CriticalOutput> = JoinSet::new();
+        critical.spawn(async { std::future::pending::<CriticalOutput>().await });
+        supervise(&mut critical, std::future::ready(()))
+            .await
+            .unwrap();
+    }
+
+    /// D1: a critical task ending before shutdown is fatal, and its own error
+    /// is the cause — `run()` then exits non-zero.
+    #[tokio::test]
+    async fn supervisor_exits_with_the_failing_task_error() {
+        let mut critical: JoinSet<CriticalOutput> = JoinSet::new();
+        critical.spawn(async { ("node", Err(anyhow::anyhow!("reconcile loop died"))) });
+        let err = supervise(&mut critical, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("node"), "{msg}");
+        assert!(msg.contains("reconcile loop died"), "{msg}");
+    }
+
+    /// D1: a panicking critical task is fatal too, even though it returns no
+    /// error value of its own.
+    #[tokio::test]
+    async fn supervisor_treats_a_panic_as_fatal() {
+        let mut critical: JoinSet<CriticalOutput> = JoinSet::new();
+        critical.spawn(async { panic!("reconcile exploded") });
+        let err = supervise(&mut critical, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+    }
+
+    /// D2: a critical task wedged in a call that never returns cannot hold
+    /// shutdown past the deadline — it is aborted instead.
+    #[tokio::test]
+    async fn drain_aborts_a_wedged_task_within_the_deadline() {
+        let mut critical: JoinSet<CriticalOutput> = JoinSet::new();
+        critical.spawn(async {
+            std::future::pending::<()>().await;
+            ("node", Ok(()))
+        });
+        let started = std::time::Instant::now();
+        drain_or_abort(&mut critical, Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drain must be bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(critical.is_empty(), "aborted tasks must be reaped");
     }
 }

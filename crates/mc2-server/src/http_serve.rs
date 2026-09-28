@@ -17,15 +17,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// Serve `app` on `listener` until `shutdown` resolves, then drain.
+/// Serve `app` on `listener` until `cancel` fires, then drain.
 pub async fn serve(
     listener: TcpListener,
     app: Router,
     limits: HttpLimits,
-    shutdown: oneshot::Receiver<()>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let addr = listener.local_addr().context("rest local_addr")?;
     let connections = Arc::new(Semaphore::new(limits.max_connections.max(1)));
@@ -44,11 +45,10 @@ pub async fn serve(
         "REST listening (GET /health, /v1/status, /v1/nodes)"
     );
 
-    tokio::pin!(shutdown);
     loop {
         let accepted = tokio::select! {
             biased;
-            _ = &mut shutdown => break,
+            _ = cancel.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -60,7 +60,7 @@ pub async fn serve(
                 if !is_connection_error(&e) {
                     tokio::select! {
                         biased;
-                        _ = &mut shutdown => break,
+                        _ = cancel.cancelled() => break,
                         _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
                     }
                 }
@@ -150,20 +150,22 @@ mod tests {
         Router::new().route("/health", get(|| async { "ok" }))
     }
 
-    /// Start the real serve loop on an ephemeral loopback port.
-    async fn start(limits: HttpLimits) -> (SocketAddr, oneshot::Sender<()>) {
+    /// Start the real serve loop on an ephemeral loopback port. Cancelling the
+    /// returned token stops the listener.
+    async fn start(limits: HttpLimits) -> (SocketAddr, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel();
+        let cancel = CancellationToken::new();
+        let cancel_serve = cancel.clone();
         tokio::spawn(async move {
-            let _ = serve(listener, ping_router(), limits, rx).await;
+            let _ = serve(listener, ping_router(), limits, cancel_serve).await;
         });
-        (addr, tx)
+        (addr, cancel)
     }
 
     #[tokio::test]
     async fn health_is_served() {
-        let (addr, _shutdown) = start(HttpLimits::default()).await;
+        let (addr, _cancel) = start(HttpLimits::default()).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
             .write_all(b"GET /health HTTP/1.1\r\nhost: mc2\r\nconnection: close\r\n\r\n")
@@ -188,7 +190,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             header_read_timeout: Duration::from_secs(30),
         };
-        let (addr, _shutdown) = start(limits).await;
+        let (addr, _cancel) = start(limits).await;
 
         // Two silent connections hold both permits (a request may still arrive
         // within the header deadline) ...
@@ -221,7 +223,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             header_read_timeout: Duration::from_millis(200),
         };
-        let (addr, _shutdown) = start(limits).await;
+        let (addr, _cancel) = start(limits).await;
 
         // A client that never sends a request line must be closed.
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -236,5 +238,52 @@ mod tests {
                 Err(_) => panic!("connection was still open after the header-read deadline"),
             }
         }
+    }
+
+    /// D2: a still-open request — the shape of a `logs --follow` SSE stream —
+    /// cannot hold shutdown past the bounded drain.
+    #[tokio::test]
+    async fn shutdown_is_bounded_with_an_in_flight_request() {
+        use axum::routing::get;
+
+        let limits = HttpLimits {
+            max_connections: 8,
+            request_timeout: Duration::from_secs(600),
+            header_read_timeout: Duration::from_secs(600),
+        };
+        let app = Router::new().route(
+            "/hang",
+            get(|| async { std::future::pending::<&'static str>().await }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_serve = cancel.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = serve(listener, app, limits, cancel_serve).await;
+            let _ = done_tx.send(());
+        });
+
+        // A request whose handler never responds keeps the connection in flight.
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"GET /hang HTTP/1.1\r\nhost: mc2\r\nconnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        // Let the server pick the request up before cancelling.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = tokio::time::Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(8), done_rx)
+            .await
+            .expect("serve() must return after the bounded drain")
+            .expect("done signal");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "shutdown must be bounded: {:?}",
+            started.elapsed()
+        );
     }
 }

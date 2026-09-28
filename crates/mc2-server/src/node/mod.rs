@@ -17,6 +17,7 @@ mod state;
 
 use crate::desired::{build_desired_set, DesiredSet};
 use crate::ingress_files::{warn_ingress_dir_unset, SelfIngressRoute};
+use crate::liveness::Liveness;
 use anyhow::{Context, Result};
 use mc2_runtime::{InstanceReport, NodeRuntime};
 use mc2_store::{InstancePhase, NodeHeartbeat, SecretsKey, Store};
@@ -24,11 +25,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use self::lifecycle::apply_live;
 use self::report::persist_instance_report;
-use self::state::{NodeRuntimeState, PassErrors, ServiceLive};
+use self::state::{InstanceLiveness, NodeRuntimeState, PassErrors};
 
 /// Configuration for the local node loop.
 #[derive(Debug, Clone)]
@@ -70,14 +71,15 @@ pub async fn ensure_local_node(store: Arc<dyn Store>, cfg: &NodeConfig) -> Resul
     Ok(rec.id)
 }
 
-/// The reconcile loop. Runs until `shutdown` fires.
+/// The reconcile loop. Runs until `cancel` fires.
 pub async fn run(
     store: Arc<dyn Store>,
     secrets_key: Arc<SecretsKey>,
     runtime: Arc<dyn NodeRuntime>,
     node_id: String,
     cfg: NodeConfig,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    cancel: CancellationToken,
+    liveness: Arc<Liveness>,
 ) -> Result<()> {
     let self_route = cfg.public_hostname.as_ref().map(|host| SelfIngressRoute {
         host: host.clone(),
@@ -107,10 +109,14 @@ pub async fn run(
             .map(|d| crate::ingress_files::IngressFileWriter::new(d, cfg.name.clone())),
         self_route,
     );
+    // Propagate the process cancellation token to the listeners this loop owns
+    // so shutdown stops accepting without waiting for the next pass (D2).
+    rt_state.network_table.set_cancel(cancel.clone());
+    rt_state.ssh_table.set_cancel(cancel.clone());
 
     loop {
         tokio::select! {
-            _ = shutdown.recv() => {
+            _ = cancel.cancelled() => {
                 info!("local node shutting down");
                 break;
             }
@@ -144,7 +150,12 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(()) => mc2_metrics::record_reconcile(true),
+                    Ok(()) => {
+                        mc2_metrics::record_reconcile(true);
+                        // Readiness (D1): only a fully successful pass refreshes
+                        // it, so a wedged loop lets `/health` degrade.
+                        liveness.record_pass();
+                    }
                     Err(e) => {
                         mc2_metrics::record_reconcile(false);
                         warn!(error = %e, error_full = format!("{e:#}"), "reconcile failed");
@@ -154,6 +165,10 @@ pub async fn run(
         }
     }
 
+    // Stop the SSH/splice listeners this loop holds; the runtime sandboxes stay
+    // running (they are detached; adoption on restart handles them).
+    rt_state.network_table.shutdown();
+    rt_state.ssh_table.close_all().await;
     Ok(())
 }
 
@@ -211,8 +226,9 @@ async fn reconcile(
             .then_with(|| a.service.cmp(&b.service))
     });
 
-    // Seed per-(stack, service) liveness from the store; updated live below as
-    // this cycle reports phases / health, so in-cycle dependencies start fast.
+    // Seed per-instance liveness from the store; the same reduction is applied
+    // to the observations this cycle makes below, so in-cycle dependencies start
+    // fast and replica order never decides a service's liveness (B11).
     let mut live = live_from_store(&store).await?;
 
     // B4: an instance whose desired state could not be resolved is reported
@@ -225,8 +241,8 @@ async fn reconcile(
             "desired state unresolved; reporting Failed"
         );
         reports.push(f.failure_report());
-        apply_live(
-            &mut live,
+        live.observe(
+            &f.instance_id,
             &f.stack,
             &f.service,
             InstancePhase::Failed.as_str(),
@@ -337,18 +353,23 @@ async fn gc_orphans(
 }
 
 /// Seed the `depends_on` liveness map from the stored observed phases.
-async fn live_from_store(store: &Arc<dyn Store>) -> Result<HashMap<(String, String), ServiceLive>> {
-    let mut live: HashMap<(String, String), ServiceLive> = HashMap::new();
+///
+/// Stored and current observations are reduced by the same [`InstanceLiveness::observe`]
+/// (B11).
+async fn live_from_store(store: &Arc<dyn Store>) -> Result<InstanceLiveness> {
+    let mut live = InstanceLiveness::default();
     for inst in store
         .list_instances()
         .await
         .context("list instances for deps")?
     {
-        let entry = live.entry((inst.stack, inst.service)).or_default();
-        if inst.phase == InstancePhase::Running.as_str() {
-            entry.running = true;
-            entry.healthy = entry.healthy || inst.healthy;
-        }
+        live.observe(
+            &inst.id,
+            &inst.stack,
+            &inst.service,
+            &inst.phase,
+            inst.healthy,
+        );
     }
     Ok(live)
 }
@@ -408,7 +429,8 @@ async fn publish_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::lifecycle::{apply_live, waiting_deps};
+    use crate::node::lifecycle::waiting_deps;
+    use crate::node::state::{InstanceLiveness, ServiceLive};
     use mc2_store::{
         ClusterCounts, ClusterMeta, InstanceNetworkRecord, InstanceRecord, InstanceSshRecord,
         MemoryStore, NodeJoin, NodeRecord, SecretBlob, SecretMeta, SshAuthorizedKey, StackPlan,
@@ -478,18 +500,17 @@ mod tests {
         )])
     }
 
-    fn live(
-        stack: &str,
-        service: &str,
-        running: bool,
-        healthy: bool,
-    ) -> HashMap<(String, String), ServiceLive> {
-        let mut m = HashMap::new();
-        m.insert(
-            (stack.to_string(), service.to_string()),
-            ServiceLive { running, healthy },
+    /// A liveness map holding one observation for `service`.
+    fn live(stack: &str, service: &str, running: bool, healthy: bool) -> InstanceLiveness {
+        let mut l = InstanceLiveness::default();
+        l.observe(
+            &format!("{stack}--{service}--0"),
+            stack,
+            service,
+            if running { "Running" } else { "Failed" },
+            healthy,
         );
-        m
+        l
     }
 
     #[test]
@@ -517,27 +538,50 @@ mod tests {
         assert!(msg.contains("cache (service_started)"), "{msg}");
     }
 
+    /// B11: a service is live if *any* replica is — one Failed replica (first or
+    /// last) must not hide a healthy one.
     #[test]
-    fn apply_live_tracks_running_and_healthy() {
-        let mut m = HashMap::new();
-        apply_live(&mut m, "demo", "web", "Running", true);
-        assert!(m[&("demo".into(), "web".into())].running);
-        assert!(m[&("demo".into(), "web".into())].healthy);
-        apply_live(&mut m, "demo", "web", "Failed", false);
-        assert!(!m[&("demo".into(), "web".into())].running);
-        assert!(!m[&("demo".into(), "web".into())].healthy);
+    fn service_liveness_reduces_over_replicas_in_any_order() {
+        let observe_all = |order: [(bool, bool); 2]| {
+            let mut l = InstanceLiveness::default();
+            for (i, (running, healthy)) in order.into_iter().enumerate() {
+                l.observe(
+                    &format!("db--{i}"),
+                    "demo",
+                    "db",
+                    if running { "Running" } else { "Failed" },
+                    healthy,
+                );
+            }
+            l.service("demo", "db")
+        };
+        let healthy_first = observe_all([(true, true), (false, false)]);
+        let healthy_last = observe_all([(false, false), (true, true)]);
+        assert_eq!(healthy_first, healthy_last);
+        assert!(healthy_first.running && healthy_first.healthy);
+        // Only a running replica can make the service healthy.
+        assert_eq!(
+            observe_all([(false, true), (false, false)]),
+            ServiceLive::default()
+        );
+    }
+
+    /// B11: this pass's observation of an instance replaces the seeded one, so a
+    /// service that just went down is not reported live from stale store state.
+    #[test]
+    fn current_observation_replaces_the_seeded_one() {
+        let mut l = live("demo", "web", true, true);
+        l.observe("demo--web--0", "demo", "web", "Failed", false);
+        assert_eq!(l.service("demo", "web"), ServiceLive::default());
     }
 
     fn plain_spec() -> String {
         spec_json(&[], None, None)
     }
 
-    fn spec_json(
-        expose: &[u16],
-        healthcheck: Option<mc2_api::HealthcheckSpec>,
-        secret: Option<(&str, &str)>,
-    ) -> String {
-        let spec = mc2_api::ServiceSpec {
+    /// The spec every helper starts from: alpine, no ports, no ssh, restart `no`.
+    fn base_spec() -> mc2_api::ServiceSpec {
+        mc2_api::ServiceSpec {
             image: "alpine".into(),
             scale: 1,
             cpus: 1.0,
@@ -545,36 +589,72 @@ mod tests {
             ports: vec![],
             network: Default::default(),
             env: BTreeMap::new(),
-            secrets: secret
-                .map(|(name, env)| {
-                    vec![mc2_api::SecretRef {
-                        name: name.into(),
-                        env: env.into(),
-                        allow_hosts: vec!["api.example.com".into()],
-                    }]
-                })
-                .unwrap_or_default(),
+            secrets: vec![],
             volumes: vec![],
             restart: "no".into(),
-            healthcheck,
+            healthcheck: None,
             labels: BTreeMap::new(),
             command: None,
             node_name: None,
             node_selector: BTreeMap::new(),
             ssh: None,
             storage_opt: None,
-            expose: expose
-                .iter()
-                .map(|&p| mc2_api::ExposeSpec {
-                    port: p,
-                    protocol: "tcp".into(),
-                    name: None,
-                })
-                .collect(),
+            expose: vec![],
             networks: vec![],
             depends_on: BTreeMap::new(),
-        };
+        }
+    }
+
+    fn spec_json(
+        expose: &[u16],
+        healthcheck: Option<mc2_api::HealthcheckSpec>,
+        secret: Option<(&str, &str)>,
+    ) -> String {
+        let mut spec = base_spec();
+        spec.expose = expose
+            .iter()
+            .map(|&p| mc2_api::ExposeSpec {
+                port: p,
+                protocol: "tcp".into(),
+                name: None,
+            })
+            .collect();
+        spec.healthcheck = healthcheck;
+        spec.secrets = secret
+            .map(|(name, env)| {
+                vec![mc2_api::SecretRef {
+                    name: name.into(),
+                    env: env.into(),
+                    allow_hosts: vec!["api.example.com".into()],
+                }]
+            })
+            .unwrap_or_default();
         serde_json::to_string(&spec).unwrap()
+    }
+
+    /// Spec with a `restart` policy, an optional healthcheck and `depends_on`.
+    fn spec_json_deps(
+        restart: &str,
+        healthcheck: Option<mc2_api::HealthcheckSpec>,
+        depends_on: BTreeMap<String, mc2_api::DependsOnSpec>,
+    ) -> String {
+        let mut spec = base_spec();
+        spec.restart = restart.into();
+        spec.healthcheck = healthcheck;
+        spec.depends_on = depends_on;
+        serde_json::to_string(&spec).unwrap()
+    }
+
+    /// A healthcheck that probes `true` every second with 3 retries.
+    fn healthcheck_spec() -> mc2_api::HealthcheckSpec {
+        mc2_api::HealthcheckSpec {
+            test: Some(vec!["true".into()]),
+            interval_seconds: 1,
+            timeout_seconds: 1,
+            retries: 3,
+            start_period_seconds: 0,
+            disable: false,
+        }
     }
 
     /// A `NodeRuntime` that records what the node does to it.
@@ -619,12 +699,15 @@ mod tests {
         async fn ensure_running(
             &self,
             d: &mc2_runtime::DesiredSandbox,
-        ) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
             self.created.fetch_add(1, Ordering::SeqCst);
-            Ok(mc2_runtime::SandboxStatus {
-                runtime_id: d.runtime_id.clone(),
-                phase: mc2_runtime::SandboxPhase::Running,
-                message: None,
+            Ok(mc2_runtime::EnsureRunning {
+                status: mc2_runtime::SandboxStatus {
+                    runtime_id: d.runtime_id.clone(),
+                    phase: mc2_runtime::SandboxPhase::Running,
+                    message: None,
+                },
+                outcome: mc2_runtime::EnsureOutcome::Created,
             })
         }
         async fn ensure_removed(&self, id: &str) -> anyhow::Result<()> {
@@ -1362,5 +1445,609 @@ mod tests {
 
         assert_eq!(runtime.created_count(), 1, "the instance was reconciled");
         assert!(rt_state.owned.contains("shop--web--0"));
+    }
+
+    /// Per-runtime-id answers for [`ScriptedRuntime`].
+    #[derive(Debug, Clone, Copy)]
+    struct Script {
+        outcome: mc2_runtime::EnsureOutcome,
+        phase: mc2_runtime::SandboxPhase,
+        /// Exit code of the health probe (`exec_command`).
+        probe_exit: i32,
+    }
+
+    impl Default for Script {
+        fn default() -> Self {
+            Self {
+                outcome: mc2_runtime::EnsureOutcome::Created,
+                phase: mc2_runtime::SandboxPhase::Running,
+                probe_exit: 0,
+            }
+        }
+    }
+
+    /// A runtime whose per-instance answers are scripted, so restart-backoff and
+    /// dependency-gating decisions can be driven without a hypervisor (B10/B11).
+    #[derive(Default)]
+    struct ScriptedRuntime {
+        scripts: tokio::sync::Mutex<HashMap<String, Script>>,
+        /// Runtime ids whose sandbox is up: what `status` observes.
+        up: tokio::sync::Mutex<HashSet<String>>,
+        ensure_calls: tokio::sync::Mutex<HashMap<String, usize>>,
+        removed: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedRuntime {
+        async fn script(
+            &self,
+            id: &str,
+            outcome: mc2_runtime::EnsureOutcome,
+            phase: mc2_runtime::SandboxPhase,
+        ) {
+            self.scripts.lock().await.insert(
+                id.to_string(),
+                Script {
+                    outcome,
+                    phase,
+                    ..Default::default()
+                },
+            );
+        }
+
+        async fn set_probe_exit(&self, id: &str, exit: i32) {
+            self.scripts
+                .lock()
+                .await
+                .entry(id.to_string())
+                .or_default()
+                .probe_exit = exit;
+        }
+
+        /// The sandbox is up before this process ever saw it (adoption).
+        async fn mark_up(&self, id: &str) {
+            self.up.lock().await.insert(id.to_string());
+        }
+
+        async fn ensure_calls(&self, id: &str) -> usize {
+            self.ensure_calls.lock().await.get(id).copied().unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeRuntime for ScriptedRuntime {
+        async fn ensure_running(
+            &self,
+            d: &mc2_runtime::DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
+            *self
+                .ensure_calls
+                .lock()
+                .await
+                .entry(d.runtime_id.clone())
+                .or_default() += 1;
+            let script = self
+                .scripts
+                .lock()
+                .await
+                .get(&d.runtime_id)
+                .copied()
+                .unwrap_or_default();
+            if script.phase == mc2_runtime::SandboxPhase::Running {
+                self.up.lock().await.insert(d.runtime_id.clone());
+            }
+            Ok(mc2_runtime::EnsureRunning {
+                status: mc2_runtime::SandboxStatus {
+                    runtime_id: d.runtime_id.clone(),
+                    phase: script.phase,
+                    message: None,
+                },
+                outcome: script.outcome,
+            })
+        }
+        async fn ensure_removed(&self, id: &str) -> anyhow::Result<()> {
+            self.removed.lock().await.push(id.to_string());
+            self.up.lock().await.remove(id);
+            Ok(())
+        }
+        async fn status(&self, id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            let up = self.up.lock().await.contains(id);
+            Ok(mc2_runtime::SandboxStatus {
+                runtime_id: id.to_string(),
+                phase: if up {
+                    mc2_runtime::SandboxPhase::Running
+                } else {
+                    mc2_runtime::SandboxPhase::Stopped
+                },
+                message: None,
+            })
+        }
+        async fn list_owned(&self, _install_id: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn exec_command(&self, id: &str, _argv: &[String]) -> anyhow::Result<i32> {
+            let exit = self
+                .scripts
+                .lock()
+                .await
+                .get(id)
+                .copied()
+                .unwrap_or_default()
+                .probe_exit;
+            Ok(exit)
+        }
+        async fn exec_with_output(
+            &self,
+            _id: &str,
+            _argv: &[String],
+            _stdin: &[u8],
+        ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    /// The node's `DesiredSandbox` for `service`, built the way the loop does.
+    async fn desired_sandbox(
+        store: &Arc<MemoryStore>,
+        node_id: &str,
+        service: &str,
+    ) -> mc2_runtime::DesiredSandbox {
+        build_desired_set(store.clone() as Arc<dyn Store>, &key(), node_id)
+            .await
+            .unwrap()
+            .sandboxes
+            .into_iter()
+            .find(|d| d.service == service)
+            .unwrap_or_else(|| panic!("{service} in the desired set"))
+    }
+
+    /// The stored instance for `service` at `ordinal`.
+    async fn record_of(store: &MemoryStore, service: &str, ordinal: u32) -> InstanceRecord {
+        store
+            .list_instances()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.service == service && i.ordinal == ordinal)
+            .unwrap_or_else(|| panic!("no {service}/{ordinal} instance"))
+    }
+
+    async fn phase_of(store: &MemoryStore, service: &str, ordinal: u32) -> String {
+        record_of(store, service, ordinal).await.phase
+    }
+
+    /// Let the spawned health probe complete (it never touches a hypervisor).
+    async fn let_probe_finish() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// Seed a stack with one or more replicas per service.
+    async fn seed_stack_replicas(
+        store: &MemoryStore,
+        node_id: &str,
+        stack: &str,
+        services: &[(&str, Vec<String>)],
+    ) -> Vec<mc2_store::InstanceRecord> {
+        let plan = StackPlan::replicas(
+            stack,
+            "{}",
+            "yaml",
+            services.iter().map(|(s, specs)| (*s, specs.clone())),
+        );
+        let insts = store.commit_stack_plan(&plan).await.unwrap();
+        for i in &insts {
+            store.bind_instance_to_node(&i.id, node_id).await.unwrap();
+        }
+        insts
+    }
+
+    /// B10: a backend that restarts the sandbox itself reports `Restarted`, and
+    /// that counts like a failure — attempts are spaced by the backoff schedule
+    /// instead of once per pass — and the counter resets after 60s of Running.
+    #[tokio::test]
+    async fn sdk_restarts_are_spaced_by_backoff_and_reset_after_sustained_running() {
+        let (mem, node_id) = store_with_node().await;
+        bound_instance(
+            &mem,
+            &node_id,
+            "shop",
+            "web",
+            &spec_json_deps("always", None, BTreeMap::new()),
+        )
+        .await;
+        let store: Arc<dyn Store> = mem.clone();
+        let runtime = Arc::new(ScriptedRuntime::default());
+        runtime
+            .script(
+                "shop--web--0",
+                mc2_runtime::EnsureOutcome::Restarted,
+                mc2_runtime::SandboxPhase::Running,
+            )
+            .await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+        let mut d = desired_sandbox(&mem, &node_id, "web").await;
+        let mut live = InstanceLiveness::default();
+        let mut errors = PassErrors::default();
+        let t0 = Instant::now();
+
+        // Pass 1: the backend restarted the sandbox itself.
+        let r = rt_state
+            .reconcile_instance(&store, &dyn_runtime, &mut d, t0, &mut live, &mut errors)
+            .await
+            .unwrap();
+        assert_eq!(r.phase, "Running");
+        assert_eq!(runtime.ensure_calls("shop--web--0").await, 1);
+        let st = rt_state.rt_state.get("shop--web--0").unwrap();
+        assert_eq!(st.restart_count, 1, "an SDK restart counts as a restart");
+        assert_eq!(st.next_restart_ok, Some(t0 + Duration::from_secs(2)));
+
+        // One second later the pass is held back: a crash loop cannot restart on
+        // every pass.
+        let r = rt_state
+            .reconcile_instance(
+                &store,
+                &dyn_runtime,
+                &mut d,
+                t0 + Duration::from_secs(1),
+                &mut live,
+                &mut errors,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.ensure_calls("shop--web--0").await,
+            1,
+            "restart attempts are spaced by the backoff schedule"
+        );
+        assert!(r.message.contains("restart backoff"), "{}", r.message);
+        assert_eq!(rt_state.rt_state["shop--web--0"].restart_count, 1);
+
+        // Past each deadline the next attempt happens and the schedule grows.
+        for (offset, calls, next_secs) in [(2u64, 2usize, 5u64), (7, 3, 15), (22, 4, 30)] {
+            let at = t0 + Duration::from_secs(offset);
+            rt_state
+                .reconcile_instance(&store, &dyn_runtime, &mut d, at, &mut live, &mut errors)
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.ensure_calls("shop--web--0").await,
+                calls,
+                "attempt at +{offset}s"
+            );
+            assert_eq!(
+                rt_state.rt_state["shop--web--0"].next_restart_ok,
+                Some(at + Duration::from_secs(next_secs))
+            );
+        }
+
+        // The VM survives (no restart) and runs: after 60s the counter resets.
+        runtime
+            .script(
+                "shop--web--0",
+                mc2_runtime::EnsureOutcome::AlreadyRunning,
+                mc2_runtime::SandboxPhase::Running,
+            )
+            .await;
+        let survived = t0 + Duration::from_secs(22);
+        rt_state
+            .reconcile_instance(
+                &store,
+                &dyn_runtime,
+                &mut d,
+                survived,
+                &mut live,
+                &mut errors,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rt_state.rt_state["shop--web--0"].restart_count, 4,
+            "a restart-free pass does not advance the counter"
+        );
+        rt_state
+            .reconcile_instance(
+                &store,
+                &dyn_runtime,
+                &mut d,
+                survived + Duration::from_secs(61),
+                &mut live,
+                &mut errors,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rt_state.rt_state["shop--web--0"].restart_count, 0,
+            "60s of Running resets the restart counter"
+        );
+        assert_eq!(rt_state.rt_state["shop--web--0"].next_restart_ok, None);
+
+        // ...so the next restart starts the schedule over.
+        runtime
+            .script(
+                "shop--web--0",
+                mc2_runtime::EnsureOutcome::Restarted,
+                mc2_runtime::SandboxPhase::Running,
+            )
+            .await;
+        let again = survived + Duration::from_secs(62);
+        rt_state
+            .reconcile_instance(&store, &dyn_runtime, &mut d, again, &mut live, &mut errors)
+            .await
+            .unwrap();
+        assert_eq!(rt_state.rt_state["shop--web--0"].restart_count, 1);
+        assert_eq!(
+            rt_state.rt_state["shop--web--0"].next_restart_ok,
+            Some(again + Duration::from_secs(2))
+        );
+    }
+
+    /// B11: `depends_on` orders startup only. Once a dependent's VM is running it
+    /// is neither reported Pending nor dropped from routing when its dependency
+    /// later goes unhealthy — it keeps being reconciled.
+    #[tokio::test]
+    async fn a_running_dependent_is_not_re_gated_when_its_dependency_fails() {
+        let (store, node_id) = store_with_node().await;
+        seed_stack(
+            &store,
+            &node_id,
+            "shop",
+            &[
+                (
+                    "db",
+                    spec_json_deps("always", Some(healthcheck_spec()), BTreeMap::new()),
+                ),
+                (
+                    "web",
+                    spec_json_deps("always", None, dep("db", "service_healthy")),
+                ),
+            ],
+        )
+        .await;
+
+        let runtime = Arc::new(ScriptedRuntime::default());
+        runtime.set_probe_exit("shop--db--0", 0).await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        // Pass 1: db comes up. Its probe result is only read by the next pass, so
+        // web is still gated.
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(phase_of(&store, "web", 0).await, "Pending");
+        assert_eq!(runtime.ensure_calls("shop--web--0").await, 0);
+
+        // Pass 2: db is healthy, so web starts.
+        let_probe_finish().await;
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(phase_of(&store, "web", 0).await, "Running");
+        assert_eq!(runtime.ensure_calls("shop--web--0").await, 1);
+
+        // Pass 3: db fails. web is already running: it must keep its phase, stay
+        // reconciled, and not be reported as waiting on its dependency.
+        runtime
+            .script(
+                "shop--db--0",
+                mc2_runtime::EnsureOutcome::Restarted,
+                mc2_runtime::SandboxPhase::Failed,
+            )
+            .await;
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(phase_of(&store, "db", 0).await, "Failed");
+        let web = record_of(&store, "web", 0).await;
+        assert_eq!(
+            web.phase, "Running",
+            "a running dependent is not held back by a failing dependency"
+        );
+        // The store keeps the last non-empty message (the old `depends_on:
+        // waiting …` text survives), so the proof that web was not re-gated is
+        // the phase above plus the continued reconcile below.
+        assert!(
+            rt_state.rt_state["shop--web--0"].started,
+            "web keeps its started flag once its VM is up"
+        );
+        assert_eq!(
+            runtime.ensure_calls("shop--web--0").await,
+            2,
+            "web is still reconciled"
+        );
+    }
+
+    /// B11: an adopted sandbox (node restart) that is already running is not
+    /// re-gated either, even though this process has never seen it come up.
+    #[tokio::test]
+    async fn an_adopted_running_dependent_is_not_gated() {
+        let (store, node_id) = store_with_node().await;
+        seed_stack(
+            &store,
+            &node_id,
+            "shop",
+            &[
+                (
+                    "db",
+                    spec_json_deps("always", Some(healthcheck_spec()), BTreeMap::new()),
+                ),
+                (
+                    "web",
+                    spec_json_deps("always", None, dep("db", "service_healthy")),
+                ),
+            ],
+        )
+        .await;
+
+        let runtime = Arc::new(ScriptedRuntime::default());
+        runtime.mark_up("shop--web--0").await;
+        runtime
+            .script(
+                "shop--db--0",
+                mc2_runtime::EnsureOutcome::Restarted,
+                mc2_runtime::SandboxPhase::Failed,
+            )
+            .await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            phase_of(&store, "web", 0).await,
+            "Running",
+            "an observed running sandbox is never reported Pending"
+        );
+    }
+
+    /// B11: the service reduction is order-independent — a Failed replica must
+    /// not hide a healthy one, whichever is processed last.
+    #[tokio::test]
+    async fn a_healthy_replica_keeps_the_service_live_when_another_fails() {
+        let (store, node_id) = store_with_node().await;
+        let db = spec_json_deps("always", Some(healthcheck_spec()), BTreeMap::new());
+        seed_stack_replicas(
+            &store,
+            &node_id,
+            "shop",
+            &[
+                ("db", vec![db.clone(), db]),
+                (
+                    "web",
+                    vec![spec_json_deps("always", None, dep("db", "service_healthy"))],
+                ),
+            ],
+        )
+        .await;
+
+        let runtime = Arc::new(ScriptedRuntime::default());
+        runtime.set_probe_exit("shop--db--0", 0).await;
+        // Replica 1 is processed after replica 0 and has failed.
+        runtime
+            .script(
+                "shop--db--1",
+                mc2_runtime::EnsureOutcome::Restarted,
+                mc2_runtime::SandboxPhase::Failed,
+            )
+            .await;
+        let dyn_runtime: Arc<dyn NodeRuntime> = runtime.clone();
+        let mut rt_state = NodeRuntimeState::new(None, None);
+
+        // Pass 1: replica 0 is up but not yet healthy, so web is still gated.
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(phase_of(&store, "db", 1).await, "Failed");
+        assert_eq!(phase_of(&store, "web", 0).await, "Pending");
+
+        // Pass 2: replica 0 is healthy, replica 1 still Failed — the Failed
+        // replica is reduced with the healthy one, so db is live and web starts.
+        let_probe_finish().await;
+        pass(&store, &node_id, "install-1", &dyn_runtime, &mut rt_state)
+            .await
+            .unwrap();
+        assert_eq!(phase_of(&store, "db", 0).await, "Running");
+        assert_ne!(
+            phase_of(&store, "db", 1).await,
+            "Running",
+            "the failed replica stays down (it is in restart backoff)"
+        );
+        assert_eq!(
+            phase_of(&store, "web", 0).await,
+            "Running",
+            "one healthy replica keeps the service live for its dependents"
+        );
+    }
+
+    /// A `NodeRuntime` whose calls never return, standing in for a microVM call
+    /// that wedges mid-pass.
+    struct HangingRuntime {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeRuntime for HangingRuntime {
+        async fn ensure_running(
+            &self,
+            _d: &mc2_runtime::DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
+            std::future::pending().await
+        }
+        async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
+            std::future::pending().await
+        }
+        async fn status(&self, _id: &str) -> anyhow::Result<mc2_runtime::SandboxStatus> {
+            std::future::pending().await
+        }
+        async fn list_owned(&self, _install_id: &str) -> anyhow::Result<Vec<String>> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+        async fn exec_command(&self, _id: &str, _argv: &[String]) -> anyhow::Result<i32> {
+            std::future::pending().await
+        }
+        async fn exec_with_output(
+            &self,
+            _id: &str,
+            _argv: &[String],
+            _stdin: &[u8],
+        ) -> anyhow::Result<mc2_runtime::ExecResult> {
+            std::future::pending().await
+        }
+    }
+
+    /// D2: a node loop wedged inside a runtime call that never returns is still
+    /// stopped within the shutdown deadline — the token cannot interrupt the
+    /// in-flight call, so the supervisor aborts the task.
+    #[tokio::test]
+    async fn a_wedged_runtime_call_cannot_hold_shutdown_open() {
+        let (store, node_id) = store_with_node().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let runtime: Arc<dyn NodeRuntime> = Arc::new(HangingRuntime {
+            entered: entered.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let cancel_node = cancel.clone();
+        let liveness = Arc::new(Liveness::for_interval(Duration::from_secs(10)));
+
+        let mut critical: tokio::task::JoinSet<(&'static str, Result<()>)> =
+            tokio::task::JoinSet::new();
+        critical.spawn(async move {
+            let res = run(
+                store as Arc<dyn Store>,
+                Arc::new(key()),
+                runtime,
+                node_id,
+                node_cfg("install-1"),
+                cancel_node,
+                liveness,
+            )
+            .await;
+            ("node", res)
+        });
+
+        // The first pass reaches the wedged call; nothing there will return.
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the reconcile pass must start");
+
+        cancel.cancel();
+        // Cancelling alone cannot interrupt an in-flight runtime call.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !critical.is_empty(),
+            "the wedged pass must not exit on cancel alone"
+        );
+
+        let started = Instant::now();
+        crate::drain_or_abort(&mut critical, Duration::from_millis(200)).await;
+        assert!(critical.is_empty(), "the wedged task must be aborted");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown must be bounded: {:?}",
+            started.elapsed()
+        );
     }
 }

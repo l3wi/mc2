@@ -7,13 +7,13 @@
 //! touched on confirmed success (B2/B3).
 
 use super::health::run_healthcheck;
-use super::state::{NodeRuntimeState, PassErrors, ServiceLive};
+use super::state::{InstanceLiveness, InstanceRuntimeState, NodeRuntimeState, PassErrors};
 use anyhow::Result;
 use mc2_runtime::{
-    desired_recreate_hash, DesiredSandbox, InstanceReport, NodeRuntime, RestartPolicy, SandboxPhase,
+    desired_recreate_hash, DesiredSandbox, EnsureOutcome, EnsureRunning, InstanceReport,
+    NodeRuntime, RestartPolicy, SandboxPhase,
 };
 use mc2_store::{InstancePhase, Store};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -30,17 +30,28 @@ impl NodeRuntimeState {
         runtime: &Arc<dyn NodeRuntime>,
         d: &mut DesiredSandbox,
         now: Instant,
-        live: &mut HashMap<(String, String), ServiceLive>,
+        live: &mut InstanceLiveness,
         errors: &mut PassErrors,
     ) -> Result<InstanceReport> {
         let policy = RestartPolicy::parse(&d.spec.restart);
         let state = self.rt_state.entry(d.runtime_id.clone()).or_default();
 
-        // Compose `depends_on` startup gate: skip ensure_running until every
-        // dependency is Running (service_started) or Running+healthy
-        // (service_healthy). Deps live in the same stack.
-        if !d.spec.depends_on.is_empty() {
+        // Compose `depends_on` startup gate: it orders *startup* only. It holds
+        // back a sandbox that has not come up yet (its initial start, or an
+        // adopted sandbox this process has never seen running) and never one
+        // that is already up — otherwise a running dependent would be reported
+        // Pending, dropped from routing and lose its health/ssh/network/crash
+        // handling the moment a dependency degrades (B11). Deps live in the
+        // same stack.
+        if !d.spec.depends_on.is_empty() && !instance_up(state, runtime, d).await {
             if let Some(waiting) = waiting_deps(d, live) {
+                live.observe(
+                    &d.instance_id,
+                    &d.stack,
+                    &d.service,
+                    InstancePhase::Pending.as_str(),
+                    false,
+                );
                 return Ok(InstanceReport {
                     instance_id: d.instance_id.clone(),
                     phase: InstancePhase::Pending.as_str().into(),
@@ -68,8 +79,8 @@ impl NodeRuntimeState {
                     ssh: Some(ssh),
                     network: Some(network),
                 };
-                apply_live(
-                    live,
+                live.observe(
+                    &d.instance_id,
                     &d.stack,
                     &d.service,
                     InstancePhase::Creating.as_str(),
@@ -104,8 +115,8 @@ impl NodeRuntimeState {
                 ssh: Some(ssh),
                 network: Some(network),
             };
-            apply_live(
-                live,
+            live.observe(
+                &d.instance_id,
                 &d.stack,
                 &d.service,
                 InstancePhase::Failed.as_str(),
@@ -126,8 +137,8 @@ impl NodeRuntimeState {
                 ssh: Some(ssh),
                 network: Some(network),
             };
-            apply_live(
-                live,
+            live.observe(
+                &d.instance_id,
                 &d.stack,
                 &d.service,
                 InstancePhase::Failed.as_str(),
@@ -194,8 +205,8 @@ impl NodeRuntimeState {
                     ssh: Some(ssh),
                     network: Some(network),
                 };
-                apply_live(
-                    live,
+                live.observe(
+                    &d.instance_id,
                     &d.stack,
                     &d.service,
                     InstancePhase::Failed.as_str(),
@@ -209,10 +220,18 @@ impl NodeRuntimeState {
             // New VM generation: health counters restart and any probe result
             // from the removed sandbox is dropped (B6b).
             state.reset_health();
+            // `state.started` is deliberately *not* reset here: `depends_on`
+            // orders a dependent's first start, so an instance that has been up
+            // once keeps being (re)started rather than being stranded behind a
+            // dependency that is down — and gating a recreate could only hold
+            // back the new VM while removing the running one.
         }
 
         match runtime.ensure_running(d).await {
-            Ok(mut st) => {
+            Ok(EnsureRunning {
+                status: mut st,
+                outcome,
+            }) => {
                 self.owned.insert(d.runtime_id.clone());
                 state.spec_hash = Some(want_hash.clone());
                 // B3: the sandbox now holds this config — record it only after
@@ -232,6 +251,36 @@ impl NodeRuntimeState {
                         "persist applied hash for instance {}",
                         d.instance_id
                     )));
+                }
+
+                // B10: the backend restarted the sandbox itself (started a
+                // Stopped one, recreated a Crashed one). That is a restart
+                // attempt like any other, so it counts against the backoff
+                // schedule and the sustained-Running clock starts over — a crash
+                // loop is spaced instead of restarting on every pass. The VM is a
+                // new generation: probe results and the `start_period` clock of
+                // the previous one no longer apply (B6b).
+                if outcome == EnsureOutcome::Restarted {
+                    state.reset_health();
+                    state.running_since = match st.phase {
+                        SandboxPhase::Running => Some(now),
+                        _ => None,
+                    };
+                    if policy != RestartPolicy::Never {
+                        state.restart_count = state.restart_count.saturating_add(1);
+                        state.next_restart_ok = Some(
+                            now + Duration::from_secs(mc2_runtime::backoff_secs(
+                                state.restart_count,
+                            )),
+                        );
+                    }
+                }
+
+                // An instance whose VM came up has passed the `depends_on`
+                // startup gate for good (B11): later passes keep restarting,
+                // probing and routing it whatever its dependencies do.
+                if matches!(st.phase, SandboxPhase::Running | SandboxPhase::Creating) {
+                    state.started = true;
                 }
 
                 // Reset restart counter after sustained Running.
@@ -309,7 +358,7 @@ impl NodeRuntimeState {
                     ssh: Some(ssh),
                     network: Some(network),
                 };
-                apply_live(live, &d.stack, &d.service, phase, state.health_ok);
+                live.observe(&d.instance_id, &d.stack, &d.service, phase, state.health_ok);
                 Ok(report)
             }
             Err(e) => {
@@ -337,8 +386,8 @@ impl NodeRuntimeState {
                     ssh: Some(ssh),
                     network: Some(network),
                 };
-                apply_live(
-                    live,
+                live.observe(
+                    &d.instance_id,
                     &d.stack,
                     &d.service,
                     InstancePhase::Failed.as_str(),
@@ -375,20 +424,36 @@ async fn recreate_decision(
     Ok(persisted.as_deref() != Some(want_hash))
 }
 
+/// Whether this instance's VM is already up.
+///
+/// A sandbox this process has seen come up is up; otherwise the runtime is
+/// asked once, so an adopted sandbox (node restart) is not re-gated either.
+/// Anything else — including a status error — counts as "not up", the direction
+/// that never starts a dependent too early (B11).
+async fn instance_up(
+    state: &InstanceRuntimeState,
+    runtime: &Arc<dyn NodeRuntime>,
+    d: &DesiredSandbox,
+) -> bool {
+    if state.started {
+        return true;
+    }
+    matches!(
+        runtime.status(&d.runtime_id).await,
+        Ok(st) if st.phase == SandboxPhase::Running
+    )
+}
+
 /// Compose `depends_on` gate: `Some(...)` lists the unsatisfied dependencies
 /// (and their conditions); `None` means all are satisfied and the instance may start.
-pub(super) fn waiting_deps(
-    d: &DesiredSandbox,
-    live: &HashMap<(String, String), ServiceLive>,
-) -> Option<String> {
+pub(super) fn waiting_deps(d: &DesiredSandbox, live: &InstanceLiveness) -> Option<String> {
     let mut waiting: Vec<String> = Vec::new();
     for (dep, spec) in &d.spec.depends_on {
-        let key = (d.stack.clone(), dep.clone());
-        let state = live.get(&key);
+        let state = live.service(&d.stack, dep);
         let cond = spec.condition.trim().to_ascii_lowercase();
         let satisfied = match cond.as_str() {
-            "service_healthy" => state.is_some_and(|s| s.running && s.healthy),
-            _ => state.is_some_and(|s| s.running),
+            "service_healthy" => state.running && state.healthy,
+            _ => state.running,
         };
         if !satisfied {
             waiting.push(format!("{dep} ({cond})"));
@@ -399,21 +464,6 @@ pub(super) fn waiting_deps(
     } else {
         Some(waiting.join(", "))
     }
-}
-
-/// Reflect an instance's observed phase into the service-liveness map.
-pub(super) fn apply_live(
-    live: &mut HashMap<(String, String), ServiceLive>,
-    stack: &str,
-    service: &str,
-    phase: &str,
-    healthy: bool,
-) {
-    let entry = live
-        .entry((stack.to_string(), service.to_string()))
-        .or_default();
-    entry.running = phase == InstancePhase::Running.as_str();
-    entry.healthy = healthy;
 }
 
 /// True if every host port accepts a TCP connect (msb publish live).

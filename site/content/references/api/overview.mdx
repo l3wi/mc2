@@ -11,7 +11,7 @@ over it, so the same routes back every `mc2` command — see the
 
 - **Base URL.** The operator API is served at the server's bind address
   (default `127.0.0.1:7443`). Operator endpoints live under `/v1/`; `/health`
-  is the bare liveness probe.
+  is the bare readiness probe (unauthenticated).
 - **JSON in/out.** Requests and responses are JSON.
 - **Auth.** Authenticated endpoints require a bearer token in the
   `Authorization` header; `/health` is unauthenticated.
@@ -54,7 +54,7 @@ Errors are returned as JSON with an `error` message. The convention:
 
 | Method | Path | Role |
 | ------ | ---- | ---- |
-| `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/health` | Readiness probe (no auth). `200` while the node loop is live and current, `503` with a `reason` when it has stopped or gone stale |
 | `GET` | `/v1/status` | Health, version, counts, public hostname, resources |
 | `GET` | `/v1/nodes` | Registered nodes |
 | `POST` | `/v1/stacks:apply` | Apply (up) a stack from YAML |

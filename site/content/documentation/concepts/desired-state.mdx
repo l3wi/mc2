@@ -92,10 +92,11 @@ mc2 down web-stack     # instances + definition removed
   service, or lowering `scale`, removes those instances on the next `up`. An
   apply that fails validation or allocation changes nothing at all.
 - **No drift.** The loop owns instance lifecycle; a crashed replica is
-  recreated according to `restart` — not left dead.
-- **Ordering at startup only.** `depends_on` gates *when* a dependent
-  starts; it does not tear down a dependent when its dependency later dies
-  (Compose semantics).
+  recreated according to `restart` — not left dead. Repeated restarts are
+  spaced by the restart backoff, so a crash loop cannot restart on every pass.
+- **Ordering at startup only.** `depends_on` gates a dependent's *first*
+  start; a running dependent is not re-gated, not dropped from routing and not
+  torn down when its dependency later dies (Compose semantics).
 - **Teardown.** `mc2 down` removes instances *and* the definition; volumes
   are retained unless you add `--volumes`.
 - **Failed ≠ vanished.** An instance that cannot start reports `Failed`

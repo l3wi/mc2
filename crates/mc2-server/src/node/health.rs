@@ -122,7 +122,7 @@ async fn handle_health_failure(
         warn!(runtime_id = %d.runtime_id, error = %e, "remove after health fail");
     }
     match runtime.ensure_running(d).await {
-        Ok(st) => st,
+        Ok(er) => er.status,
         Err(e) => SandboxStatus {
             runtime_id: d.runtime_id.clone(),
             phase: SandboxPhase::Failed,
@@ -285,7 +285,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeRuntime for HangingRuntime {
-        async fn ensure_running(&self, _d: &DesiredSandbox) -> anyhow::Result<SandboxStatus> {
+        async fn ensure_running(
+            &self,
+            _d: &DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
             anyhow::bail!("unused")
         }
         async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
@@ -315,7 +318,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeRuntime for FailingRuntime {
-        async fn ensure_running(&self, _d: &DesiredSandbox) -> anyhow::Result<SandboxStatus> {
+        async fn ensure_running(
+            &self,
+            _d: &DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
             anyhow::bail!("unused")
         }
         async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {
@@ -347,7 +353,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeRuntime for SlowFailingRuntime {
-        async fn ensure_running(&self, _d: &DesiredSandbox) -> anyhow::Result<SandboxStatus> {
+        async fn ensure_running(
+            &self,
+            _d: &DesiredSandbox,
+        ) -> anyhow::Result<mc2_runtime::EnsureRunning> {
             anyhow::bail!("unused")
         }
         async fn ensure_removed(&self, _id: &str) -> anyhow::Result<()> {

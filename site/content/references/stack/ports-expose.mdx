@@ -51,8 +51,10 @@ Allocations are stable across re-applies. Moving a fixed `published` base is
 fine — the same apply releases the stack's previous block — but `mc2 up` is
 refused (`400`) if two entries would need the same host port, if the port is
 already an `expose` claim or another stack's publish, or if `published +
-ordinal` would exceed `65535`. Ingress routes for a scaled service target
-replica 0's port.
+ordinal` would exceed `65535`. Ingress routes for a scaled service target a
+Running replica (healthy one first when the service declares a healthcheck,
+otherwise the lowest ordinal) and use that replica's own port, so a route
+fails over when ordinal 0 is down.
 
 <Callout type="note" title="Auto ports persist">
   An auto host port is resolved once at apply and persisted — the same port

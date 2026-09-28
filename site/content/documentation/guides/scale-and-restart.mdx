@@ -70,10 +70,17 @@ mc2 logs shop/web/0 --follow
   above the new count (and frees their host ports); the remaining ones keep
   their identity, ports and placement. `mc2 up` is all-or-nothing, so a
   rejected apply leaves the running stack untouched.
-- **Ingress targets replica 0.** Routes for a scaled service point at
-  ordinal 0's port.
+- **Ingress follows the running replica.** With a scaled service, a route
+  targets a Running replica whose healthcheck has passed (when the service
+  declares one), otherwise any Running replica, otherwise the lowest ordinal —
+  and it always points at *that* replica's own host port. If replica 0 is
+  `Stopped`, the route fails over to replica 1 and uses replica 1's port.
 - **`restart` + reconcile = self-healing.** Without it, a crash surfaces as
-  `Failed`.
+  `Failed`. With it, the replica is re-created — and repeated restarts are
+  spaced by a backoff (`2s`, `5s`, `15s`, then `30s`, reset after `60s` of
+  continuous `Running`). A restart the runtime performs on a crashed sandbox
+  itself counts the same as a failed start, so a crash loop cannot restart on
+  every reconcile pass.
 
 ## Next
 

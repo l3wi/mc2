@@ -94,6 +94,9 @@ server.
 
 - **BYO Traefik.** MC2 writes the catalog; you run the proxy and TLS.
 - **Ready-gated files.** No routes until instances are actually reachable.
+- **Failover by replica.** A route picks a Running replica — a healthy one
+  first when the service declares a `healthcheck`, otherwise the lowest
+  ordinal — and points at that replica's own host port.
 - **TLS is delegated.** `ingress.tls.enabled` + `certResolver` just mark
   routes in the catalog; certs/ACME live in the proxy.
 

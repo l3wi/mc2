@@ -40,8 +40,9 @@ use std::path::PathBuf;
 /// Execution backend on a node (microsandbox SDK only).
 #[async_trait]
 pub trait NodeRuntime: Send + Sync {
-    /// Ensure sandbox exists and is running. Returns runtime id (sandbox name).
-    async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<SandboxStatus>;
+    /// Ensure sandbox exists and is running, reporting **what was done** so the
+    /// controller can count every restart attempt (B10).
+    async fn ensure_running(&self, desired: &DesiredSandbox) -> Result<EnsureRunning>;
 
     /// Stop and remove a sandbox we own (scale-down / delete).
     async fn ensure_removed(&self, runtime_id: &str) -> Result<()>;
@@ -105,4 +106,31 @@ pub struct SandboxStatus {
     pub runtime_id: String,
     pub phase: SandboxPhase,
     pub message: Option<String>,
+}
+
+/// What [`NodeRuntime::ensure_running`] did to the sandbox.
+///
+/// The controller must see every restart the runtime performs on its own
+/// (B10): a backend that quietly recreates a crashed sandbox would otherwise
+/// restart it on every reconcile pass, with the restart policy's backoff never
+/// advancing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    /// The sandbox was already up; nothing was created or started.
+    AlreadyRunning,
+    /// No sandbox existed; a new one was created.
+    Created,
+    /// An existing sandbox was restarted: a stopped one started, or a
+    /// crashed/failed one removed and recreated.
+    Restarted,
+    /// The sandbox is not running and the restart policy left it that way.
+    Left,
+}
+
+/// Result of [`NodeRuntime::ensure_running`]: the observed status plus what the
+/// call did to get there.
+#[derive(Debug, Clone)]
+pub struct EnsureRunning {
+    pub status: SandboxStatus,
+    pub outcome: EnsureOutcome,
 }
