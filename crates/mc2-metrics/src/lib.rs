@@ -117,7 +117,16 @@ pub fn init(service_name: &str) -> Result<bool> {
         .with_interval(Duration::from_secs(15))
         .build();
 
-    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    // `service.name` on the resource (not only the scope) is what backends
+    // such as Prometheus turn into `job`; without it they report
+    // `unknown_service`.
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build();
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
 
     global::set_meter_provider(provider.clone());
     let _ = PROVIDER.set(provider);

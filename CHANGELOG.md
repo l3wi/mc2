@@ -25,6 +25,8 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   listener lives until the next reconcile pass; apply now recognises MC2's own
   held listener instead of rejecting the port as "in use by another process".
   The node loop publishes its held ports to the apply path.
+- **Metrics carry `service.name` on the resource**, so Prometheus labels them
+  `job="mc2-server"` instead of `unknown_service`.
 - **An empty ingress catalog is valid Traefik config.** With no ready route,
   `traefik/dynamic.yml` is a comment only; `http: {}` made Traefik reject the
   whole file provider ("http cannot be a standalone element"). `GET /v1/ingress`
