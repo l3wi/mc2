@@ -40,7 +40,7 @@ pub async fn apply_stack(
         Err(
             ApplyError::Validation(msg) | ApplyError::Allocation(msg) | ApplyError::Capacity(msg),
         ) => Err(ApiError::bad_request(msg)),
-        Err(ApplyError::Other(e)) => Err(ApiError::internal(e.to_string())),
+        Err(ApplyError::Other(e)) => Err(ApiError::internal(format!("{e:#}"))),
     }
 }
 

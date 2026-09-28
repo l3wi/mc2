@@ -138,7 +138,12 @@ impl IntoResponse for ApiError {
         let (status, msg) = match self {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
-            Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            Self::Internal(m) => {
+                // The client gets the message too, but a 500 must be
+                // diagnosable from the server's own log.
+                tracing::error!(error = %m, "internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, m)
+            }
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }

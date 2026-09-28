@@ -14,6 +14,17 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   owner, and the foreign sandbox is left as it is. Previously the server
   adopted it, and a `restart` policy could delete it.
 
+### Apply and ingress fixes
+
+- **`mc2 up` no longer fails with a 500 while the reconcile loop writes.**
+  Write transactions start with `BEGIN IMMEDIATE`; a deferred transaction
+  that read first could deadlock against the loop's status writes and be
+  refused with `database is locked`. Internal errors now return and log their
+  full cause instead of only the outermost context.
+- **An empty ingress catalog is valid Traefik config.** With no ready route,
+  `traefik/dynamic.yml` is a comment only; `http: {}` made Traefik reject the
+  whole file provider ("http cannot be a standalone element").
+
 ### Port claims and whole vCPUs (breaking, pre-release)
 
 - **Host ports are enforced by the database.** A `host_port_claims` table

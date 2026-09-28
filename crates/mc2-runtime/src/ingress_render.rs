@@ -174,10 +174,15 @@ pub fn route_key(id: &str) -> String {
     mc2_api::route_key(id)
 }
 
+/// First line of the dynamic file when no route is ready.
+const EMPTY_DYNAMIC_MARKER: &str = "# Managed by MC2 — no ready Ingress routes";
+
 /// Build Traefik file-provider dynamic YAML (`http.routers` + `http.services`).
 pub fn render_traefik_dynamic(routes: &[ReadyIngressRoute]) -> String {
     if routes.is_empty() {
-        return "# Managed by MC2 — no ready Ingress routes\nhttp: {}\n".into();
+        // Comment only: Traefik rejects an empty `http: {}` ("http cannot be a
+        // standalone element") and would fail the whole file provider.
+        return format!("{EMPTY_DYNAMIC_MARKER}\n");
     }
 
     let mut http = HttpDynamic::default();
@@ -423,7 +428,7 @@ mod tests {
     #[test]
     fn traefik_empty() {
         let y = render_traefik_dynamic(&[]);
-        assert!(y.contains("http: {}"));
+        assert_eq!(y, format!("{EMPTY_DYNAMIC_MARKER}\n"));
     }
 
     #[test]
@@ -483,7 +488,7 @@ mod tests {
         // Ready gate: only ready routes appear as upstreams.
         let pending = sample_route();
         let y = render_traefik_dynamic(&[]);
-        assert!(y.contains("http: {}"), "{y}");
+        assert_eq!(y, format!("{EMPTY_DYNAMIC_MARKER}\n"), "{y}");
         let j = render_catalog_json("n", "t", &[], &[pending]);
         assert!(j.contains("\"ready\": false"));
         assert!(j.contains("8080")); // backend port still recorded as pending

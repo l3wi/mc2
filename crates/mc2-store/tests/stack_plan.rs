@@ -473,6 +473,43 @@ async fn failed_delete_stack_leaves_instances(store: Arc<dyn Store>, pool: &sqlx
     );
 }
 
+/// An apply racing the reconcile loop's status writes never fails with
+/// `SQLITE_BUSY`: the commit reads before it writes, so a deferred transaction
+/// could deadlock against a concurrent writer and be refused without waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commits_survive_concurrent_status_writes_sqlite() {
+    let (store, _dir) = sqlite().await;
+    let loop_instance = store
+        .commit_stack_plan(&claiming("loop", "web", vec![]))
+        .await
+        .unwrap()
+        .remove(0);
+
+    let writer = {
+        let store = store.clone();
+        let id = loop_instance.id.clone();
+        tokio::spawn(async move {
+            for i in 0..400 {
+                let phase = if i % 2 == 0 { "Running" } else { "Creating" };
+                store
+                    .update_instance_status(&id, phase, None, None)
+                    .await
+                    .expect("status write");
+            }
+        })
+    };
+    for i in 0..100 {
+        let image = if i % 2 == 0 { "alpine" } else { "busybox" };
+        let plan =
+            StackPlan::replicas("app", "{}", "name: app\n", vec![("web", vec![spec(image)])]);
+        store
+            .commit_stack_plan(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("commit {i}: {e:?}"));
+    }
+    writer.await.unwrap();
+}
+
 #[tokio::test]
 async fn creates_updates_and_prunes_memory() {
     creates_updates_and_prunes(memory().await).await;

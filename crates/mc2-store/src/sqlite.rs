@@ -25,6 +25,19 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Start a write transaction with `BEGIN IMMEDIATE`.
+    ///
+    /// A deferred transaction that reads first and writes later can deadlock
+    /// against the reconcile loop's writes; SQLite then fails one side with
+    /// `SQLITE_BUSY` at once, without waiting out the busy timeout. Taking the
+    /// write lock up front makes a concurrent writer wait instead.
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Other(e.into()))
+    }
+
     /// Open (or create) a SQLite database at `path` and run migrations.
     pub async fn open(path: impl AsRef<Path>) -> AnyResult<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
@@ -369,11 +382,7 @@ impl Store for SqliteStore {
 
     async fn commit_stack_plan(&self, plan: &StackPlan) -> Result<Vec<InstanceRecord>, StoreError> {
         let now = Utc::now().to_rfc3339();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
+        let mut tx = self.begin_write().await?;
         if let Err(e) = write_stack_plan(&mut tx, plan, &now).await {
             // Roll back explicitly: a dropped transaction only queues its
             // ROLLBACK, so SQLite would keep the write lock and the next
@@ -437,11 +446,7 @@ impl Store for SqliteStore {
         // also cascades its host_port_claims (C4), so a `down` frees its ports.
         // A mid-way failure rolls both statements back so a down never leaves a
         // half-deleted stack.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| StoreError::Other(e.into()))?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("DELETE FROM instances WHERE stack = ?1")
             .bind(name)
             .execute(&mut *tx)

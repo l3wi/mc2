@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(st.pending, 1);
 
         let traefik = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
-        assert!(traefik.contains("http: {}"), "{traefik}");
+        assert!(!traefik.contains("http:"), "{traefik}");
         let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
         assert!(catalog.contains("\"ready\": false"), "{catalog}");
 
@@ -359,7 +359,7 @@ mod tests {
             .unwrap();
         assert_eq!(st.ready, 0);
         let t3 = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
-        assert!(t3.contains("http: {}"), "{t3}");
+        assert!(!t3.contains("http:"), "{t3}");
         drop(listener2);
     }
 
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(st.pending, 1);
 
         let traefik = std::fs::read_to_string(dir.path().join("traefik/dynamic.yml")).unwrap();
-        assert!(traefik.contains("http: {}"), "{traefik}");
+        assert!(!traefik.contains("http:"), "{traefik}");
         let catalog = std::fs::read_to_string(dir.path().join("catalog.json")).unwrap();
         assert!(catalog.contains("\"ready\": false"), "{catalog}");
     }
