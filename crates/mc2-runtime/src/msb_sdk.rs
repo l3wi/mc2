@@ -13,7 +13,7 @@ use crate::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use microsandbox::sandbox::SandboxStatus as MsbStatus;
+use microsandbox::sandbox::{SandboxHandle, SandboxStatus as MsbStatus};
 use microsandbox::{set_default_backend, LocalBackend, NetworkPolicy, NetworkProfile, Sandbox};
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, PortRange, Protocol, Rule,
@@ -191,7 +191,7 @@ async fn create_detached(
         .label("mc2.ordinal", desired.ordinal.to_string())
         // Ownership marker: `list_owned` filters on it, so a node only ever
         // adopts/removes sandboxes this install created (B2).
-        .label("mc2.install", install_id);
+        .label(INSTALL_LABEL, install_id);
 
     // MC2-owned volume directories, mounted as bind mounts with an explicit
     // per-start quota. microsandbox charges a bind mount's quota as growth
@@ -275,14 +275,69 @@ async fn create_detached(
     Ok(())
 }
 
-async fn observe(name: &str) -> Result<Option<MsbStatus>> {
+/// Label carrying the id of the MC2 install that created a sandbox.
+const INSTALL_LABEL: &str = "mc2.install";
+
+/// Who holds a sandbox name in microsandbox's store.
+enum Holder {
+    Missing,
+    Ours(SandboxHandle),
+    /// Another MC2 install (its id) or something that isn't MC2 (`None`).
+    Foreign(Option<String>),
+}
+
+/// Look `name` up and check it carries `install_id`'s label.
+///
+/// microsandbox's store is shared by everything on the host, including other
+/// MC2 installs with their own data dirs, so a sandbox name can already be
+/// taken by one this server never created. Such a sandbox is never adopted,
+/// restarted, removed, exec'd into or read from.
+async fn lookup(name: &str, install_id: &str) -> Result<Holder> {
     ensure_local_backend().await?;
-    match Sandbox::get(name).await {
-        Ok(handle) => Ok(Some(handle.status_snapshot())),
+    let handle = match Sandbox::get(name).await {
+        Ok(handle) => handle,
         Err(e) => {
             debug!(%name, error = %e, "sandbox get failed (treat as missing)");
-            Ok(None)
+            return Ok(Holder::Missing);
         }
+    };
+    let owner = handle
+        .config()
+        .ok()
+        .and_then(|c| c.spec.labels.get(INSTALL_LABEL).cloned());
+    Ok(match owner {
+        Some(owner) if !install_id.is_empty() && owner == install_id => Holder::Ours(handle),
+        owner => Holder::Foreign(owner),
+    })
+}
+
+fn foreign_error(name: &str, owner: Option<&str>) -> anyhow::Error {
+    let holder = match owner {
+        Some(id) => format!("another MC2 install ({INSTALL_LABEL}={id})"),
+        None => "something other than MC2".to_string(),
+    };
+    anyhow::anyhow!(
+        "sandbox name {name} is already taken by {holder}; MC2 leaves it untouched. \
+         Remove that sandbox, or rename the stack or service"
+    )
+}
+
+impl MicrosandboxRuntime {
+    /// This install's sandbox `name`, or `None` when no sandbox has the name.
+    /// A sandbox under that name that belongs to someone else is an error.
+    async fn owned(&self, name: &str) -> Result<Option<SandboxHandle>> {
+        match lookup(name, &self.install_id).await? {
+            Holder::Missing => Ok(None),
+            Holder::Ours(handle) => Ok(Some(handle)),
+            Holder::Foreign(owner) => Err(foreign_error(name, owner.as_deref())),
+        }
+    }
+
+    /// This install's sandbox `name`; missing or foreign is an error.
+    async fn owned_handle(&self, name: &str, purpose: &str) -> Result<SandboxHandle> {
+        self.owned(name)
+            .await?
+            .with_context(|| format!("no sandbox {name} for {purpose}"))
     }
 }
 
@@ -297,9 +352,9 @@ impl NodeRuntime for MicrosandboxRuntime {
         // B10: every restart this backend performs (starting a Stopped sandbox,
         // recreating a Crashed one) is reported as `Restarted` so the
         // controller counts it against the restart-policy backoff.
-        let outcome = match observe(name).await? {
-            Some(st) => {
-                let phase = map_status(st);
+        let outcome = match self.owned(name).await? {
+            Some(handle) => {
+                let phase = map_status(handle.status_snapshot());
                 match phase {
                     SandboxPhase::Running => {
                         return Ok(EnsureRunning {
@@ -374,8 +429,8 @@ impl NodeRuntime for MicrosandboxRuntime {
             }
         };
 
-        let phase = match observe(name).await? {
-            Some(st) => map_status(st),
+        let phase = match self.owned(name).await? {
+            Some(handle) => map_status(handle.status_snapshot()),
             None => SandboxPhase::Creating,
         };
 
@@ -392,9 +447,17 @@ impl NodeRuntime for MicrosandboxRuntime {
     async fn ensure_removed(&self, runtime_id: &str) -> Result<()> {
         ensure_local_backend().await?;
         let name = runtime_id;
+        let handle = match lookup(name, &self.install_id).await? {
+            Holder::Missing => return Ok(()),
+            Holder::Ours(handle) => handle,
+            Holder::Foreign(owner) => {
+                warn!(%name, owner = ?owner, "not removing a sandbox this install did not create");
+                return Ok(());
+            }
+        };
         info!(%name, "stopping/removing microsandbox via SDK");
 
-        if let Ok(handle) = Sandbox::get(name).await {
+        {
             let st = handle.status_snapshot();
             if matches!(
                 st,
@@ -423,8 +486,8 @@ impl NodeRuntime for MicrosandboxRuntime {
 
     async fn status(&self, runtime_id: &str) -> Result<SandboxStatus> {
         ensure_local_backend().await?;
-        let phase = match observe(runtime_id).await? {
-            Some(st) => map_status(st),
+        let phase = match self.owned(runtime_id).await? {
+            Some(handle) => map_status(handle.status_snapshot()),
             None => SandboxPhase::Stopped,
         };
         Ok(SandboxStatus {
@@ -447,7 +510,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         loop {
             let after = cursor.clone();
             let page = Sandbox::list_with(move |list| {
-                let list = list.label("mc2.install", install_id);
+                let list = list.label(INSTALL_LABEL, install_id);
                 match after {
                     Some(c) => list.cursor(c),
                     None => list,
@@ -481,9 +544,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         if argv.is_empty() {
             anyhow::bail!("exec: empty argv");
         }
-        let handle = Sandbox::get(runtime_id)
-            .await
-            .with_context(|| format!("Sandbox::get({runtime_id}) for exec"))?;
+        let handle = self.owned_handle(runtime_id, "exec").await?;
         let sb = handle
             .connect()
             .await
@@ -544,9 +605,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     /// file) go through this; the caller owns the script text.
     async fn guest_shell(&self, runtime_id: &str, script: &str) -> Result<String> {
         ensure_local_backend().await?;
-        let handle = Sandbox::get(runtime_id)
-            .await
-            .with_context(|| format!("Sandbox::get({runtime_id}) for shell"))?;
+        let handle = self.owned_handle(runtime_id, "shell").await?;
         let sb = handle
             .connect()
             .await
@@ -559,7 +618,7 @@ impl NodeRuntime for MicrosandboxRuntime {
     }
 
     async fn read_logs(&self, runtime_id: &str, tail: Option<usize>) -> Result<Vec<LogLine>> {
-        ensure_local_backend().await?;
+        self.owned_handle(runtime_id, "logs").await?;
         let opts = microsandbox::logs::LogOptions {
             tail,
             ..Default::default()
@@ -575,7 +634,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         runtime_id: &str,
         from: Option<String>,
     ) -> Result<futures::stream::BoxStream<'static, Result<LogLine>>> {
-        ensure_local_backend().await?;
+        self.owned_handle(runtime_id, "logs").await?;
         let start = match from {
             Some(cursor) => microsandbox::logs::LogStreamStart::From(
                 cursor.parse().context("parse log cursor")?,
@@ -603,9 +662,7 @@ impl NodeRuntime for MicrosandboxRuntime {
         sftp: bool,
     ) -> Result<Arc<dyn SshServer>> {
         ensure_local_backend().await?;
-        let handle = Sandbox::get(runtime_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Sandbox::get({runtime_id}): {e}"))?;
+        let handle = self.owned_handle(runtime_id, "ssh").await?;
         let sb = handle
             .connect()
             .await

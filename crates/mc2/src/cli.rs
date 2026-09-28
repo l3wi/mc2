@@ -222,6 +222,7 @@ pub enum SecretCommands {
     /// List secret names (values never shown)
     #[command(name = "ls", alias = "list")]
     Ls(ListArgs),
+    /// Delete a secret (running consumers keep their current value)
     #[command(name = "rm", alias = "delete")]
     Rm(SecretRmArgs),
 }

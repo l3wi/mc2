@@ -4,6 +4,16 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
 
 ## Unreleased
 
+### Sandbox ownership across installs
+
+- **A sandbox name taken by another install is never touched.** microsandbox's
+  store is shared host-wide, so two MC2 data dirs (or other tools) can hold the
+  same `{stack}--{service}--{ordinal}` name. Every by-name operation (adopt,
+  restart, recreate, remove, exec, logs, SSH, hosts injection) now checks the
+  `mc2.install` label first: the instance is reported `Failed` naming the
+  owner, and the foreign sandbox is left as it is. Previously the server
+  adopted it, and a `restart` policy could delete it.
+
 ### Port claims and whole vCPUs (breaking, pre-release)
 
 - **Host ports are enforced by the database.** A `host_port_claims` table
@@ -145,11 +155,13 @@ All notable changes to MC2. Pre-release: entries are grouped per feature area.
   data kept; shrinking below usage is a 400. `services.<name>.storage_opt.size`
   (default 4 GiB) sets the VM root disk. Volumes are MC2-owned directories
   under `<data-dir>/volumes` (so `--data-dir /srv/mc2` keeps them with the
-  rest of the state; `--volume-dir` still overrides). `--limit-disk-mib` is now an apply-time reservation
+  rest of the state; `--volume-dir` still overrides). `--limit-disk-mib` is
+  now an apply-time reservation
   (volume sizes + root disks × replicas) with a breakdown on refusal.
 - **Disk-full is visible.** `mc2 ps` gains a `NOTES` column; `mc2 exec`,
-  `mc2 ssh open`, `mc2 logs` and `mc2 up` print the condition with the exact
-  stack.yaml fix. Server logs condition changes and exports
+  `mc2 ssh open` and `mc2 logs` print the condition with the exact
+  stack.yaml fix (`mc2 up` doesn't: its conditions would predate the apply).
+  Server logs condition changes and exports
   `mc2.instance.disk_{used,limit}_mib`.
 - **Listener limits.** REST: connection cap with 503 load-shedding
   (`--max-connections`, 256), header-read deadline, per-request timeout for
